@@ -1,0 +1,39 @@
+{
+  "name": "@distr-sh/distr-sdk",
+  "version": "4.8.1",
+  "type": "module",
+  "license": "Apache-2.0",
+  "description": "Distr SDK",
+  "homepage": "https://distr.sh",
+  "packageManager": "pnpm@12.16.1",
+  "engines": {
+    "node": "26.x"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/distr-sh/distr.git",
+    "directory": "sdk/js"
+  },
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "scripts": {
+    "build": "rimraf dist && tsc",
+    "docs": "typedoc",
+    "test:examples": "npx tsx src/examples/test-client.ts"
+  },
+  "files": [
+    "dist/"
+  ],
+  "dependencies": {
+    "semver": "^7.6.3"
+  },
+  "devDependencies": {
+    "@types/semver": "^7.5.8",
+    "prettier": "^3.3.3",
+    "prettier-plugin-organize-imports": "^4.3.0",
+    "rimraf": "^6.0.1",
+    "typedoc": "^0.28.0",
+    "typedoc-plugin-markdown": "^4.5.0",
+    "typescript": "~6.0.3"
+  }
+}

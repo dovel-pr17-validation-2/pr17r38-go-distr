@@ -1,0 +1,93 @@
+---
+title: Customer Portal Support Bundles
+description: Create and manage support bundles to share diagnostic data with your vendor from the Customer Portal.
+slug: docs/platform/customer-portal/support
+sidebar:
+  label: Support Bundles
+  order: 5
+---
+
+import {Aside} from '@astrojs/starlight/components';
+import ThemedImage from '~/components/util/ThemedImage.astro';
+import supportLight from '~/assets/docs/platform/customer-portal/customer-view/customer-portal-support-light.png';
+import supportDark from '~/assets/docs/platform/customer-portal/customer-view/customer-portal-support-dark.png';
+import detailLight from '~/assets/docs/platform/customer-portal/customer-view/customer-portal-support-detail-light.png';
+import detailDark from '~/assets/docs/platform/customer-portal/customer-view/customer-portal-support-detail-dark.png';
+
+As an end customer, you can create support bundles to share diagnostic data with your vendor when reporting an issue. Support bundles give your vendor the information they need to troubleshoot problems without requiring direct access to your infrastructure.
+
+<ThemedImage
+  lightSrc={supportLight}
+  darkSrc={supportDark}
+  alt="Customer Portal support bundles page"
+/>
+
+<Aside type="note">
+  The **Support** section only appears if your vendor has enabled the Support
+  Bundles feature for your organization.
+</Aside>
+
+## Creating a support bundle
+
+1. Navigate to **Support** in the sidebar and click **New Support Bundle**.
+2. Choose **Docker** or **Kubernetes** as the **Deployment Type**, enter a **Title** (required) and an optional **Description** of the issue.
+3. Click **Create**. Distr opens the new bundle and shows a one-time `curl` command valid for 24 hours.
+4. Run the command. It asks you before it collects or uploads anything and before it runs a script of your vendor.
+
+For a **Docker** bundle, run the command on the affected deployment host. The interactive script will:
+
+- List available Docker containers and prompt for which ones to exclude
+- Show environment variable groups that will be collected, with redacted values already masked, and prompt for which groups to exclude
+- Show the full source of any diagnostic script your vendor configured and prompt for which ones to exclude, then run the rest and show you their output before uploading it
+- Upload the remaining data to Distr
+
+For a **Kubernetes** bundle, run the command on a machine with access to the cluster, such as the one you run `kubectl` from. The machine needs access to `github.com`, where the script downloads the support collector from. Nothing is installed in the cluster. The interactive script will:
+
+- Ask for the kubectl context to collect from, unless your kubeconfig has only one
+- List the namespaces of the cluster with their Helm releases and ask which ones to collect
+- Ask for every part of the bundle whether to collect it: the cluster information, the resources of the namespaces, the Helm releases and their values, the events and the container logs
+- Write the files to a temporary directory, where you can look through them and edit or delete any of them before you confirm the upload
+- Show the full source of any diagnostic script your vendor configured and prompt for which ones to exclude, then run the rest against the same context
+
+To collect from a context without being asked, append `-s --` and the option to the command: `curl -fsSL '...' | sh -s -- --context prod`. See [Kubernetes bundles](/docs/platform/support-bundles/#kubernetes-bundles) for every option, the permissions the collector needs and what the collected resources contain.
+
+<Aside type="tip">
+  The collect command is shown in the Customer Portal after creating the bundle
+  and remains visible in the bundle detail view for as long as the bundle is in
+  the **Initialized** state.
+</Aside>
+
+## Viewing and commenting on bundles
+
+After the collection script runs, the bundle status changes from **Initialized** to **Created**. Click on any bundle to open the detail view where you can:
+
+- View all collected resources (container logs, environment variables, Kubernetes resources, script output)
+- Exchange comments with your vendor's support team
+- Track the bundle status (Initialized, Created, Resolved, Canceled)
+
+<ThemedImage
+  lightSrc={detailLight}
+  darkSrc={detailDark}
+  alt="Support bundle detail view showing resources and comments"
+/>
+
+## Bundle status lifecycle
+
+| Status          | Meaning                                                                         |
+| --------------- | ------------------------------------------------------------------------------- |
+| **Initialized** | Bundle created, collection script not yet run. Secret valid for 24 hours.       |
+| **Created**     | Collection script ran successfully. Resources are attached and ready to review. |
+| **Resolved**    | Vendor has marked the bundle as resolved.                                       |
+| **Canceled**    | Bundle was canceled before data was collected.                                  |
+
+You can cancel an **Initialized** bundle if you no longer need it. Once resolved or canceled, a bundle cannot be reopened.
+
+If you have the role **Administrator** or **User**, you can delete a bundle in any status, from the list or from its detail view. Deleting is permanent: the bundle, the collected resources and the comments are removed from Distr for you and for your vendor, and cannot be restored.
+
+## Remote access for a support case
+
+If a support bundle does not answer the question, your vendor may ask to deploy a [remote access](/docs/integrations/remote-access/) application to your deployment target for the duration of the support case.
+It shows up on your **Deployments** page like any other deployment.
+Undeploy it there to end the vendor's access at any time.
+
+For the vendor-side setup and configuration, see [Support Bundles](/docs/platform/support-bundles/).

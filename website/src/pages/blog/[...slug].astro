@@ -1,0 +1,49 @@
+---
+import {getImage} from 'astro:assets';
+import Layout from '~/layouts/StarlightLayout.astro';
+import SinglePost from '~/components/blog/SinglePost.astro';
+import SignUpCta from '~/components/cta/standalone/SignUpCta.astro';
+import TestimonialsSection from '~/components/home/TestimonialsSection.astro';
+import {getSortedPosts} from '~/utils/blog';
+import type {Post} from '~/types';
+
+export async function getStaticPaths() {
+  let posts = await getSortedPosts();
+
+  return posts.map(post => {
+    return {
+      params: {
+        slug: post.data.slug + '/',
+      },
+      props: {
+        post: post,
+      },
+    };
+  });
+}
+
+export interface Props {
+  allPosts: Post[];
+  post: Post;
+}
+
+const {slug} = Astro.params;
+const {post} = Astro.props;
+const optimizedImage = await getImage({
+  src: post.data.image,
+  width: 1200,
+  height: 675,
+});
+const ogImageUrl = new URL(optimizedImage.src, Astro.site).href;
+---
+
+<Layout
+  title={post.data.title}
+  description={post.data.description}
+  head={[{tag: 'meta', attrs: {property: 'og:image', content: ogImageUrl}}]}>
+  <div class="mx-auto max-w-7xl px-1 sm:px-8 lg:px-10">
+    <SinglePost post={post} url={slug} />
+  </div>
+  <SignUpCta bgClass="bg-[var(--sl-color-bg)]" />
+  <TestimonialsSection />
+</Layout>

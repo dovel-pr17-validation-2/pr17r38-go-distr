@@ -1,0 +1,114 @@
+export type Product = {
+  title: string;
+  description: string;
+  value: string;
+  href: string;
+};
+
+export const products: Product[] = [
+  {
+    title: 'Deployment Controllers',
+    description:
+      'Standardize your Docker or Helm deployments embedded with controllers in Kubernetes, Docker Compose, VM or Bare Metal environments',
+    value: 'rocket',
+    href: '/docs/controllers/',
+  },
+  {
+    title: 'Automatic Updates',
+    description:
+      'New - Keep deployments on the latest eligible version of their application without manual updates',
+    value: 'refresh-cw',
+    href: '/docs/controllers/deployment/#automatic-updates',
+  },
+  {
+    title: 'Customer Portal',
+    description:
+      'Where customers can download Artifacts and manage their Applications',
+    value: 'circle-user',
+    href: '/docs/platform/customer-portal/',
+  },
+  {
+    title: 'Artifact Registry',
+    description:
+      'Distribute Docker Images, Helm Charts, or every OCI compatible artifact like large LLM Models with our high performance OCI registry',
+    value: 'package',
+    href: '/docs/registry/',
+  },
+  {
+    title: 'License Management',
+    description:
+      'Time based access control and entitlements for Applications and Artifacts - managed in a central place',
+    value: 'key',
+    href: '/docs/platform/license-management/',
+  },
+  {
+    title: 'Alerts',
+    description:
+      'Receive notification in realtime when deployments report an error or go stale',
+    value: 'bell',
+    href: '/docs/controllers/alerts/',
+  },
+  {
+    title: 'Update Notifications',
+    description:
+      'New - Email selected users when a new version of an application or an artifact is available',
+    value: 'megaphone',
+    href: '/docs/controllers/update-notifications/',
+  },
+  {
+    title: 'Logs and Metrics',
+    description:
+      'Collect Logs and Metrics in realtime and directly download them as bundle for better Customer support',
+    value: 'chart-line',
+    href: '/docs/controllers/logs-and-metrics/',
+  },
+  {
+    title: 'Remote Access',
+    description:
+      'New - Debug customer installations through a Tailscale or Cloudflare tunnel that the customer approves and can revoke',
+    value: 'square-terminal',
+    href: '/docs/integrations/remote-access/',
+  },
+  {
+    title: 'Compatibility Matrix',
+    description:
+      'New - Automatically test if your application is compatible across a matrix of deployment environments',
+    value: 'check-circle',
+    href: '/docs/platform/kubernetes-compatibility-matrix/',
+  },
+  {
+    title: 'Pre-flight Checks',
+    description:
+      'New - Determine if needed resources are available or execute custom pre and post installation scripts',
+    value: 'clipboard-check',
+    href: '/docs/controllers/preflight-checks/',
+  },
+  {
+    title: 'Vulnerability Scanning',
+    description:
+      'New - Scan source dependencies and container images for known vulnerabilities and share reports with customers',
+    value: 'shield-check',
+    href: '/docs/platform/vulnerability-scanning/',
+  },
+  {
+    title: 'Secrets',
+    description:
+      'Securely store and reference sensitive configuration values in deployments using centralized secret management',
+    value: 'lock',
+    href: '/docs/controllers/secrets/',
+  },
+  {
+    title: 'BYOC & Terraform',
+    description:
+      'New - Provision customer cloud infrastructure from your OpenTofu or Terraform configuration with our infrastructure controllers',
+    value: 'workflow',
+    href: '/docs/use-cases/byoc-bring-your-own-cloud/',
+  },
+  {
+    title: 'Air-gapped',
+    description:
+      'Enterprise - Distribute your application with air-gapped bundles into the most isolated environments',
+    value: 'server-off',
+    href: '/docs/integrations/zarf/',
+  },
+];

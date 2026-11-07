@@ -1,0 +1,134 @@
+<div class="z-50 max-h-full w-3xl max-w-full overflow-x-hidden overflow-y-auto">
+  <div class="relative max-h-full w-full">
+    <div class="relative rounded-lg bg-white shadow-sm dark:bg-gray-700">
+      <!-- Modal header -->
+      <div class="flex items-center justify-between rounded-t border-b border-gray-200 p-4 dark:border-gray-600">
+        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">{{ license().name }}</h3>
+        <button
+          type="button"
+          class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white"
+          (click)="close()">
+          <fa-icon [icon]="faXmark" />
+          <span class="sr-only">Close modal</span>
+        </button>
+      </div>
+
+      <!-- Modal body -->
+      <div class="space-y-4 p-4">
+        @if (license().description) {
+          <p class="text-sm text-gray-500 dark:text-gray-400">{{ license().description }}</p>
+        }
+        <div class="text-gray-500 dark:text-gray-400">
+          <div class="flex flex-wrap border-b border-gray-200 dark:border-gray-600">
+            <button
+              type="button"
+              (click)="activeTab.set('token')"
+              class="inline-flex cursor-pointer items-center justify-center rounded-t-lg border-b-2 p-2 text-sm hover:border-gray-300 hover:text-gray-600 dark:hover:text-gray-300"
+              [class.text-blue-600]="activeTab() === 'token'"
+              [class.dark:text-blue-500]="activeTab() === 'token'"
+              [class.border-blue-600]="activeTab() === 'token'"
+              [class.border-transparent]="activeTab() !== 'token'">
+              License
+            </button>
+            <button
+              type="button"
+              (click)="activeTab.set('payload')"
+              class="inline-flex cursor-pointer items-center justify-center rounded-t-lg border-b-2 p-2 text-sm hover:border-gray-300 hover:text-gray-600 dark:hover:text-gray-300"
+              [class.text-blue-600]="activeTab() === 'payload'"
+              [class.dark:text-blue-500]="activeTab() === 'payload'"
+              [class.border-blue-600]="activeTab() === 'payload'"
+              [class.border-transparent]="activeTab() !== 'payload'">
+              License Data
+            </button>
+            <button
+              type="button"
+              (click)="activeTab.set('decoded')"
+              class="inline-flex cursor-pointer items-center justify-center rounded-t-lg border-b-2 p-2 text-sm hover:border-gray-300 hover:text-gray-600 dark:hover:text-gray-300"
+              [class.text-blue-600]="activeTab() === 'decoded'"
+              [class.dark:text-blue-500]="activeTab() === 'decoded'"
+              [class.border-blue-600]="activeTab() === 'decoded'"
+              [class.border-transparent]="activeTab() !== 'decoded'">
+              Decoded License
+            </button>
+            <button
+              type="button"
+              (click)="activeTab.set('revisions')"
+              class="inline-flex cursor-pointer items-center justify-center rounded-t-lg border-b-2 p-2 text-sm hover:border-gray-300 hover:text-gray-600 dark:hover:text-gray-300"
+              [class.text-blue-600]="activeTab() === 'revisions'"
+              [class.dark:text-blue-500]="activeTab() === 'revisions'"
+              [class.border-blue-600]="activeTab() === 'revisions'"
+              [class.border-transparent]="activeTab() !== 'revisions'">
+              Revisions
+            </button>
+          </div>
+
+          <div class="mt-4">
+            @if (activeTab() === 'token') {
+              <pre
+                data-ph-mask-text="true"
+                class="max-h-96 overflow-y-auto rounded-lg border border-gray-300 bg-gray-50 p-4 font-mono text-sm break-all whitespace-pre-wrap text-gray-900 select-all dark:border-gray-600 dark:bg-gray-800 dark:text-white"
+                >{{ token() }}</pre>
+              <button
+                type="button"
+                (click)="copyToken()"
+                class="distr-btn-secondary mt-3 inline-flex items-center px-4 py-2 text-sm font-medium">
+                <fa-icon [icon]="copied ? faClipboardCheck : faClipboard" class="mr-2" />
+                {{ copied ? 'Copied' : 'Copy to clipboard' }}
+              </button>
+            }
+
+            @if (activeTab() === 'payload') {
+              <app-editor
+                language="json"
+                [formControl]="payloadControl"
+                class="block w-full rounded-lg border border-gray-300 bg-gray-50 text-sm text-gray-900 [--editor-min-height:--spacing(32)] dark:border-gray-600 dark:bg-gray-700 dark:text-white" />
+            }
+
+            @if (activeTab() === 'decoded') {
+              <app-editor
+                language="json"
+                [formControl]="decodedControl"
+                class="block w-full rounded-lg border border-gray-300 bg-gray-50 text-sm text-gray-900 [--editor-min-height:--spacing(32)] dark:border-gray-600 dark:bg-gray-700 dark:text-white" />
+            }
+
+            @if (activeTab() === 'revisions') {
+              <table class="distr-table">
+                <thead class="bg-gray-100 text-xs text-gray-700 uppercase dark:bg-gray-700 dark:text-gray-400">
+                  <tr>
+                    <th scope="col" class="px-4 py-2">Created</th>
+                    <th scope="col" class="px-4 py-2">Not Before</th>
+                    <th scope="col" class="px-4 py-2">Expires At</th>
+                    <th scope="col" class="px-4 py-2">License Data</th>
+                    <th scope="col"></th>
+                  </tr>
+                </thead>
+                <tbody>
+                  @for (
+                    revision of revisionsResource.value() ?? [];
+                    track revision.id;
+                    let first = $first, i = $index
+                  ) {
+                    <tr
+                      class="border-t border-gray-200 dark:border-gray-600"
+                      [class.bg-blue-50]="first"
+                      [class.dark:bg-gray-600]="first">
+                      <td class="px-4 py-2 whitespace-nowrap">{{ revision.createdAt | date: 'medium' }}</td>
+                      <td class="px-4 py-2 whitespace-nowrap">{{ revision.notBefore | date }}</td>
+                      <td class="px-4 py-2 whitespace-nowrap">{{ revision.expiresAt | date }}</td>
+                      <td class="max-w-48 overflow-x-auto px-4 py-2 font-mono text-xs">
+                        <app-editor language="json" [formControl]="revisionPayloadControls()[i]" />
+                      </td>
+                      <td class="px-4 py-2 text-end">
+                        <app-clip [clip]="revision.token">Copy license</app-clip>
+                      </td>
+                    </tr>
+                  }
+                </tbody>
+              </table>
+            }
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

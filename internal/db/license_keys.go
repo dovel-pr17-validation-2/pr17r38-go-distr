@@ -1,0 +1,279 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const licenseKeyOutExpr = `
+	lk.id,
+	lk.created_at,
+	lk.name,
+	lk.description,
+	lr.payload,
+	lr.not_before,
+	lr.expires_at,
+	lr.created_at AS last_revised_at,
+	lk.organization_id,
+	lk.customer_organization_id,
+	lk.license_template_id `
+
+const licenseKeyLatestRevisionJoin = `
+	LEFT JOIN LATERAL (
+		SELECT payload, not_before, expires_at, created_at
+		FROM LicenseKeyRevision
+		WHERE license_key_id = lk.id
+		ORDER BY created_at DESC, id DESC
+		LIMIT 1
+	) lr ON true`
+
+func GetLicenseKeysForDeploymentTarget(
+	ctx context.Context,
+	dt types.DeploymentTarget,
+) ([]types.LicenseKey, error) {
+	return GetLicenseKeysByScope(ctx, dt.OrganizationID, dt.CustomerOrganizationID)
+}
+
+func GetLicenseKeysByScope(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	customerOrganizationID *uuid.UUID,
+) ([]types.LicenseKey, error) {
+	if customerOrganizationID != nil {
+		return GetLicenseKeysByCustomerOrgID(ctx, *customerOrganizationID, organizationID)
+	}
+	return nil, nil
+}
+
+func GetLicenseKeys(ctx context.Context, orgID uuid.UUID) ([]types.LicenseKey, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+licenseKeyOutExpr+`
+		FROM LicenseKey lk`+licenseKeyLatestRevisionJoin+`
+		WHERE lk.organization_id = @orgId
+		ORDER BY lk.name`,
+		pgx.NamedArgs{"orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.LicenseKey])
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	return result, nil
+}
+
+func GetLicenseKeysByCustomerOrgID(
+	ctx context.Context, customerOrgID, orgID uuid.UUID,
+) ([]types.LicenseKey, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+licenseKeyOutExpr+`
+		FROM LicenseKey lk`+licenseKeyLatestRevisionJoin+`
+		WHERE lk.organization_id = @orgId AND lk.customer_organization_id = @customerOrgId
+			AND lr.payload IS NOT NULL
+		ORDER BY lk.name`,
+		pgx.NamedArgs{"orgId": orgID, "customerOrgId": customerOrgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.LicenseKey])
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	return result, nil
+}
+
+func GetLicenseKeysByPartnerOrgID(ctx context.Context, partnerOrgID, orgID uuid.UUID) ([]types.LicenseKey, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+licenseKeyOutExpr+`
+		FROM LicenseKey lk`+licenseKeyLatestRevisionJoin+`
+		JOIN CustomerOrganization co ON lk.customer_organization_id = co.id
+		WHERE lk.organization_id = @orgId AND co.partner_organization_id = @partnerOrgId
+		ORDER BY lk.name`,
+		pgx.NamedArgs{"orgId": orgID, "partnerOrgId": partnerOrgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.LicenseKey])
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	return result, nil
+}
+
+func GetLicenseKeyByID(ctx context.Context, id uuid.UUID) (*types.LicenseKey, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+licenseKeyOutExpr+`
+		FROM LicenseKey lk`+licenseKeyLatestRevisionJoin+`
+		WHERE lk.id = @id`,
+		pgx.NamedArgs{"id": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKey: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.LicenseKey]); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not collect LicenseKey: %w", err)
+	} else {
+		return &result, nil
+	}
+}
+
+func CreateLicenseKey(ctx context.Context, licenseKey *types.LicenseKey) error {
+	return RunTx(ctx, func(ctx context.Context) error {
+		db := internalctx.GetDb(ctx)
+		rows, err := db.Query(ctx, `
+			INSERT INTO LicenseKey (name, description, organization_id, customer_organization_id, license_template_id)
+			VALUES (@name, @description, @organizationId, @customerOrganizationId, @licenseTemplateId)
+			RETURNING id`,
+			pgx.NamedArgs{
+				"name":                   licenseKey.Name,
+				"description":            licenseKey.Description,
+				"organizationId":         licenseKey.OrganizationID,
+				"customerOrganizationId": licenseKey.CustomerOrganizationID,
+				"licenseTemplateId":      licenseKey.LicenseTemplateID,
+			},
+		)
+		if err != nil {
+			return fmt.Errorf("could not insert LicenseKey: %w", err)
+		}
+		var insertedID uuid.UUID
+		if id, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[uuid.UUID]); err != nil {
+			var pgError *pgconn.PgError
+			if errors.As(err, &pgError) && pgError.Code == pgerrcode.UniqueViolation {
+				return fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+			}
+			return err
+		} else {
+			insertedID = id
+		}
+
+		if licenseKey.LicenseTemplateID == nil {
+			revision := types.LicenseKeyRevision{
+				LicenseKeyID: insertedID,
+				NotBefore:    *licenseKey.NotBefore,
+				ExpiresAt:    *licenseKey.ExpiresAt,
+				Payload:      licenseKey.Payload,
+			}
+			if err := createLicenseKeyRevision(ctx, &revision); err != nil {
+				return err
+			}
+		}
+
+		result, err := GetLicenseKeyByID(ctx, insertedID)
+		if err != nil {
+			return err
+		}
+		*licenseKey = *result
+		return nil
+	})
+}
+
+func UpdateLicenseKeyMetadata(
+	ctx context.Context, id uuid.UUID, description *string, licenseTemplateID *uuid.UUID,
+) (*types.LicenseKey, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		WITH updated AS (
+			UPDATE LicenseKey SET
+				description = @description,
+				license_template_id = @licenseTemplateId
+			WHERE id = @id RETURNING *
+		)
+		SELECT `+licenseKeyOutExpr+`
+		FROM updated lk`+licenseKeyLatestRevisionJoin,
+		pgx.NamedArgs{
+			"id":                id,
+			"description":       description,
+			"licenseTemplateId": licenseTemplateID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not update LicenseKey: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.LicenseKey]); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == pgerrcode.UniqueViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return nil, err
+	} else {
+		return &result, nil
+	}
+}
+
+func DeleteLicenseKeyWithID(ctx context.Context, id uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(ctx, `DELETE FROM LicenseKey WHERE id = @id`, pgx.NamedArgs{"id": id})
+	if err != nil {
+		return fmt.Errorf("could not delete LicenseKey: %w", err)
+	}
+	if cmd.RowsAffected() == 0 {
+		return fmt.Errorf("could not delete LicenseKey: %w", distrerr.ErrNotFound)
+	}
+	return nil
+}
+
+func GetLicenseKeyRevisions(ctx context.Context, licenseKeyID uuid.UUID) ([]types.LicenseKeyRevision, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT id, created_at, license_key_id, not_before, expires_at, payload
+		FROM LicenseKeyRevision
+		WHERE license_key_id = @licenseKeyId
+		ORDER BY created_at DESC, id DESC`,
+		pgx.NamedArgs{"licenseKeyId": licenseKeyID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query LicenseKeyRevision: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.LicenseKeyRevision])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect LicenseKeyRevision: %w", err)
+	}
+	return result, nil
+}
+
+func CreateLicenseKeyRevision(ctx context.Context, revision *types.LicenseKeyRevision) error {
+	return createLicenseKeyRevision(ctx, revision)
+}
+
+func createLicenseKeyRevision(ctx context.Context, revision *types.LicenseKeyRevision) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		INSERT INTO LicenseKeyRevision (license_key_id, not_before, expires_at, payload)
+		VALUES (@licenseKeyId, @notBefore, @expiresAt, @payload)
+		RETURNING id, created_at, license_key_id, not_before, expires_at, payload`,
+		pgx.NamedArgs{
+			"licenseKeyId": revision.LicenseKeyID,
+			"notBefore":    revision.NotBefore,
+			"expiresAt":    revision.ExpiresAt,
+			"payload":      revision.Payload,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert LicenseKeyRevision: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.LicenseKeyRevision])
+	if err != nil {
+		return fmt.Errorf("could not collect LicenseKeyRevision: %w", err)
+	}
+	*revision = result
+	return nil
+}

@@ -1,0 +1,890 @@
+package env
+
+import (
+	"context"
+	"encoding/base64"
+	"fmt"
+	"net/netip"
+	"os"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/distr-sh/distr/internal/envparse"
+	"github.com/distr-sh/distr/internal/envutil"
+	"github.com/distr-sh/distr/internal/kms"
+	"github.com/distr-sh/distr/internal/util"
+	"github.com/joho/godotenv"
+)
+
+// kmsResolveTimeout bounds the requests to the key management service, which happen before
+// anything of this process runs that could cancel them.
+const kmsResolveTimeout = 30 * time.Second
+
+var (
+	databaseUrl                           string
+	databaseMaxConns                      *int
+	databaseReadonlyUrl                   *string
+	databaseReadonlyMaxConns              *int
+	databaseEncryptionKey                 string
+	databaseEncryptionMigrateOnBoot       bool
+	jwtSecret                             []byte
+	host                                  string
+	controllerHost                        *string
+	registryHost                          string
+	mailerConfig                          MailerConfig
+	inviteTokenValidDuration              time.Duration
+	resetTokenValidDuration               time.Duration
+	controllerTokenMaxValidDuration       time.Duration
+	controllerInterval                    time.Duration
+	metricsEntriesMaxAge                  *time.Duration
+	sentryDSN                             string
+	sentryDebug                           bool
+	sentryEnvironment                     string
+	otelControllerSampler                 *SamplerConfig
+	otelRegistrySampler                   *SamplerConfig
+	otelExporterSentryEnabled             bool
+	otelExporterOtlpEnabled               bool
+	enableQueryLogging                    bool
+	controllerDockerConfig                []byte
+	controllerImageRepository             string
+	frontendSentryDSN                     *string
+	frontendSentryTraceSampleRate         *float64
+	frontendPosthogToken                  *string
+	frontendPosthogAPIHost                *string
+	frontendPosthogUIHost                 *string
+	userEmailVerificationRequired         bool
+	serverShutdownDelayDuration           *time.Duration
+	registration                          RegistrationMode
+	blockedEmailDomains                   []string
+	blockedIPs                            []netip.Prefix
+	turnstileSiteKey                      *string
+	turnstileSecret                       *string
+	supportEmail                          *string
+	registrationLegalText                 *string
+	registryEnabled                       bool
+	registryS3Config                      S3Config
+	registryScratchDir                    *string
+	registryAnonymousRateLimits           AnonymousRateLimits
+	artifactTagsDefaultLimitPerOrg        int
+	registryUpstreamSyncCron              *string
+	registryUpstreamSyncTimeout           time.Duration
+	registryUpstreamBlobFetchTimeout      time.Duration
+	cleanupDeploymentTargetMetricsCron    *string
+	cleanupDeploymentTargetMetricsTimeout time.Duration
+	cleanupOIDCStateCron                  *string
+	cleanupOIDCStateCronTimeout           time.Duration
+	cleanupArtifactBlobCron               *string
+	cleanupArtifactBlobTimeout            time.Duration
+	cleanupArtifactBlobMinAge             time.Duration
+	cleanupOrganizationCron               *string
+	cleanupOrganizationTimeout            time.Duration
+	cleanupOrganizationMinAge             time.Duration
+	cleanupUserAccountCron                *string
+	cleanupUserAccountTimeout             time.Duration
+	cleanupUserAccountMinAge              time.Duration
+	cleanupFileCron                       *string
+	cleanupFileTimeout                    time.Duration
+	cleanupFileMinAge                     time.Duration
+	deploymentStatusNotificationCron      *string
+	deploymentStatusNotificationTimeout   time.Duration
+	notificationEmailHourlyQuota          int
+	oidcGithubEnabled                     bool
+	oidcGithubClientID                    *string
+	oidcGithubClientSecret                *string
+	oidcGoogleEnabled                     bool
+	oidcGoogleClientID                    *string
+	oidcGoogleClientSecret                *string
+	oidcMicrosoftEnabled                  bool
+	oidcMicrosoftClientID                 *string
+	oidcMicrosoftClientSecret             *string
+	oidcMicrosoftTenantID                 *string
+	oidcGenericEnabled                    bool
+	oidcGenericClientID                   *string
+	oidcGenericClientSecret               *string
+	oidcGenericIssuer                     *string
+	oidcGenericScopes                     *string
+	oidcGenericPKCEEnabled                bool
+	wellKnownMicrosoftIdentityAssociation []byte
+	stripeWebhookSecret                   *string
+	stripeWebhookVersionMismatchBehavior  StripeWebhookVersionMismatchBehaviorType
+	stripeAPIKey                          *string
+	licenseKeyPrivateKeyPEM               []byte
+	licenseKey                            string
+	metricsEnabled                        bool
+	metricsAddr                           string
+	metricsBearerToken                    *string
+	metricsPprofEnabled                   bool
+	supportBundleLogTailLines             int
+	supportBundleResourceMaxBytes         int
+	supportBundleScriptTimeout            time.Duration
+	supportCollectorDownloadURLOverride   *string
+	lokiURL                               string
+	lokiBearerToken                       *string
+	lokiBasicAuthUsername                 *string
+	lokiBasicAuthPassword                 *string
+	lokiRequestTimeout                    time.Duration
+	customDomainTarget                    *string
+	customDomainVerificationCron          *string
+	customDomainVerificationTimeout       time.Duration
+	customDomainVerificationRefreshAfter  time.Duration
+	internalServerAddr                    string
+	maintenanceMode                       bool
+)
+
+func Initialize() {
+	if currentEnv, ok := os.LookupEnv("DISTR_ENV"); ok {
+		fmt.Fprintf(os.Stderr, "environment=%v\n", currentEnv)
+		if err := godotenv.Load(currentEnv); err != nil {
+			fmt.Fprintf(os.Stderr, "environment %v not loaded: %v\n", currentEnv, err)
+		}
+		secretEnv := currentEnv + ".secret"
+		if err := godotenv.Load(secretEnv); err != nil {
+			fmt.Fprintf(os.Stderr, "environment %v not loaded: %v\n", secretEnv, err)
+		}
+	}
+
+	databaseUrl = envutil.RequireEnv("DATABASE_URL")
+	databaseMaxConns = envutil.GetEnvParsedOrNil("DATABASE_MAX_CONNS", strconv.Atoi)
+	databaseReadonlyUrl = envutil.GetEnvOrNil("DATABASE_READONLY_URL")
+	databaseReadonlyMaxConns = envutil.GetEnvParsedOrNil("DATABASE_READONLY_MAX_CONNS", strconv.Atoi)
+
+	ctx, cancel := context.WithTimeout(context.Background(), kmsResolveTimeout)
+	defer cancel()
+	resolver := util.Require(kms.New(ctx, kms.Config{
+		AWS: kms.AWSConfig{
+			KeyID:    envutil.GetEnv("KMS_AWS_KEY_ID"),
+			Region:   envutil.GetEnvOrNil("KMS_AWS_REGION"),
+			Endpoint: envutil.GetEnvOrNil("KMS_AWS_ENDPOINT"),
+		},
+		GCP: kms.GCPConfig{KeyName: envutil.GetEnv("KMS_GCP_KEY_NAME")},
+	}))
+	defer func() { _ = resolver.Close() }()
+
+	databaseEncryptionKey = requireEnvResolved(ctx, resolver, "DATABASE_ENCRYPTION_KEY")
+	databaseEncryptionMigrateOnBoot = envutil.GetEnvParsedOrDefault(
+		"DATABASE_ENCRYPTION_MIGRATE_ON_BOOT", strconv.ParseBool, false,
+	)
+	jwtSecret = util.Require(envutil.ParseValue("JWT_SECRET",
+		requireEnvResolved(ctx, resolver, "JWT_SECRET"), base64.StdEncoding.DecodeString))
+	host = envutil.RequireEnv("DISTR_HOST")
+	controllerHost = envutil.GetEnvParsedOrNil(
+		envutil.ResolveDeprecatedAlias("CONTROLLER_HOST", "AGENT_HOST"), envparse.Host,
+	)
+	controllerInterval = envutil.GetEnvParsedOrDefault(
+		envutil.ResolveDeprecatedAlias("CONTROLLER_INTERVAL", "AGENT_INTERVAL"), envparse.PositiveDuration, 5*time.Second,
+	)
+	metricsEntriesMaxAge = envutil.GetEnvParsedOrNil("METRICS_ENTRIES_MAX_AGE", envparse.PositiveDuration)
+	enableQueryLogging = envutil.GetEnvParsedOrDefault("ENABLE_QUERY_LOGGING", strconv.ParseBool, false)
+	userEmailVerificationRequired = envutil.GetEnvParsedOrDefault(
+		"USER_EMAIL_VERIFICATION_REQUIRED", strconv.ParseBool, true,
+	)
+	serverShutdownDelayDuration = envutil.GetEnvParsedOrNil("SERVER_SHUTDOWN_DELAY_DURATION", envparse.PositiveDuration)
+	registration = envutil.GetEnvParsedOrDefault("REGISTRATION", parseRegistrationMode, RegistrationEnabled)
+	blockedEmailDomains = envutil.GetEnvParsedOrDefault("BLOCKED_EMAIL_DOMAINS", envparse.EmailDomainList, nil)
+	blockedIPs = envutil.GetEnvParsedOrDefault("BLOCKED_IPS", envparse.IPPrefixList, nil)
+	// Turnstile needs the site key in the browser and the secret on the server, so a half-configured widget
+	// can only ever fail: either the form has no widget to solve, or its token cannot be verified.
+	if siteKey, secret := envutil.GetEnv("TURNSTILE_SITE_KEY"), envutil.GetEnv("TURNSTILE_SECRET"); siteKey != "" &&
+		secret != "" {
+		turnstileSiteKey = &siteKey
+		turnstileSecret = &secret
+	} else if siteKey != "" || secret != "" {
+		fmt.Fprintln(os.Stderr,
+			"WARNING: TURNSTILE_SITE_KEY and TURNSTILE_SECRET must both be set, Turnstile has been disabled")
+	}
+	if email := envutil.GetEnv("SUPPORT_EMAIL"); email != "" {
+		supportEmail = &email
+	}
+	if text := envutil.GetEnv("REGISTRATION_LEGAL_TEXT"); text != "" {
+		registrationLegalText = &text
+	}
+	inviteTokenValidDuration = envutil.GetEnvParsedOrDefault(
+		"INVITE_TOKEN_VALID_DURATION", envparse.PositiveDuration, 24*time.Hour,
+	)
+	resetTokenValidDuration = envutil.GetEnvParsedOrDefault(
+		"RESET_TOKEN_VALID_DURATION", envparse.PositiveDuration, 1*time.Hour,
+	)
+	controllerTokenMaxValidDuration = envutil.GetEnvParsedOrDefault(
+		envutil.ResolveDeprecatedAlias("CONTROLLER_TOKEN_MAX_VALID_DURATION", "AGENT_TOKEN_MAX_VALID_DURATION"),
+		envparse.PositiveDuration, 24*time.Hour,
+	)
+
+	mailerConfig.Type = envutil.GetEnvParsedOrDefault("MAILER_TYPE", parseMailerType, MailerTypeUnspecified)
+	if mailerConfig.Type != MailerTypeUnspecified {
+		mailerConfig.FromAddress = envutil.RequireEnvParsed("MAILER_FROM_ADDRESS", envparse.MailAddress)
+	}
+	if mailerConfig.Type == MailerTypeSMTP {
+		mailerConfig.SmtpConfig = &MailerSMTPConfig{
+			Host:        envutil.GetEnv("MAILER_SMTP_HOST"),
+			Port:        envutil.RequireEnvParsed("MAILER_SMTP_PORT", strconv.Atoi),
+			Username:    envutil.GetEnv("MAILER_SMTP_USERNAME"),
+			Password:    envutil.GetEnv("MAILER_SMTP_PASSWORD"),
+			ImplicitTLS: envutil.GetEnvParsedOrDefault("MAILER_SMTP_IMPLICIT_TLS", strconv.ParseBool, false),
+		}
+	}
+
+	registryEnabled = envutil.GetEnvParsedOrDefault("REGISTRY_ENABLED", strconv.ParseBool, false)
+	if registryEnabled {
+		registryHost = envutil.RequireEnv("REGISTRY_HOST")
+		registryS3Config.CreateBucket = envutil.GetEnvParsedOrDefault("REGISTRY_S3_CREATE_BUCKET", strconv.ParseBool, false)
+		registryS3Config.Bucket = envutil.RequireEnv("REGISTRY_S3_BUCKET")
+		registryS3Config.Region = envutil.RequireEnv("REGISTRY_S3_REGION")
+		registryS3Config.Endpoint = envutil.GetEnvOrNil("REGISTRY_S3_ENDPOINT")
+		registryS3Config.AccessKeyID = envutil.GetEnvOrNil("REGISTRY_S3_ACCESS_KEY_ID")
+		registryS3Config.SecretAccessKey = envutil.GetEnvOrNil("REGISTRY_S3_SECRET_ACCESS_KEY")
+		registryS3Config.UsePathStyle = envutil.GetEnvParsedOrDefault("REGISTRY_S3_USE_PATH_STYLE", strconv.ParseBool, false)
+		registryS3Config.AllowRedirect = envutil.GetEnvParsedOrDefault("REGISTRY_S3_ALLOW_REDIRECT", strconv.ParseBool, true)
+		registryS3Config.RequestChecksumCalculationWhenRequired = envutil.GetEnvParsedOrDefault(
+			"REGISTRY_S3_REQUEST_CHECKSUM_CALCULATION", strconv.ParseBool, false,
+		)
+		registryS3Config.ResponseChecksumValidationWhenRequired = envutil.GetEnvParsedOrDefault(
+			"REGISTRY_S3_RESPONSE_CHECKSUM_VALIDATION", strconv.ParseBool, false,
+		)
+		registryS3Config.ResignForGCP = envutil.GetEnvParsedOrDefault(
+			"REGISTRY_RESIGN_FOR_GCP", strconv.ParseBool, false,
+		)
+		registryScratchDir = envutil.GetEnvOrNil("REGISTRY_SCRATCH_DIR")
+		registryAnonymousRateLimits = AnonymousRateLimits{
+			ManifestsPerMinute: envutil.GetEnvParsedOrDefault(
+				"REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_MINUTE", envparse.NonNegativeNumber, 10,
+			),
+			ManifestsPerHour: envutil.GetEnvParsedOrDefault(
+				"REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_HOUR", envparse.NonNegativeNumber, 30,
+			),
+			BlobsPerMinute: envutil.GetEnvParsedOrDefault(
+				"REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_MINUTE", envparse.NonNegativeNumber, 60,
+			),
+			BlobsPerHour: envutil.GetEnvParsedOrDefault(
+				"REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_HOUR", envparse.NonNegativeNumber, 300,
+			),
+		}
+	}
+	artifactTagsDefaultLimitPerOrg = envutil.GetEnvParsedOrDefault(
+		"ARTIFACT_TAGS_DEFAULT_LIMIT_PER_ORG", envparse.NonNegativeNumber, 0,
+	)
+	registryUpstreamSyncCron = envutil.GetEnvOrNil("REGISTRY_UPSTREAM_SYNC_CRON")
+	registryUpstreamSyncTimeout = envutil.GetEnvParsedOrDefault(
+		"REGISTRY_UPSTREAM_SYNC_TIMEOUT", envparse.PositiveDuration, 10*time.Minute,
+	)
+	registryUpstreamBlobFetchTimeout = envutil.GetEnvParsedOrDefault(
+		"REGISTRY_UPSTREAM_BLOB_FETCH_TIMEOUT", envparse.PositiveDuration, time.Hour,
+	)
+
+	sentryDSN = envutil.GetEnv("SENTRY_DSN")
+	sentryDebug = envutil.GetEnvParsedOrDefault("SENTRY_DEBUG", strconv.ParseBool, false)
+	sentryEnvironment = envutil.GetEnv("SENTRY_ENVIRONMENT")
+	otelExporterSentryEnabled = envutil.GetEnvParsedOrDefault("OTEL_EXPORTER_SENTRY_ENABLED", strconv.ParseBool, false)
+	otelExporterOtlpEnabled = envutil.GetEnvParsedOrDefault("OTEL_EXPORTER_OTLP_ENABLED", strconv.ParseBool, false)
+	if s := envutil.GetEnvParsedOrNil(
+		envutil.ResolveDeprecatedAlias("OTEL_CONTROLLER_SAMPLER", "OTEL_AGENT_SAMPLER"), parseSamplerType,
+	); s != nil {
+		otelControllerSampler = &SamplerConfig{
+			Sampler: *s,
+			Arg: envutil.GetEnvParsedOrDefault(
+				envutil.ResolveDeprecatedAlias("OTEL_CONTROLLER_SAMPLER_ARG", "OTEL_AGENT_SAMPLER_ARG"), envparse.Float, 1.0,
+			),
+		}
+	}
+	if s := envutil.GetEnvParsedOrNil("OTEL_REGISTRY_SAMPLER", parseSamplerType); s != nil {
+		otelRegistrySampler = &SamplerConfig{
+			Sampler: *s,
+			Arg:     envutil.GetEnvParsedOrDefault("OTEL_REGISTRY_SAMPLER_ARG", envparse.Float, 1.0),
+		}
+	}
+
+	controllerDockerConfig = envutil.GetEnvParsedOrDefault(
+		envutil.ResolveDeprecatedAlias("CONTROLLER_DOCKER_CONFIG", "AGENT_DOCKER_CONFIG"), envparse.ByteSlice, nil,
+	)
+	controllerImageRepository = envutil.GetEnvParsedOrDefault(
+		"CONTROLLER_IMAGE_REPOSITORY", envparse.ImageRepository, "ghcr.io/distr-sh/distr",
+	)
+	frontendSentryDSN = envutil.GetEnvOrNil("FRONTEND_SENTRY_DSN")
+	frontendSentryTraceSampleRate = envutil.GetEnvParsedOrNil("FRONTEND_SENTRY_TRACE_SAMPLE_RATE", envparse.Float)
+	frontendPosthogToken = envutil.GetEnvOrNil("FRONTEND_POSTHOG_TOKEN")
+	frontendPosthogAPIHost = envutil.GetEnvOrNil("FRONTEND_POSTHOG_API_HOST")
+	frontendPosthogUIHost = envutil.GetEnvOrNil("FRONTEND_POSTHOG_UI_HOST")
+
+	cleanupDeploymentTargetMetricsCron = envutil.GetEnvOrNil("CLEANUP_DEPLOYMENT_TARGET_METRICS_CRON")
+	cleanupDeploymentTargetMetricsTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_DEPLOYMENT_TARGET_METRICS_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupOIDCStateCron = envutil.GetEnvOrNil("CLEANUP_OIDC_STATE_CRON")
+	cleanupOIDCStateCronTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_OIDC_STATE_CRON_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupArtifactBlobCron = envutil.GetEnvOrNil("CLEANUP_ARTIFACT_BLOB_CRON")
+	cleanupArtifactBlobTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_ARTIFACT_BLOB_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupArtifactBlobMinAge = envutil.GetEnvParsedOrDefault("CLEANUP_ARTIFACT_BLOB_MIN_AGE",
+		envparse.PositiveDuration, 24*time.Hour)
+	cleanupOrganizationCron = envutil.GetEnvOrNil("CLEANUP_ORGANIZATION_CRON")
+	cleanupOrganizationTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_ORGANIZATION_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupOrganizationMinAge = envutil.GetEnvParsedOrDefault("CLEANUP_ORGANIZATION_MIN_AGE",
+		envparse.PositiveDuration, 30*24*time.Hour)
+	cleanupUserAccountCron = envutil.GetEnvOrNil("CLEANUP_USER_ACCOUNT_CRON")
+	cleanupUserAccountTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_USER_ACCOUNT_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupUserAccountMinAge = envutil.GetEnvParsedOrDefault("CLEANUP_USER_ACCOUNT_MIN_AGE",
+		envparse.PositiveDuration, 30*24*time.Hour)
+	cleanupFileCron = envutil.GetEnvOrNil("CLEANUP_FILE_CRON")
+	cleanupFileTimeout = envutil.GetEnvParsedOrDefault("CLEANUP_FILE_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	cleanupFileMinAge = envutil.GetEnvParsedOrDefault("CLEANUP_FILE_MIN_AGE",
+		envparse.PositiveDuration, 24*time.Hour)
+	deploymentStatusNotificationCron = envutil.GetEnvOrNil("DEPLOYMENT_STATUS_NOTIFICATION_CRON")
+	deploymentStatusNotificationTimeout = envutil.GetEnvParsedOrDefault("DEPLOYMENT_STATUS_NOTIFICATION_TIMEOUT",
+		envparse.PositiveDuration, 0)
+	notificationEmailHourlyQuota = envutil.GetEnvParsedOrDefault("NOTIFICATION_EMAIL_HOURLY_QUOTA",
+		envparse.NonNegativeNumber, 120)
+
+	oidcGithubEnabled = envutil.GetEnvParsedOrDefault("OIDC_GITHUB_ENABLED", strconv.ParseBool, false)
+	if oidcGithubEnabled {
+		oidcGithubClientID = util.PtrTo(envutil.RequireEnv("OIDC_GITHUB_CLIENT_ID"))
+		oidcGithubClientSecret = util.PtrTo(envutil.RequireEnv("OIDC_GITHUB_CLIENT_SECRET"))
+	}
+	oidcGoogleEnabled = envutil.GetEnvParsedOrDefault("OIDC_GOOGLE_ENABLED", strconv.ParseBool, false)
+	if oidcGoogleEnabled {
+		oidcGoogleClientID = util.PtrTo(envutil.RequireEnv("OIDC_GOOGLE_CLIENT_ID"))
+		oidcGoogleClientSecret = util.PtrTo(envutil.RequireEnv("OIDC_GOOGLE_CLIENT_SECRET"))
+	}
+	oidcMicrosoftEnabled = envutil.GetEnvParsedOrDefault("OIDC_MICROSOFT_ENABLED", strconv.ParseBool, false)
+	if oidcMicrosoftEnabled {
+		oidcMicrosoftClientID = util.PtrTo(envutil.RequireEnv("OIDC_MICROSOFT_CLIENT_ID"))
+		oidcMicrosoftClientSecret = util.PtrTo(envutil.RequireEnv("OIDC_MICROSOFT_CLIENT_SECRET"))
+		oidcMicrosoftTenantID = util.PtrTo(envutil.RequireEnv("OIDC_MICROSOFT_TENANT_ID"))
+	}
+	oidcGenericEnabled = envutil.GetEnvParsedOrDefault("OIDC_GENERIC_ENABLED", strconv.ParseBool, false)
+	if oidcGenericEnabled {
+		oidcGenericClientID = util.PtrTo(envutil.RequireEnv("OIDC_GENERIC_CLIENT_ID"))
+		oidcGenericClientSecret = util.PtrTo(envutil.RequireEnv("OIDC_GENERIC_CLIENT_SECRET"))
+		oidcGenericIssuer = util.PtrTo(envutil.RequireEnv("OIDC_GENERIC_ISSUER"))
+		oidcGenericScopes = util.PtrTo(envutil.RequireEnv("OIDC_GENERIC_SCOPES"))
+		oidcGenericPKCEEnabled = envutil.GetEnvParsedOrDefault("OIDC_GENERIC_PKCE_ENABLED", strconv.ParseBool, false)
+	}
+	wellKnownMicrosoftIdentityAssociation = envutil.GetEnvParsedOrDefault(
+		"WELLKNOWN_MICROSOFT_IDENTITY_ASSOCIATION_JSON", envparse.ByteSlice, nil)
+
+	stripeWebhookSecret = envutil.GetEnvOrNil("STRIPE_WEBHOOK_SECRET")
+	stripeWebhookVersionMismatchBehavior = envutil.GetEnvParsedOrDefault(
+		"STRIPE_WEBHOOK_VERSION_MISMATCH_BEHAVIOR",
+		parseStripeWebhookVersionMismatchBehavior,
+		StripeWebhookVersionMismatchBehaviorError,
+	)
+	stripeAPIKey = envutil.GetEnvOrNil("STRIPE_API_KEY")
+
+	if pem := getEnvResolvedOrNil(ctx, resolver, "LICENSE_KEY_PRIVATE_KEY"); pem != nil {
+		licenseKeyPrivateKeyPEM = []byte(*pem)
+	}
+
+	licenseKey = envutil.GetEnv("LICENSE_KEY")
+	metricsEnabled = envutil.GetEnvParsedOrDefault("METRICS_ENABLED", strconv.ParseBool, false)
+	metricsAddr = envutil.GetEnvOrDefault("METRICS_ADDR", ":3000")
+	metricsBearerToken = envutil.GetEnvOrNil("METRICS_BEARER_TOKEN")
+	metricsPprofEnabled = envutil.GetEnvParsedOrDefault("METRICS_PPROF_ENABLED", strconv.ParseBool, false)
+	supportBundleLogTailLines = envutil.GetEnvParsedOrDefault(
+		"SUPPORT_BUNDLE_LOG_TAIL_LINES", envparse.PositiveNumber, 1000,
+	)
+	supportBundleResourceMaxBytes = envutil.GetEnvParsedOrDefault(
+		"SUPPORT_BUNDLE_RESOURCE_MAX_BYTES", envparse.PositiveNumber, 1024*1024,
+	)
+	supportBundleScriptTimeout = envutil.GetEnvParsedOrDefault(
+		"SUPPORT_BUNDLE_SCRIPT_TIMEOUT", envparse.PositiveDuration, time.Minute,
+	)
+	supportCollectorDownloadURLOverride = envutil.GetEnvOrNil("SUPPORT_COLLECTOR_DOWNLOAD_URL")
+
+	lokiURL = envutil.RequireEnv("LOKI_URL")
+	lokiBearerToken = envutil.GetEnvOrNil("LOKI_BEARER_TOKEN")
+	lokiBasicAuthUsername = envutil.GetEnvOrNil("LOKI_BASIC_AUTH_USERNAME")
+	lokiBasicAuthPassword = envutil.GetEnvOrNil("LOKI_BASIC_AUTH_PASSWORD")
+	lokiRequestTimeout = envutil.GetEnvParsedOrDefault("LOKI_REQUEST_TIMEOUT", envparse.PositiveDuration, 30*time.Second)
+
+	customDomainTarget = envutil.GetEnvOrNil("CUSTOM_DOMAIN_TARGET")
+	customDomainVerificationCron = envutil.GetEnvOrNil("CUSTOM_DOMAIN_VERIFICATION_CRON")
+	customDomainVerificationTimeout = envutil.GetEnvParsedOrDefault("CUSTOM_DOMAIN_VERIFICATION_TIMEOUT",
+		envparse.PositiveDuration, 4*time.Minute)
+	customDomainVerificationRefreshAfter = envutil.GetEnvParsedOrDefault("CUSTOM_DOMAIN_VERIFICATION_REFRESH_AFTER",
+		envparse.PositiveDuration, 12*time.Hour)
+	internalServerAddr = envutil.GetEnvOrDefault("INTERNAL_SERVER_ADDR", ":8085")
+
+	maintenanceMode = envutil.GetEnvParsedOrDefault("MAINTENANCE_MODE", strconv.ParseBool, false)
+}
+
+// requireEnvResolved reads a required variable whose value may be wrapped with a key management
+// service instead of being the secret itself.
+func requireEnvResolved(ctx context.Context, resolver *kms.Resolver, key string) string {
+	return util.Require(resolver.Resolve(ctx, key, envutil.RequireEnv(key)))
+}
+
+// getEnvResolvedOrNil is [requireEnvResolved] for an optional variable.
+func getEnvResolvedOrNil(ctx context.Context, resolver *kms.Resolver, key string) *string {
+	value := envutil.GetEnvOrNil(key)
+	if value == nil {
+		return nil
+	}
+	return new(util.Require(resolver.Resolve(ctx, key, *value)))
+}
+
+func DatabaseUrl() string {
+	return databaseUrl
+}
+
+// DatabaseMaxConns allows to override the MaxConns parameter of the pgx pool config.
+//
+// Note that it should also be possible to set this value via the connection string
+// (like this: postgresql://...?pool_max_conns=10), but it doesn't work for some reason.
+func DatabaseMaxConns() *int {
+	return databaseMaxConns
+}
+
+// DatabaseReadonlyUrl returns the connection string for an optional read-only database (e.g. a replica).
+//
+// When set, expensive read-only queries (logs, analytics, dashboards, metrics, status) are
+// routed to this database instead of the primary. When nil, those queries use the primary.
+func DatabaseReadonlyUrl() *string {
+	return databaseReadonlyUrl
+}
+
+// DatabaseReadonlyMaxConns allows to override the MaxConns parameter of the read-only pgx pool config.
+func DatabaseReadonlyMaxConns() *int {
+	return databaseReadonlyMaxConns
+}
+
+// DatabaseEncryptionKey is the raw spec of the keyring. Pass it to dbcrypto.Init rather than parsing
+// it anywhere else, and read the keyring itself through dbcrypto.Keys.
+func DatabaseEncryptionKey() string {
+	return databaseEncryptionKey
+}
+
+// DatabaseEncryptionMigrateOnBoot makes the server encrypt every value that is still stored in
+// plaintext during startup, which is the alternative to running `distr maintenance encrypt-database`.
+func DatabaseEncryptionMigrateOnBoot() bool {
+	return databaseEncryptionMigrateOnBoot
+}
+
+func JWTSecret() []byte {
+	return jwtSecret
+}
+
+func Host() string { return host }
+
+// HostScheme is the scheme this instance is reached with, taken from DISTR_HOST. It is https unless
+// DISTR_HOST explicitly says http, and is the scheme of every URL this instance builds for a host
+// other than the one of the current request, e.g. an organization's custom domain.
+func HostScheme() URLScheme {
+	if strings.HasPrefix(strings.ToLower(host), string(SchemeHTTP)+"://") {
+		return SchemeHTTP
+	}
+	return SchemeHTTPS
+}
+
+func ControllerHost() *string { return controllerHost }
+
+func RegistryHost() string { return registryHost }
+
+// AnonymousRateLimits bounds what a single client IP may pull from public artifacts without
+// credentials. A zero disables the limit it stands for.
+type AnonymousRateLimits struct {
+	ManifestsPerMinute int
+	ManifestsPerHour   int
+	BlobsPerMinute     int
+	BlobsPerHour       int
+}
+
+func RegistryAnonymousRateLimits() AnonymousRateLimits { return registryAnonymousRateLimits }
+
+func GetMailerConfig() MailerConfig {
+	return mailerConfig
+}
+
+func InviteTokenValidDuration() time.Duration {
+	return inviteTokenValidDuration
+}
+
+func ResetTokenValidDuration() time.Duration {
+	return resetTokenValidDuration
+}
+
+func ControllerTokenMaxValidDuration() time.Duration {
+	return controllerTokenMaxValidDuration
+}
+
+func ControllerInterval() time.Duration {
+	return controllerInterval
+}
+
+func SentryDSN() string {
+	return sentryDSN
+}
+
+func SentryDebug() bool {
+	return sentryDebug
+}
+
+func SentryEnvironment() string {
+	return sentryEnvironment
+}
+
+func EnableQueryLogging() bool {
+	return enableQueryLogging
+}
+
+func MetricsEntriesMaxAge() *time.Duration {
+	return metricsEntriesMaxAge
+}
+
+func ControllerDockerConfig() []byte {
+	return controllerDockerConfig
+}
+
+func ControllerImageRepository() string {
+	return controllerImageRepository
+}
+
+func FrontendSentryDSN() *string {
+	return frontendSentryDSN
+}
+
+func FrontendSentryTraceSampleRate() *float64 {
+	return frontendSentryTraceSampleRate
+}
+
+func FrontendPosthogToken() *string {
+	return frontendPosthogToken
+}
+
+func FrontendPosthogAPIHost() *string {
+	return frontendPosthogAPIHost
+}
+
+func FrontendPosthogUIHost() *string {
+	return frontendPosthogUIHost
+}
+
+func UserEmailVerificationRequired() bool {
+	return userEmailVerificationRequired
+}
+
+func ServerShutdownDelayDuration() *time.Duration {
+	return serverShutdownDelayDuration
+}
+
+func Registration() RegistrationMode {
+	return registration
+}
+
+func BlockedEmailDomains() []string {
+	return blockedEmailDomains
+}
+
+func BlockedIPs() []netip.Prefix {
+	return blockedIPs
+}
+
+func TurnstileSiteKey() *string {
+	return turnstileSiteKey
+}
+
+func TurnstileSecret() *string {
+	return turnstileSecret
+}
+
+func SupportEmail() *string {
+	return supportEmail
+}
+
+func RegistrationLegalText() *string {
+	return registrationLegalText
+}
+
+func RegistryEnabled() bool {
+	return registryEnabled
+}
+
+func RegistryS3Config() S3Config {
+	return registryS3Config
+}
+
+func RegistryScratchDir() *string {
+	return registryScratchDir
+}
+
+func ArtifactTagsDefaultLimitPerOrg() int {
+	return artifactTagsDefaultLimitPerOrg
+}
+
+func RegistryUpstreamSyncCron() *string {
+	return registryUpstreamSyncCron
+}
+
+func RegistryUpstreamSyncTimeout() time.Duration {
+	return registryUpstreamSyncTimeout
+}
+
+func RegistryUpstreamBlobFetchTimeout() time.Duration {
+	return registryUpstreamBlobFetchTimeout
+}
+
+func OtelControllerSampler() *SamplerConfig {
+	return otelControllerSampler
+}
+
+func OtelRegistrySampler() *SamplerConfig {
+	return otelRegistrySampler
+}
+
+func OtelExporterSentryEnabled() bool {
+	return otelExporterSentryEnabled
+}
+
+func OtelExporterOtlpEnabled() bool {
+	return otelExporterOtlpEnabled
+}
+
+func CleanupDeploymentTargetMetricsCron() *string {
+	return cleanupDeploymentTargetMetricsCron
+}
+
+func CleanupDeploymentTargetMetricsTimeout() time.Duration {
+	return cleanupDeploymentTargetMetricsTimeout
+}
+
+func DeploymentStatusNotificationCron() *string {
+	return deploymentStatusNotificationCron
+}
+
+func DeploymentStatusNotificationTimeout() time.Duration {
+	return deploymentStatusNotificationTimeout
+}
+
+// NotificationEmailHourlyQuota is the maximum number of status/metrics notification
+// emails sent to a single email address per hour. 0 means unlimited.
+func NotificationEmailHourlyQuota() int {
+	return notificationEmailHourlyQuota
+}
+
+func CleanupOIDCStateCron() *string {
+	return cleanupOIDCStateCron
+}
+
+func CleanupOIDCStateCronTimeout() time.Duration {
+	return cleanupOIDCStateCronTimeout
+}
+
+func CleanupArtifactBlobCron() *string {
+	return cleanupArtifactBlobCron
+}
+
+func CleanupArtifactBlobTimeout() time.Duration {
+	return cleanupArtifactBlobTimeout
+}
+
+func CleanupArtifactBlobMinAge() time.Duration {
+	return cleanupArtifactBlobMinAge
+}
+
+func CleanupOrganizationCron() *string {
+	return cleanupOrganizationCron
+}
+
+func CleanupOrganizationTimeout() time.Duration {
+	return cleanupOrganizationTimeout
+}
+
+func CleanupOrganizationMinAge() time.Duration {
+	return cleanupOrganizationMinAge
+}
+
+func CleanupUserAccountCron() *string {
+	return cleanupUserAccountCron
+}
+
+func CleanupUserAccountTimeout() time.Duration {
+	return cleanupUserAccountTimeout
+}
+
+func CleanupUserAccountMinAge() time.Duration {
+	return cleanupUserAccountMinAge
+}
+
+func CleanupFileCron() *string {
+	return cleanupFileCron
+}
+
+func CleanupFileTimeout() time.Duration {
+	return cleanupFileTimeout
+}
+
+func CleanupFileMinAge() time.Duration {
+	return cleanupFileMinAge
+}
+
+func OIDCGithubEnabled() bool {
+	return oidcGithubEnabled
+}
+
+func OIDCGithubClientID() *string {
+	return oidcGithubClientID
+}
+
+func OIDCGithubClientSecret() *string {
+	return oidcGithubClientSecret
+}
+
+func OIDCGoogleEnabled() bool {
+	return oidcGoogleEnabled
+}
+
+func OIDCGoogleClientID() *string {
+	return oidcGoogleClientID
+}
+
+func OIDCGoogleClientSecret() *string {
+	return oidcGoogleClientSecret
+}
+
+func OIDCMicrosoftEnabled() bool {
+	return oidcMicrosoftEnabled
+}
+
+func OIDCMicrosoftClientID() *string {
+	return oidcMicrosoftClientID
+}
+
+func OIDCMicrosoftClientSecret() *string {
+	return oidcMicrosoftClientSecret
+}
+
+func OIDCMicrosoftTenantID() *string {
+	return oidcMicrosoftTenantID
+}
+
+func OIDCGenericEnabled() bool         { return oidcGenericEnabled }
+func OIDCGenericClientID() *string     { return oidcGenericClientID }
+func OIDCGenericClientSecret() *string { return oidcGenericClientSecret }
+func OIDCGenericIssuer() *string       { return oidcGenericIssuer }
+func OIDCGenericPKCEEnabled() bool     { return oidcGenericPKCEEnabled }
+func OIDCGenericScopes() *string       { return oidcGenericScopes }
+
+func WellKnownMicrosoftIdentityAssociation() []byte {
+	return wellKnownMicrosoftIdentityAssociation
+}
+
+func StripeWebhookSecret() *string {
+	return stripeWebhookSecret
+}
+
+func StripeWebhookVersionMismatchBehavior() StripeWebhookVersionMismatchBehaviorType {
+	return stripeWebhookVersionMismatchBehavior
+}
+
+func StripeAPIKey() *string {
+	return stripeAPIKey
+}
+
+func LicenseKeyPrivateKey() []byte {
+	return licenseKeyPrivateKeyPEM
+}
+
+func LicenseKey() string {
+	return licenseKey
+}
+
+func MetricsEnabled() bool {
+	return metricsEnabled
+}
+
+func MetricsAddr() string {
+	return metricsAddr
+}
+
+func MetricsBearerToken() *string {
+	return metricsBearerToken
+}
+
+func MetricsPprofEnabled() bool {
+	return metricsPprofEnabled
+}
+
+// SupportBundleLogTailLines is the number of container log lines (per container) collected by the
+// support bundle collect script.
+func SupportBundleLogTailLines() int {
+	return supportBundleLogTailLines
+}
+
+// SupportBundleResourceMaxBytes is the maximum size of a single resource collected by the
+// support bundle collect script.
+func SupportBundleResourceMaxBytes() int {
+	return supportBundleResourceMaxBytes
+}
+
+// SupportBundleScriptTimeout is how long a single custom script may run on the customer's host
+// before the collect script kills it. Rounded up to whole seconds when rendered.
+func SupportBundleScriptTimeout() time.Duration {
+	return supportBundleScriptTimeout
+}
+
+// SupportCollectorDownloadURLOverride replaces the GitHub release the Kubernetes collect script
+// downloads the support collector from, e.g. with a mirror of its assets.
+func SupportCollectorDownloadURLOverride() *string {
+	return supportCollectorDownloadURLOverride
+}
+
+// LokiURL is the base URL of the Loki instance storing deployment and deployment
+// target log records, e.g. "http://loki:3100".
+func LokiURL() string {
+	return lokiURL
+}
+
+func LokiBearerToken() *string {
+	return lokiBearerToken
+}
+
+func LokiBasicAuthUsername() *string {
+	return lokiBasicAuthUsername
+}
+
+func LokiBasicAuthPassword() *string {
+	return lokiBasicAuthPassword
+}
+
+func LokiRequestTimeout() time.Duration {
+	return lokiRequestTimeout
+}
+
+// CustomDomainTarget is the DNS name (pointing at the Caddy LoadBalancer) that vendors CNAME
+// every custom domain to, e.g. "whitelabel.distr.sh". One target serves all domain types: Caddy
+// routes registry traffic to the registry by its mandatory /v2/ path prefix, not by hostname.
+func CustomDomainTarget() *string {
+	return customDomainTarget
+}
+
+// CustomDomainsConfigured reports whether the self-service custom domain feature is
+// configured on this instance. The internal caddy-ask server is only started when it is.
+func CustomDomainsConfigured() bool {
+	return customDomainTarget != nil
+}
+
+func CustomDomainVerificationCron() *string {
+	return customDomainVerificationCron
+}
+
+func CustomDomainVerificationTimeout() time.Duration {
+	return customDomainVerificationTimeout
+}
+
+func CustomDomainVerificationRefreshAfter() time.Duration {
+	return customDomainVerificationRefreshAfter
+}
+
+// InternalServerAddr is the listen address of the internal HTTP server, which currently
+// serves only the Caddy on-demand TLS ask endpoint. It must never be exposed outside the
+// cluster.
+func InternalServerAddr() string {
+	return internalServerAddr
+}
+
+// MaintenanceMode reports whether this instance is down for maintenance. It keeps serving the
+// frontend, but answers every API request with 503 instead of letting it reach the database.
+func MaintenanceMode() bool {
+	return maintenanceMode
+}

@@ -1,0 +1,117 @@
+package mapping
+
+import (
+	"github.com/distr-sh/distr/api"
+	"github.com/distr-sh/distr/internal/supportbundle/resourcetype"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+)
+
+func SupportBundleConfigurationEnvVarsToAPI(
+	envVars []types.SupportBundleConfigurationEnvVar,
+) []api.SupportBundleConfigurationEnvVar {
+	return List(envVars, func(ev types.SupportBundleConfigurationEnvVar) api.SupportBundleConfigurationEnvVar {
+		return api.SupportBundleConfigurationEnvVar{
+			Name:     ev.Name,
+			Redacted: ev.Redacted,
+		}
+	})
+}
+
+func SupportBundleKubernetesConfigurationToAPI(
+	config types.SupportBundleKubernetesConfiguration,
+) api.SupportBundleKubernetesConfiguration {
+	return api.SupportBundleKubernetesConfiguration{
+		IncludeConfigMapData: config.IncludeConfigMapData,
+		IncludeSecretData:    config.IncludeSecretData,
+	}
+}
+
+func SupportBundleKubernetesConfigurationToInternal(
+	request api.SupportBundleKubernetesConfiguration,
+	orgID uuid.UUID,
+) types.SupportBundleKubernetesConfiguration {
+	return types.SupportBundleKubernetesConfiguration{
+		OrganizationID:       orgID,
+		IncludeConfigMapData: request.IncludeConfigMapData,
+		IncludeSecretData:    request.IncludeSecretData,
+	}
+}
+
+func SupportBundleConfigurationScriptToAPI(
+	script types.SupportBundleConfigurationScript,
+) api.SupportBundleConfigurationScript {
+	return api.SupportBundleConfigurationScript{
+		ID:             script.ID,
+		CreatedAt:      script.CreatedAt,
+		DeploymentType: script.DeploymentType,
+		Name:           script.Name,
+		Description:    script.Description,
+		Content:        script.Content,
+		Enabled:        script.Enabled,
+	}
+}
+
+func SupportBundleConfigurationScriptToInternal(
+	request api.CreateUpdateSupportBundleConfigurationScriptRequest,
+	orgID uuid.UUID,
+) types.SupportBundleConfigurationScript {
+	return types.SupportBundleConfigurationScript{
+		OrganizationID: orgID,
+		DeploymentType: request.DeploymentType,
+		Name:           request.Name,
+		Description:    request.Description,
+		Content:        request.Content,
+		Enabled:        request.Enabled,
+	}
+}
+
+func SupportBundleToAPI(bundle types.SupportBundleWithDetails) api.SupportBundle {
+	return api.SupportBundle{
+		ID:                       bundle.ID,
+		CreatedAt:                bundle.CreatedAt,
+		CustomerOrganizationID:   bundle.CustomerOrganizationID,
+		CustomerOrganizationName: bundle.CustomerOrganizationName,
+		CreatedByUserAccountID:   bundle.CreatedByUserAccountID,
+		CreatedByUserName:        bundle.CreatedByUserName,
+		CreatedByImageURL:        CreateImageURL(bundle.CreatedByImageID),
+		DeploymentType:           bundle.DeploymentType,
+		Title:                    bundle.Title,
+		Description:              bundle.Description,
+		Status:                   string(bundle.Status),
+		ResourceCount:            bundle.ResourceCount,
+		CommentCount:             bundle.CommentCount,
+		LastCommentAt:            bundle.LastCommentAt,
+		StatusChangedByUserName:  bundle.StatusChangedByUserName,
+		StatusChangedByImageURL:  CreateImageURL(bundle.StatusChangedByImageID),
+		StatusChangedAt:          bundle.StatusChangedAt,
+	}
+}
+
+func SupportBundleResourceToAPI(resource types.SupportBundleResource) api.SupportBundleResource {
+	return api.SupportBundleResource{
+		SupportBundleResourceSummary: SupportBundleResourceSummaryToAPI(resource.SupportBundleResourceSummary),
+		Content:                      string(resource.Content),
+	}
+}
+
+func SupportBundleResourceSummaryToAPI(resource types.SupportBundleResourceSummary) api.SupportBundleResourceSummary {
+	return api.SupportBundleResourceSummary{
+		ID:          resource.ID,
+		CreatedAt:   resource.CreatedAt,
+		Name:        resource.Name,
+		ContentType: resourcetype.ParseContentType(resource.ContentType),
+		Size:        resource.Size,
+	}
+}
+
+func SupportBundleCommentToAPI(comment types.SupportBundleCommentWithUser) api.SupportBundleComment {
+	return api.SupportBundleComment{
+		ID:            comment.ID,
+		CreatedAt:     comment.CreatedAt,
+		UserAccountID: comment.UserAccountID,
+		UserName:      comment.UserName,
+		UserImageURL:  CreateImageURL(comment.UserImageID),
+		Content:       comment.Content,
+	}
+}

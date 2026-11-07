@@ -1,0 +1,97 @@
+<div
+  class="flex cursor-default items-center justify-end space-x-1 rtl:space-x-reverse"
+  tabindex="0"
+  role="button"
+  [attr.aria-haspopup]="'dialog'"
+  [attr.aria-expanded]="hovered()"
+  (mouseenter)="hovered.set(true)"
+  (mouseleave)="hovered.set(false)"
+  (focus)="hovered.set(true)"
+  (blur)="hovered.set(false)"
+  (click)="hovered.set(!hovered())"
+  cdkOverlayOrigin
+  #metricsOverlayOrigin="cdkOverlayOrigin">
+  @if (anyDiskWarning()) {
+    <div class="text-red-400" [class.grayscale]="outdated()">
+      <fa-icon [icon]="faHardDrive" />
+      <fa-icon class="-ms-2" [icon]="faExclamation" />
+    </div>
+  }
+
+  <div class="relative">
+    <div
+      class="gauge relative size-10 rounded-full bg-conic from-green-700 via-yellow-300 to-red-600"
+      [class.grayscale]="outdated()"
+      [style.--deg]="cpuUsageDegrees()"></div>
+    <div class="absolute inset-1 rounded-full bg-white dark:bg-gray-800"></div>
+    <div class="absolute inset-0 flex items-center justify-center text-xs font-thin text-black dark:text-white">
+      {{ metrics().cpuUsage | percent }}
+    </div>
+  </div>
+
+  <div class="relative">
+    <div
+      class="gauge relative size-10 rounded-full bg-conic from-green-700 via-yellow-300 to-red-600"
+      [class.grayscale]="outdated()"
+      [style.--deg]="memoryUsageDegrees()"></div>
+    <div class="absolute inset-1 rounded-full bg-white dark:bg-gray-800"></div>
+    <div class="absolute inset-0 flex items-center justify-center text-xs font-thin text-black dark:text-white">
+      {{ metrics().memoryUsage | percent }}
+    </div>
+  </div>
+</div>
+
+<ng-template
+  cdkConnectedOverlay
+  [cdkConnectedOverlayOrigin]="metricsOverlayOrigin"
+  [cdkConnectedOverlayOpen]="hovered()"
+  [cdkConnectedOverlayPush]="true"
+  [cdkConnectedOverlayPositions]="[
+    {originX: 'center', originY: 'bottom', overlayX: 'center', overlayY: 'top'},
+    {originX: 'center', originY: 'top', overlayX: 'center', overlayY: 'bottom'},
+  ]">
+  <div class="distr-tooltip mt-1 px-3 py-2 text-xs whitespace-nowrap">
+    <div class="flex flex-col gap-2">
+      @if (outdated()) {
+        <div class="flex items-center gap-1.5 text-yellow-800 dark:text-yellow-300">
+          <fa-icon [icon]="faTriangleExclamation" />
+          <span>Outdated metrics, last reported {{ metrics().createdAt | relativeDate }}</span>
+        </div>
+      }
+      <div>
+        <span class="me-1 inline-block size-2" [appStatusDot]="metrics().cpuUsage > 0.75 ? 'danger' : 'ok'"></span>
+        <span class="font-semibold">CPU:</span>
+        {{ metrics().cpuUsage | percent: '1.1-1' }} of {{ metrics().cpuCoresMillis / 1000 }} Cores
+        @if (controllerUsage(); as controller) {
+          <span class="text-gray-500 dark:text-gray-400">(Controller usage: {{ controller.cpuUsageMillis }}m)</span>
+        }
+      </div>
+      <div>
+        <span class="me-1 inline-block size-2" [appStatusDot]="metrics().memoryUsage > 0.75 ? 'danger' : 'ok'"></span>
+        <span class="font-semibold">RAM:</span>
+        {{ metrics().memoryUsage | percent: '1.1-1' }} of {{ metrics().memoryBytes | bytes: '1.0-0' }}
+        @if (controllerUsage(); as controller) {
+          <span class="text-gray-500 dark:text-gray-400"
+            >(Controller usage: {{ controller.memoryBytes | bytes: '1.0-1' }})</span
+          >
+        }
+      </div>
+      @for (disk of metrics().diskMetrics; track disk.path) {
+        @let diskUsage = disk.bytesUsed / disk.bytesTotal;
+        <div>
+          <span class="me-1 inline-block size-2" [appStatusDot]="diskUsage > 0.75 ? 'danger' : 'ok'"></span>
+          <span class="font-semibold">{{ disk.device }}:</span>
+          {{ diskUsage | percent: '1.1-1' }} of {{ disk.bytesTotal | bytes: '1.0-0' }}
+        </div>
+      }
+      @let imageBytes = metrics().imageBytes;
+      @if (imageBytes !== undefined) {
+        <div class="text-gray-500 dark:text-gray-400">Container images: {{ imageBytes | bytes: '1.0-1' }}</div>
+      }
+      @let controllerLogBytes = metrics().controllerLogBytes;
+      @if (controllerLogBytes !== undefined) {
+        <div class="text-gray-500 dark:text-gray-400">Controller logs: {{ controllerLogBytes | bytes: '1.0-1' }}</div>
+      }
+    </div>
+  </div>
+</ng-template>

@@ -1,0 +1,190 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "postUpdateOptions": [
+    "gomodTidy",
+    "pnpmDedupe"
+  ],
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigestsToSemver"
+  ],
+  "timezone": "Europe/Vienna",
+  "schedule": [
+    "* 0-7,20-23 * * 1-5",
+    "* * * * 0,6"
+  ],
+  "updateNotScheduled": false,
+  "platformAutomerge": false,
+  "rebaseWhen": "behind-base-branch",
+  "minimumReleaseAge": "1 day",
+  "gitIgnoredAuthors": [
+    "133648757+glasskube-bot@users.noreply.github.com"
+  ],
+  "packageRules": [
+    {
+      "description": "Registries other than Docker Hub do not expose release timestamps, which would make minimumReleaseAge unsatisfiable",
+      "matchDatasources": [
+        "docker"
+      ],
+      "minimumReleaseAgeBehaviour": "timestamp-optional"
+    },
+    {
+      "description": "Silence dependency lookup warnings for enterprise images, which are not publicly available",
+      "matchPackageNames": [
+        "registry.distr.sh/enterprise/distr-ee"
+      ],
+      "enabled": false
+    },
+    {
+      "matchPackageNames": [
+        "github.com/go-mailx/**"
+      ],
+      "groupName": "go-mailx dependencies"
+    },
+    {
+      "extends": [
+        "monorepo:opentelemetry-go"
+      ],
+      "groupName": "opentelemetry-go monorepo"
+    },
+    {
+      "extends": [
+        "monorepo:opentelemetry-go-contrib"
+      ],
+      "groupName": "opentelemetry-go-contrib monorepo"
+    },
+    {
+      "description": "The sentry-go modules share one version and go mod tidy bumps the rest with any one of them, which auto-closes their separate PRs",
+      "matchPackageNames": [
+        "github.com/getsentry/sentry-go",
+        "github.com/getsentry/sentry-go/**"
+      ],
+      "groupName": "sentry-go"
+    },
+    {
+      "matchSourceUrls": [
+        "https://github.com/golangci/golangci-lint"
+      ],
+      "groupName": "golangci-lint"
+    },
+    {
+      "matchFileNames": ["website/**"],
+      "semanticCommitType": "build",
+      "semanticCommitScope": "website"
+    },
+    {
+      "matchFileNames": ["website/**"],
+      "matchPackageNames": [
+        "!pnpm",
+        "!distr-sh/hello-distr",
+        "!ghcr.io/distr-sh/hello-distr/**"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "groupName": "website dependencies",
+      "automerge": true
+    },
+    {
+      "matchManagers": [
+        "github-actions"
+      ],
+      "semanticCommitType": "ci"
+    },
+    {
+      "description": "Automerge minor and patch releases of non-0.x development dependencies",
+      "matchManagers": [
+        "npm"
+      ],
+      "matchDepTypes": [
+        "devDependencies"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "matchCurrentVersion": "!/^0/",
+      "automerge": true
+    },
+    {
+      "description": "Automerge minor and patch releases of GitHub Actions",
+      "matchManagers": [
+        "github-actions"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Automerge minor and patch releases",
+      "matchPackageNames": [
+        "@fontsource/*",
+        "@sentry/*",
+        "axllent/mailpit",
+        "github.com/getsentry/sentry-go",
+        "github.com/getsentry/sentry-go/**",
+        "postcss",
+        "posthog-js",
+        "rustfs",
+        "rustfs/rustfs"
+      ],
+      "matchUpdateTypes": [
+        "minor",
+        "patch"
+      ],
+      "automerge": true
+    },
+    {
+      "description": "Schedule noisy dependencies on Sunday",
+      "matchPackageNames": [
+        "@fontsource/*",
+        "@sentry/*",
+        "postcss",
+        "posthog-js"
+      ],
+      "schedule": [
+        "* * * * 0"
+      ]
+    },
+    {
+      "matchPackageNames": [
+        "distr-sh/hello-distr",
+        "ghcr.io/distr-sh/hello-distr/**"
+      ],
+      "groupName": "hello-distr",
+      "minimumReleaseAge": "0 days",
+      "automerge": true
+    }
+  ],
+  "customManagers": [
+    {
+      "customType": "regex",
+      "description": "Images of the pre_start and post_start lifecycle hooks. Renovate's docker-compose manager (https://docs.renovatebot.com/modules/manager/docker-compose/) extracts services.<name>.image only, so hook images are missed upstream. Drop this manager once it handles them. The first matchString bounds the hook block by indentation, since RE2 has no backreference for the indentation of the hook key itself.",
+      "managerFilePatterns": [
+        "deploy/docker/*/docker-compose.yaml"
+      ],
+      "matchStringsStrategy": "recursive",
+      "matchStrings": [
+        "(?:pre_start|post_start):[ \\t]*\\n(?:[ \\t]{6,}[^\\n]*\\n)+",
+        "image:[ \\t]*'?(?<depName>[^:'\\s]+):(?<currentValue>[^'\\s@]+)'?"
+      ],
+      "datasourceTemplate": "docker"
+    },
+    {
+      "customType": "regex",
+      "managerFilePatterns": [
+        "internal/handlers/tutorials.go",
+        "frontend/ui/src/app/tutorials/registry/registry-tutorial.component.ts",
+        ".github/workflows/build-distr.yaml"
+      ],
+      "matchStrings": [
+        "\"(?<currentValue>[^\"]+)\",\\s+// renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)",
+        "'(?<currentValue>[^']+)';?\\s+// renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)",
+        "'(?<currentValue>[^']+)'\\s+# renovate: datasource=(?<datasource>[^\\s]+) depName=(?<depName>[^\\s]+)"
+      ]
+    }
+  ]
+}

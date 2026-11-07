@@ -1,0 +1,90 @@
+package authinfo
+
+import (
+	"github.com/distr-sh/distr/internal/authjwt"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+)
+
+type SimpleAuthInfo struct {
+	userID                 uuid.UUID
+	userEmail              string
+	organizationID         *uuid.UUID
+	customerOrganizationID *uuid.UUID
+	partnerOrganizationID  *uuid.UUID
+	deploymentTargetID     *uuid.UUID
+	emailVerified          bool
+	tokenScope             authjwt.TokenScope
+	isAccessToken          bool
+	isCustomOIDCSession    bool
+	userRole               *types.UserRole
+	isSuperAdmin           bool
+	isLens                 bool
+	rawToken               any
+}
+
+// CurrentOrgID implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentOrgID() *uuid.UUID { return i.organizationID }
+
+// CurrentCustomerOrgID implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentCustomerOrgID() *uuid.UUID { return i.customerOrganizationID }
+
+// CurrentPartnerOrgID implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentPartnerOrgID() *uuid.UUID { return i.partnerOrganizationID }
+
+// CurrentDeploymentTargetID implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentDeploymentTargetID() *uuid.UUID { return i.deploymentTargetID }
+
+// CurrentUserEmailVerified implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentUserEmailVerified() bool { return i.emailVerified }
+
+// TokenScope implements AuthInfo.
+func (i *SimpleAuthInfo) TokenScope() authjwt.TokenScope { return i.tokenScope }
+
+// IsAccessToken implements AuthInfo.
+func (i *SimpleAuthInfo) IsAccessToken() bool { return i.isAccessToken }
+
+// IsCustomOIDCSession implements AuthInfo.
+func (i *SimpleAuthInfo) IsCustomOIDCSession() bool { return i.isCustomOIDCSession }
+
+// OrganizationScoped implements AuthInfo.
+func (i *SimpleAuthInfo) OrganizationScoped() bool { return i.isAccessToken || i.isCustomOIDCSession }
+
+// CurrentUserID implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentUserID() uuid.UUID { return i.userID }
+
+// CurrentUserEmail implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentUserEmail() string { return i.userEmail }
+
+// CurrentUserRole implements AuthInfo.
+func (i *SimpleAuthInfo) CurrentUserRole() *types.UserRole { return i.userRole }
+
+// IsSuperAdmin implements AuthInfo.
+func (i *SimpleAuthInfo) IsSuperAdmin() bool { return i.isSuperAdmin }
+
+// IsLens implements AuthInfo.
+func (i *SimpleAuthInfo) IsLens() bool { return i.isLens }
+
+// Token implements AuthInfo.
+func (i *SimpleAuthInfo) Token() any { return i.rawToken }
+
+type SimpleControllerAuthInfo struct {
+	deploymentTargetID uuid.UUID
+	organizationID     uuid.UUID
+	rawToken           any
+}
+
+// CurrentDeploymentTargetID implements ControllerAuthInfo.
+func (i *SimpleControllerAuthInfo) CurrentDeploymentTargetID() uuid.UUID {
+	return i.deploymentTargetID
+}
+
+// CurrentOrgID implements ControllerAuthInfo.
+func (i *SimpleControllerAuthInfo) CurrentOrgID() uuid.UUID {
+	return i.organizationID
+}
+
+// Token implements ControllerAuthInfo.
+func (i *SimpleControllerAuthInfo) Token() any {
+	return i.rawToken
+}

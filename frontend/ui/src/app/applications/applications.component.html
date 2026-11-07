@@ -1,0 +1,201 @@
+<div class="distr-table-panel">
+  @if (fullVersion()) {
+    <div class="distr-toolbar p-4">
+      <app-search-bar [control]="filterForm.controls.search" placeholder="Filter applications" />
+      <div class="distr-toolbar-actions">
+        <button
+          *appPermissions="{vendor: true, role: ['read_write', 'admin']}"
+          (click)="openCreateModal(newApplicationModal)"
+          type="button"
+          id="createApplicationButton"
+          class="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none md:w-auto dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+          <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+          Add application
+        </button>
+      </div>
+    </div>
+  }
+  <div class="overflow-x-auto">
+    <table class="distr-table">
+      <thead class="distr-table-head">
+        <tr>
+          <th scope="col" class="p-4">Application</th>
+          <th scope="col" class="p-4">Versions</th>
+          @if (fullVersion()) {
+            <th scope="col" class="p-4">Creation Date</th>
+          }
+        </tr>
+      </thead>
+      <tbody>
+        @for (application of applications$ | async; track application.id) {
+          <tr [appClickableRow]="['/', 'applications', application.id]" class="distr-table-row">
+            <td class="distr-table-cell">
+              <div class="flex flex-wrap items-center gap-2">
+                <div class="flex items-center">
+                  <app-application-logo
+                    class="mr-3 size-8 shrink-0"
+                    [imageUrl]="application.imageUrl"
+                    [type]="application.type" />
+                  <span class="max-w-32 overflow-hidden text-ellipsis sm:max-w-64 lg:max-w-128">
+                    {{ application.name }}
+                  </span>
+                </div>
+                <span class="distr-badge capitalize">{{ application.type }}</span>
+                @if (isAutoUpdatesEnabled() && application.allowAutomaticUpdates) {
+                  <span class="distr-badge distr-badge-success whitespace-nowrap"> Auto-Updates allowed </span>
+                }
+              </div>
+            </td>
+            <td class="distr-table-cell">
+              <div class="flex items-center">
+                {{ application.versions?.length || 0 }}
+              </div>
+            </td>
+            @if (fullVersion()) {
+              <td class="distr-table-cell">
+                <div class="flex items-center">
+                  {{ application.createdAt | date: 'short' }}
+                </div>
+              </td>
+            }
+          </tr>
+        }
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<ng-template #newApplicationModal>
+  <div
+    animate.enter="animate-fly-in-top"
+    animate.leave="animate-fly-out-top"
+    class="my-auto max-h-full w-140 overflow-y-auto rounded-lg bg-white p-4 shadow-sm dark:bg-gray-900">
+    <div class="relative max-h-full w-full">
+      <div class="relative rounded-lg">
+        <div
+          class="flex items-center justify-between rounded-t border-b border-gray-200 p-4 md:p-5 dark:border-gray-600">
+          <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Create Application</h3>
+          <button
+            type="button"
+            class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white"
+            (click)="hideCreateModal()">
+            <fa-icon [icon]="faXmark" />
+            <span class="sr-only">Close modal</span>
+          </button>
+        </div>
+
+        <div class="p-4 md:p-5">
+          <form [formGroup]="createApplicationForm" (ngSubmit)="createApplication()">
+            <div>
+              <div class="space-y-4 sm:flex sm:space-y-0 sm:space-x-4">
+                <div class="w-full">
+                  <label for="name" class="distr-label mb-2">
+                    Application Name <span class="text-red-500">*</span>
+                  </label>
+                  <input
+                    [formControl]="createApplicationForm.controls.name"
+                    autotrim
+                    autocomplete="off"
+                    type="text"
+                    name="name"
+                    id="name"
+                    class="distr-input" />
+                  @if (createApplicationForm.controls.name.invalid && createApplicationForm.controls.name.touched) {
+                    <p class="mt-1 text-sm text-red-600 dark:text-red-500">Field is required.</p>
+                  }
+                </div>
+              </div>
+
+              <div class="mt-4">
+                <label class="distr-label mb-2">Application Type <span class="text-red-500">*</span></label>
+                <div class="mb-2 grid grid-cols-1 gap-4 sm:grid-cols-2">
+                  <label class="distr-radio-card">
+                    <input
+                      [formControl]="createApplicationForm.controls.type"
+                      aria-describedby="app-type-docker-radio-text"
+                      type="radio"
+                      name="appType"
+                      value="docker"
+                      class="distr-radio mt-0.5" />
+                    <div class="text-sm">
+                      <span class="font-bold text-gray-900 dark:text-white">Docker Compose</span>
+                      <p id="app-type-docker-radio-text" class="distr-hint mt-1">I have a docker compose file.</p>
+                    </div>
+                  </label>
+
+                  <label class="distr-radio-card">
+                    <input
+                      [formControl]="createApplicationForm.controls.type"
+                      aria-describedby="app-type-kubernetes-radio-text"
+                      type="radio"
+                      name="appType"
+                      value="kubernetes"
+                      class="distr-radio mt-0.5" />
+                    <div class="text-sm">
+                      <span class="font-bold text-gray-900 dark:text-white">Helm / Kubernetes</span>
+                      <p id="app-type-kubernetes-radio-text" class="distr-hint mt-1">I have a Helm chart.</p>
+                    </div>
+                  </label>
+                </div>
+
+                @if (createApplicationForm.controls.type.invalid && createApplicationForm.controls.type.touched) {
+                  <p class="text-sm text-red-600 dark:text-red-500">Field is required.</p>
+                }
+              </div>
+
+              <div class="mt-4">
+                <label for="versioningStrategy" class="distr-label mb-2">
+                  Versioning Strategy <span class="text-red-500">*</span>
+                </label>
+                <select
+                  id="versioningStrategy"
+                  [formControl]="createApplicationForm.controls.versioningStrategy"
+                  class="distr-input">
+                  <option value="semver">Semantic versioning</option>
+                  <option value="chronological">Chronological versioning</option>
+                </select>
+                <p class="mt-1 text-xs font-normal text-gray-500 dark:text-gray-400">
+                  @if (createApplicationForm.controls.versioningStrategy.value === 'chronological') {
+                    The most recently created version is the latest, whatever it is named.
+                  } @else {
+                    Every version name has to be a valid SemVer version, such as 1.4.0.
+                  }
+                </p>
+              </div>
+
+              @if (isAutoUpdatesEnabled()) {
+                <div class="mt-4 flex items-start">
+                  <div class="flex h-5 items-center">
+                    <input
+                      id="allow-automatic-updates-checkbox"
+                      [formControl]="createApplicationForm.controls.allowAutomaticUpdates"
+                      aria-describedby="allow-automatic-updates-checkbox-text"
+                      type="checkbox"
+                      class="distr-checkbox" />
+                  </div>
+                  <div class="ms-3 text-sm">
+                    <label for="allow-automatic-updates-checkbox" class="distr-label">Allow automatic updates</label>
+                    <p
+                      id="allow-automatic-updates-checkbox-text"
+                      class="mt-1 text-xs font-normal text-gray-500 dark:text-gray-400">
+                      Let a deployment of this application be updated to the latest version without anyone deploying it.
+                    </p>
+                  </div>
+                </div>
+              }
+
+              <div class="mt-5 flex justify-stretch space-x-2.5 sm:justify-end">
+                <button
+                  type="submit"
+                  [disabled]="createApplicationFormLoading"
+                  class="distr-btn-primary inline-flex flex-1 items-center justify-center text-white sm:flex-none">
+                  Create Application
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</ng-template>

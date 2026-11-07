@@ -1,0 +1,217 @@
+[settings]
+env_shell_expand = false
+task.output = "prefix"
+
+[tools]
+node = "26"
+go = "1.27.3"
+golangci-lint = "2.15.0"
+helm = "4.3.1"
+helm-docs = "1.14.2"
+"github:losisin/helm-values-schema-json" = "2.6.0"
+watchexec = "2.8.0"
+pnpm = "12.16.1"
+stripe = "1.55.8"
+"go:github.com/go-delve/delve/cmd/dlv" = "1.27.2"
+git-lfs = "3.8.1"
+
+[env]
+_.source = ['hack/current-commit.sh']
+DISTR_ENV = '.env.development.local'
+VERSION = 'snapshot'
+CGO_ENABLED = "0"
+
+[vars]
+ldflags = "-s -w -X github.com/distr-sh/distr/internal/buildconfig.version=$VERSION -X github.com/distr-sh/distr/internal/buildconfig.commit=$COMMIT"
+
+[tasks.go-tidy]
+run = 'go mod tidy'
+
+[tasks."build:sdk"]
+run = ['pnpm run build', 'pnpm run docs']
+dir = "sdk/js"
+sources = [
+  "{{config_root}}/sdk/js/src/**/*",
+  "{{config_root}}/sdk/js/package.json",
+]
+
+[tasks."build:frontend:dev"]
+run = 'pnpm build:dev'
+depends = ["build:sdk"]
+sources = [
+  "frontend/ui/**/*",
+  "!frontend/ui/src/data/*.json",
+  "package.json",
+]
+
+[tasks."build:frontend:community"]
+run = 'pnpm build:community'
+depends = ["build:sdk"]
+sources = [
+  "frontend/ui/**/*",
+  "!frontend/ui/src/data/*.json",
+  "package.json",
+]
+
+[tasks."build:frontend:enterprise"]
+run = 'pnpm build:enterprise'
+depends = ["build:sdk"]
+sources = [
+  "frontend/ui/**/*",
+  "!frontend/ui/src/data/*.json",
+  "package.json",
+]
+
+[tasks."build:distr:community"]
+run = 'go build -ldflags="{{vars.ldflags}} -X github.com/distr-sh/distr/internal/buildconfig.edition=community" -o dist/distr ./cmd/distr'
+depends = ["go-tidy", "build:frontend:community"]
+
+[tasks."build:distr:enterprise"]
+run = 'go build -ldflags="{{vars.ldflags}} -X github.com/distr-sh/distr/internal/buildconfig.edition=enterprise" -o dist/distr ./cmd/distr'
+depends = ["go-tidy", "build:frontend:enterprise"]
+
+[tasks."build:website"]
+run = 'pnpm build'
+dir = "website"
+sources = [
+  "{{config_root}}/website/src/**/*",
+  "{{config_root}}/website/public/**/*",
+  "{{config_root}}/website/astro.config.mjs",
+  "{{config_root}}/website/package.json",
+  "{{config_root}}/CHANGELOG.md",
+]
+
+[tasks."build:controller:docker"]
+run = 'go build -ldflags="{{vars.ldflags}}" -o dist/docker-controller ./cmd/controller/docker'
+depends = ["go-tidy"]
+
+[tasks."build:controller:kubernetes"]
+run = 'go build -ldflags="{{vars.ldflags}}" -o dist/kubernetes-controller ./cmd/controller/kubernetes'
+depends = ["go-tidy"]
+
+[tasks."build:support-collector"]
+run = [
+  'go build -ldflags="{{vars.ldflags}}" -o dist/support-collector ./cmd/support-collector',
+  'hack/package-support-collector.sh',
+]
+env = { CGO_ENABLED = "0" }
+depends = ["go-tidy"]
+
+[tasks."lint:go"]
+depends = ["go-tidy"]
+run = 'golangci-lint run'
+
+[tasks."lint:frontend"]
+run = 'pnpm lint'
+
+[tasks."lint:migrations"]
+run = 'hack/validate-migrations.sh'
+
+[tasks."lint:website"]
+run = 'pnpm lint'
+dir = "website"
+
+[tasks."lint:app"]
+run = { tasks = ["lint:go", "lint:frontend", "lint:migrations"] }
+description = 'Lint Distr and the controllers, without the website'
+
+[tasks."lint:renovate-config"]
+run = "pnpm dlx --package renovate renovate-config-validator"
+description = "Lint the renovate.json config file"
+sources = ["renovate.json"]
+
+[tasks.lint]
+run = { tasks = ["lint:app", "lint:website"] }
+
+[tasks."test:go"]
+run = 'go test ./...'
+depends = ["go-tidy"]
+description = 'Run all Go tests'
+
+[tasks."test:frontend"]
+run = 'pnpm test'
+depends = ["build:sdk"]
+description = 'Run all frontend tests'
+
+[tasks.test]
+run = { tasks = ["test:go", "test:frontend"] }
+
+[tasks."format:go"]
+run = 'golangci-lint run --fix'
+
+[tasks."build:helm-docs"]
+run = [
+  'helm-docs --chart-search-root deploy/charts',
+  'pnpm exec prettier --write deploy/charts/distr/README.md',
+]
+sources = [
+  "deploy/charts/distr/Chart.yaml",
+  "deploy/charts/distr/values.yaml",
+  "deploy/charts/distr/README.md.gotmpl",
+]
+outputs = ["deploy/charts/distr/README.md"]
+
+[tasks."build:helm-schema"]
+description = "Generate values.schema.json from values.yaml and its helm-docs comments"
+run = 'schema'
+dir = "deploy/charts/distr"
+
+[tasks."format:frontend"]
+run = ['pnpm dedupe', 'pnpm format']
+depends = ["build:helm-docs", "build:helm-schema"]
+
+[tasks."format:website"]
+run = ['pnpm dedupe', 'pnpm format']
+dir = "website"
+description = 'Format the website. Also deletes unused images'
+
+[tasks."format:app"]
+run = { tasks = ["format:go", "format:frontend"] }
+description = 'Format Distr and the controllers, without the website'
+
+[tasks.format]
+run = { tasks = ["format:app", "format:website"] }
+
+[tasks.distr]
+run = 'go run -ldflags="{{vars.ldflags}}" ./cmd/distr/'
+description = """
+Run Distr with arbitrary arguments: "mise run distr arg1 arg2...".
+Examples:
+  - "mise run distr serve"
+  - "mise run distr migrate --to ..."
+  - "mise run distr maintenance encrypt-database"
+Try "mise run distr help" to explore the available commands.
+Protip: "mise watch -r distr serve" to auto-reload on code changes.
+"""
+depends = ["go-tidy", "build:frontend:dev"]
+env = { SUPPORT_COLLECTOR_DOWNLOAD_URL = 'file://{{config_root}}/dist/support-collector-release' }
+# sources are what "mise watch" reacts to. The empty outputs keep mise from
+# skipping the task as up-to-date when they have not changed since the last run.
+sources = ["api/**/*.go", "cmd/**/*.go", "internal/**/*.go"]
+outputs = []
+
+[tasks.serve]
+run = {tasks = ["distr serve"]}
+description = "Shorthand for 'mise run distr serve'"
+
+[tasks."run:controller:docker"]
+run = 'go run -ldflags="{{vars.ldflags}}" ./cmd/controller/docker/ run'
+
+[tasks."run:controller:kubernetes"]
+run = 'go run -ldflags="{{vars.ldflags}}" ./cmd/controller/kubernetes/ run'
+
+[tasks."run:support-collector"]
+run = 'go run -ldflags="{{vars.ldflags}}" ./cmd/support-collector/'
+
+[tasks."docker-build:distr"]
+depends = "build:distr:enterprise"
+run = 'cp dist/distr dist/distr-$(go env GOARCH) && docker build -f Dockerfile.distr --tag ghcr.io/distr-sh/distr:$VERSION .'
+
+[tasks."docker-build:controller:docker"]
+run = 'docker build -f Dockerfile.docker-controller --tag ghcr.io/distr-sh/distr/docker-controller:$VERSION --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --network host .'
+
+[tasks."docker-build:controller:kubernetes"]
+run = 'docker build -f Dockerfile.kubernetes-controller --tag ghcr.io/distr-sh/distr/kubernetes-controller:$VERSION --build-arg VERSION=$VERSION --build-arg COMMIT=$COMMIT --network host .'
+
+[tasks."docker-build:docker-autoheal"]
+run = 'docker build --tag ghcr.io/distr-sh/distr/docker-autoheal:$VERSION --network host docker-autoheal'

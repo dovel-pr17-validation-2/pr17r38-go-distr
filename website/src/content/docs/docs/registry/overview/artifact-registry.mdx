@@ -1,0 +1,256 @@
+---
+title: Artifact Registry
+description: The Artifact Registry is a private, OCI-compliant registry built into Distr for publishing container images, Helm charts, and other artifacts to self-managed environments. It includes tag-based access control, a registry UI, and detailed usage insights per customer.
+slug: docs/registry
+sidebar:
+  label: Artifact Registry
+  order: 1
+---
+
+import {Aside} from '@astrojs/starlight/components';
+import ThemedImage from '~/components/util/ThemedImage.astro';
+import lightModeRegistry from '~/assets/docs/registry/overview/light-mode-registry.png';
+import darkModeRegistry from '~/assets/docs/registry/overview/dark-mode-registry.png';
+import artifactsListLight from '~/assets/docs/registry/overview/artifacts-list-light.png';
+import artifactsListDark from '~/assets/docs/registry/overview/artifacts-list-dark.png';
+import artifactDetailsLight from '~/assets/docs/registry/overview/artifact-details-light.png';
+import artifactDetailsDark from '~/assets/docs/registry/overview/artifact-details-dark.png';
+import dashboardArtifactViewLight from '~/assets/docs/registry/overview/dashboard-artifact-view-light.png';
+import dashboardArtifactViewDark from '~/assets/docs/registry/overview/dashboard-artifact-view-dark.png';
+
+The Distr Artifact Registry is a built-in, [OCI-compliant](/glossary/oci-container-artifact-registry/) registry designed for AI and software companies
+to distribute Docker images and [Helm Charts](/glossary/helm-chart/), [SBOMs](/glossary/sbom-software-bill-of-materials/) and other OCI artifacts to [self-managed](/glossary/self-hosted-software/) and [BYOC](/glossary/byoc-definition/) environments.
+It also includes tag-based access and licensing controls.
+The registry also provides detailed download analytics that let you monitor which versions of your software are being used by each customer.
+
+Use it to publish versioned artifacts, enforce entitlement rules, and track consumption across your customer base.
+
+<Aside type="note">
+  The Distr Artifact registry is private by default, meaning that only
+  [authenticated](/docs/registry/configuration/#2-authenticate-with-a-personal-access-token)
+  users via PAT can push and pull artifacts. Unauthenticated users will not be
+  able to access your artifacts, unless you mark an artifact as
+  [public](#public-artifacts).
+</Aside>
+
+<ThemedImage
+  lightSrc={lightModeRegistry}
+  darkSrc={darkModeRegistry}
+  alt="Registry diagram"
+  dropShadow={false}
+/>
+
+### Core capabilities
+
+- **Multi-artifact support**: Distribute Docker Images, Helm Charts, Terraform Modules, [Zarf packages](/docs/integrations/zarf/), and any OCI-compliant artifact
+- **Software supply chain security**: Store SBOMs and signatures for image verification
+- **Visibility**: Get insights into which customers are using which artifacts and versions
+- **Open standards**: Built on the OCI specification and compatible with existing tooling (Docker, ORAS, Helm, etc.)
+- **Built-in licensing (beta)**: Bind artifact versions to entitlements for fine-grained customer access control
+
+## Getting started
+
+<Aside type="note">
+  If you haven’t set up your registry yet, start with the [in-platform
+  tutorials](/docs/quickstart/#getting-started-with-platform-tutorials) or
+  follow the [Quickstart Guide](/docs/registry/configuration/).
+</Aside>
+
+Want a quick overview of how it works? Watch this short walkthrough:
+
+<iframe
+  width="560"
+  height="315"
+  src="https://www.youtube-nocookie.com/embed/gM9WCx61owQ?si=rWP7n4UR1liAKi_6"
+  title="YouTube video player"
+  frameborder="0"
+  allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+  referrerpolicy="strict-origin-when-cross-origin"
+  allowfullscreen
+  style="width: 560px; height: 315px; max-width: 100%; aspect-ratio: 16/9; border-radius: 8px; margin: 2rem auto; display: block; box-shadow: 0 2px 8px rgba(0,0,0,0.1);"></iframe>
+
+## Artifact Registry UI
+
+### Artifact List
+
+The Artifact List page lets you view all artifacts stored in your registry. It provides an overview of pull counts across all tags, along with insights into which users and customers are using each artifact.
+
+<ThemedImage
+  lightSrc={artifactsListLight}
+  darkSrc={artifactsListDark}
+  alt="Registry artifacts view"
+/>
+
+### Artifact Details
+
+The artifact details page gives you a complete view of all tags associated with a specific artifact. You can see the OCI URL, upload date, and artifact size, along with pull counts for each tag.
+
+<ThemedImage
+  lightSrc={artifactDetailsLight}
+  darkSrc={artifactDetailsDark}
+  alt="Registry artifacts view"
+/>
+
+<Aside type="note">
+  By default, the Distr artifact registry uses immutable tags. This means that
+  once a tag is pushed to the registry it can't be associated with another
+  digest. We believe immutable tags are a safer and more secure default, as they
+  guarantee that a given tag always refers to the exact same content. If you
+  need to overwrite existing tags, mutable tags can be enabled on the
+  organization settings page ("Artifact versions are mutable").
+</Aside>
+
+## Public Artifacts
+
+A single artifact can be made public, so anyone who knows its name can pull it without credentials.
+This is meant for what you want to hand out freely, an installer image, a CLI, an agent chart or a
+public demo, while everything else in the registry stays private.
+
+Open the artifact details page and pick **Make public** from the menu in the top right. The artifact
+then carries a **Public** badge everywhere it is listed, and **Make private** in the same menu
+requires credentials again. Only organization admins can change it.
+
+<Aside type="caution">
+  Making an artifact public exposes every version and tag it has, present and
+  future, and [artifact entitlements](/docs/platform/artifact-entitlements/) no
+  longer restrict who may pull it. It also appears in the artifact list of every
+  customer of your organization, whether they hold an entitlement for it or not.
+  For a [pull-through cache](/docs/registry/pull-through-cache/) artifact this
+  extends to the upstream: a pull that misses the cache is fetched from the
+  upstream registry with the credentials stored on the artifact.
+</Aside>
+
+### Pulling without credentials
+
+Docker, Podman, Skopeo, ORAS, Helm and anything speaking the HTTP API directly pull a public artifact
+with no setup at all:
+
+```sh
+docker pull registry.example.com/acme/my-image:1.0.0
+oras pull registry.example.com/acme/my-artifact:1.0.0
+helm pull oci://registry.example.com/acme/my-chart --version 1.0.0
+curl -sSL https://registry.example.com/v2/acme/my-image/manifests/1.0.0 \
+  -H 'Accept: application/vnd.oci.image.manifest.v1+json'
+```
+
+Private artifacts still need credentials: log in with `docker login`, `podman login` or
+`helm registry login`, using a PAT as the password.
+
+Anonymous pulls are rate limited per client IP address, considerably more strictly than the pull
+limits of the large public registries. A client that exceeds them gets `401 Unauthorized` with a
+request to authenticate and a `Retry-After` header. Authenticated pulls are never rate limited, so
+a client that holds a PAT authenticates with it and pulls on, and a customer who runs into
+the limit only has to log in. The answer is a 401 rather than `429 Too Many Requests` because
+OCI clients send their credentials only once they have seen a 401, so a 429 would lock out a
+customer whose credentials are sitting unused in the client's config file. Self-hosted instances can
+change the limits, see the [`REGISTRY_ANONYMOUS_*`
+variables](/docs/self-hosting/configuration/#oci-registry).
+
+Every anonymous pull is recorded in the [download
+analytics](/docs/registry/analytics/) like any other pull, marked as
+**Anonymous** since there is no user or customer behind it.
+
+## Global Dashboard Artifact View
+
+The main Distr dashboard also provides a global view of which artifacts each end customer has consumed, including version details and a health status.
+
+<ThemedImage
+  lightSrc={dashboardArtifactViewLight}
+  darkSrc={dashboardArtifactViewDark}
+  alt="Registry artifacts view"
+/>
+
+## Artifact Deletion
+
+The Distr registry protects artifacts and tags that are referenced in entitlements, so customers keep access to their licensed software.
+
+### Deleting Artifact Tags
+
+You can delete individual tags from an artifact through the API, the UI and the registry itself (`DELETE /v2/<name>/manifests/<tag>`). However, the system enforces several validation rules to prevent breaking customer access.
+
+Only named tags such as `v1.0.0` can be deleted. A digest reference (`sha256:…`) is rejected with `400 Bad Request`, which also affects clients that resolve a tag to its digest before deleting it.
+
+#### When Tag Deletion is Allowed
+
+Tag deletion succeeds when all of these conditions are met:
+
+- The tag exists
+- No [artifact entitlement](/docs/platform/artifact-entitlements/) grants all versions of the artifact
+- If an entitlement grants exactly the version the tag points at, another tag must point at that version as well
+- If it is the last tag of the artifact, no entitlement references the artifact at all
+
+Deleting the last tag of an artifact deletes the entire artifact, as described in [Deleting Artifacts](#deleting-artifacts).
+When this happens through the registry API, the response carries a `Warning` header saying so.
+A [pull-through cache](/docs/registry/pull-through-cache/) artifact is the exception: its last tag cannot be deleted, and the next sync restores a deleted tag unless it has been removed from the upstream repository.
+
+<Aside type="tip">
+  The system distinguishes between regular tags (like `v1.0.0`, `latest`) and
+  SHA digest tags (like `sha256:abc123...`). As artifact version access is
+  always checked by the underlying digest, it is possible to untag a licensed
+  version, if multiple tags point to it.
+</Aside>
+
+#### What Deleting a Tag Removes
+
+Deleting a tag also deletes the version the tag pointed at, so that its blobs can be reclaimed. For a
+multi-arch image, this extends to the per-architecture manifests the index referenced. A version is only
+deleted when nothing references it any more, that is when no other tag points at it and no other version
+references it (a per-architecture manifest shared with another index is kept).
+
+An entitlement that grants a version deleted this way loses that version, and keeps every other artifact
+and version it grants.
+
+Once a version is deleted, it can no longer be pulled by its digest. The blobs themselves are removed
+by the [blob cleanup job](/docs/self-hosting/maintenance/#database-cleanup-jobs), which a self-hosted
+instance has to schedule.
+
+#### Example: Tag Deletion Scenarios
+
+**Scenario 1: Safe deletion**
+
+> Artifact: myapp
+> Tags: v1.0.0, v1.0.1, latest (all point to different digests)
+> License: References sha256:abc123 (v1.0.0's digest)
+>
+> Action: Delete tag "v1.0.1"
+> Result: Success - v1.0.1 is not licensed
+
+**Scenario 2: Blocked deletion - licensed digest**
+
+> Artifact: myapp
+> Tags: v1.0.0 (points to sha256:abc123)
+> License: References sha256:abc123
+>
+> Action: Delete tag "v1.0.0"
+> Result: Blocked (400) - Cannot delete last non-SHA tag for licensed digest
+
+**Scenario 3: Last tag deletes the artifact**
+
+> Artifact: myapp
+> Tags: v1.0.0 (only tag remaining)
+> No licenses
+>
+> Action: Delete tag "v1.0.0"
+> Result: Success - the artifact myapp is deleted as well
+
+### Deleting Artifacts
+
+You can delete entire artifacts from your registry, which will cascade to all associated versions,
+tags and historical download data.
+
+#### When Artifact Deletion is Allowed
+
+Artifacts can be deleted when they are not referenced in any entitlement, including an expired one.
+
+<Aside type="caution">
+  Deleting an artifact is a cascade operation that automatically removes all
+  associated artifact versions, tags, and parts. This action cannot be undone.
+  Ensure the artifact is not referenced in any entitlements before deletion.
+</Aside>
+
+#### Best Practices
+
+- **Check entitlements first**: Before deleting artifacts or tags, verify they are not referenced in customer entitlements
+- **Use caution with tags**: Deleting tags can affect customer access if not done carefully
+- **Monitor usage**: Review the Downloads section to understand which artifacts and versions are actively used
+- **Mind the last tag**: Deleting the last tag of an artifact deletes the artifact with it

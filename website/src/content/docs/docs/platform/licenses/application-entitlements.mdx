@@ -1,0 +1,83 @@
+---
+title: Application Entitlements
+description: Learn how to create and manage Application Entitlements to control which application versions your customers can access and deploy.
+slug: docs/platform/application-entitlements
+sidebar:
+  label: Application Entitlements
+  order: 2
+---
+
+import {Aside} from '@astrojs/starlight/components';
+import ThemedImage from '~/components/util/ThemedImage.astro';
+import entitlementFormDark from '~/assets/docs/platform/licenses/entitlements/application-entitlement-form-dark.png';
+import entitlementFormLight from '~/assets/docs/platform/licenses/entitlements/application-entitlement-form-light.png';
+
+This guide walks you through how to use Application Entitlements to control which application versions your end-customers can access and deploy through Distr controllers.
+
+<Aside type="note">
+  Application Entitlements are a Pro feature available in Pro, Enterprise, and
+  Pro Trial plans. Learn more about [License
+  Management](/docs/platform/license-management/) and [subscription
+  plans](/docs/subscription-management/).
+</Aside>
+
+With Application Entitlements, you can link an entitlement to a customer to grant access to specific application versions, whether that's one version, a few, or all of them. You can name the entitlement, set an expiration date, and assign it to a particular customer. This gives you granular control over which applications and versions each end-customer can use.
+
+## Entitlement flow diagram
+
+![license-diagram](../../../../../assets/docs/platform/licenses/license-diagram.png)
+
+<Aside type="note">
+  The diagram above illustrates how an entitlement links an end-customer account
+  to a specific set of application versions. Once the entitlement is active, the
+  customer will only be able to see and deploy the granted versions of the
+  application.
+</Aside>
+
+## Use case
+
+Many vendors offer tiered pricing plans with different features. For those serving [on-premises](/glossary/on-premises-definition/) environments, granular control over version access matters: you might deliver a specific feature set, send hotfixes to select customers, or offer early access to new application versions. Application Entitlements give you that control.
+
+## Entitlement features
+
+1. Each entitlement is linked to a single `customer/application` pairing.
+2. Each entitlement grants a customer access to one or multiple application versions.
+3. Once an application version has been granted via an entitlement, it can't be revoked (version revoking is currently in progress).
+4. A customer can be associated with multiple entitlements.
+5. Entitlement edits are reflected in the customer portal in real time.
+
+## How to use it
+
+If you don't see the feature yet, make sure you're on a Pro plan or Pro Trial. Once you're in, here's how it works:
+
+1. **Create a customer:** If none exist, [create a customer](/docs/platform/customer-management/#creating-a-customer) first
+2. **Navigate to Licenses** in the sidebar
+3. **Click the customer** you want to create an entitlement for
+4. **Select the Application Entitlements tab** and click **"Create Entitlement"**
+5. **Give it a name**
+6. **Set an expiration date** (optional)
+7. **Assign to an application**
+8. **Choose the versions**: grant all versions, or select specific ones and optionally an auto-add regex for future versions
+9. **Save**: click "Save" and you're done
+
+The customer can now access and deploy the assigned application version/s directly from their [customer portal](/docs/platform/customer-portal/).
+
+<ThemedImage
+  lightSrc={entitlementFormLight}
+  darkSrc={entitlementFormDark}
+  alt="Application Entitlement create form showing name, expiration date, application selector, version picker, and optional registry credentials"
+/>
+
+## Choosing the granted versions
+
+An entitlement grants either **All versions** of the application, which includes every version you create later, or **Specific versions**. With specific versions, you have to select at least one version, the customer only gets the versions you select and new versions are not added unless they match the [auto-add version regex](#auto-add-version-regex).
+
+## Auto-add version regex
+
+An entitlement for specific versions can grow with your releases. Enter a regular expression in **Auto-add Version Regex**, and every new application version whose name matches it is added to the entitlement automatically. See [Auto-add Regex](/docs/platform/auto-add-regex/) for when it runs, how to write it and examples.
+
+## OCI registry authentication
+
+If your images are stored in a private [OCI registry](/glossary/oci-container-artifact-registry/), you'll need to provide access credentials. You can configure these credentials in the lower section of the entitlement configuration panel. Once set, the application versions will be available at the deployment target for as long as the entitlement is valid.
+
+![OCI-registry-auth](../../../../../assets/docs/platform/licenses/OCI-Registry-auth.png)

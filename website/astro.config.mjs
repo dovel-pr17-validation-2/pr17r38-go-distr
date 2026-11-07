@@ -1,0 +1,479 @@
+// @ts-check
+import {unified} from '@astrojs/markdown-remark';
+import mdx from '@astrojs/mdx';
+import preact from '@astrojs/preact';
+import sitemap from '@astrojs/sitemap';
+import starlight from '@astrojs/starlight';
+import tailwindcss from '@tailwindcss/vite';
+import icon from 'astro-icon';
+import {defineConfig, fontProviders} from 'astro/config';
+import rehypeExternalLinks from 'rehype-external-links';
+import starlightLinksValidator from 'starlight-links-validator';
+import starlightLlmsTxt from 'starlight-llms-txt';
+import starlightSidebarTopics from 'starlight-sidebar-topics';
+import {llmsTxtOptions} from './src/llms-txt/options';
+
+const site = 'https://distr.sh';
+
+// https://astro.build/config
+export default defineConfig({
+  site,
+  prefetch: {
+    prefetchAll: true,
+  },
+  fonts: [
+    {
+      name: 'Inter',
+      cssVariable: '--font-inter',
+      provider: fontProviders.npm(),
+      weights: [300, 400, 600, 700],
+      subsets: ['latin'],
+    },
+    {
+      name: 'Poppins',
+      cssVariable: '--font-poppins',
+      provider: fontProviders.npm(),
+      weights: [600],
+      subsets: ['latin'],
+    },
+  ],
+
+  integrations: [
+    icon({
+      include: {
+        lucide: ['*'],
+        'simple-icons': ['openai', 'claude', 'perplexity', 'x', 'googlegemini'],
+      },
+    }),
+    preact(),
+    sitemap({
+      filter: page => {
+        // Exclude specific pages by slug
+        const excludedSlugs = [
+          '/onboarding/',
+          '/get-started/',
+          '/docs/',
+          '/demo/success/',
+          '/terms-of-service/',
+          '/data-processing-agreement/',
+        ];
+        const url = new URL(page);
+        const pathname = url.pathname;
+
+        return !excludedSlugs.some(slug => slug === pathname);
+      },
+    }),
+    starlight({
+      title: 'Distr',
+      customCss: ['./src/styles/global.css'],
+      editLink: {
+        baseUrl: 'https://github.com/distr-sh/distr/tree/main/website',
+      },
+      lastUpdated: true,
+      description: 'Open Source Software Distribution Platform',
+      logo: {
+        src: './src/assets/distr.svg',
+      },
+      social: [
+        {
+          icon: 'github',
+          label: 'GitHub',
+          href: 'https://github.com/distr-sh/distr',
+        },
+        {
+          icon: 'comment-alt',
+          label: 'GitHub Discussions',
+          href: 'https://github.com/distr-sh/distr/discussions',
+        },
+      ],
+      components: {
+        // Components can be overwritten here
+        Head: './src/components/overwrites/Head.astro',
+        Header: './src/components/overwrites/Header.astro',
+        PageTitle: './src/components/overwrites/PageTitle.astro',
+        MarkdownContent: './src/components/overwrites/MarkdownContent.astro',
+        ContentPanel: './src/components/overwrites/ContentPanel.astro',
+        Footer: './src/components/overwrites/Footer.astro',
+        Sidebar: './src/components/overwrites/Sidebar.astro',
+        SocialIcons: './src/components/overwrites/SocialIcons.astro',
+        ThemeProvider: './src/components/overwrites/ThemeProvider.astro',
+        ThemeSelect: './src/components/overwrites/ThemeSelect.astro',
+      },
+      tableOfContents: {
+        minHeadingLevel: 2,
+        maxHeadingLevel: 6,
+      },
+      prerender: true,
+      plugins: [
+        starlightSidebarTopics(
+          [
+            {
+              label: 'Getting Started',
+              link: '/docs/',
+              icon: 'open-book',
+              items: [
+                {
+                  label: 'Introduction',
+                  items: [
+                    {label: 'What is Distr?', link: '/docs/'},
+                    {label: 'Core Concepts', link: '/docs/core-concepts/'},
+                    {
+                      label: 'Vendor Portal',
+                      link: '/docs/vendor-portal/',
+                    },
+                    {label: 'Quickstart', link: '/docs/quickstart/'},
+                    {label: 'FAQs', link: '/docs/faqs/'},
+                  ],
+                },
+                {
+                  label: 'Distribution Scenarios',
+                  items: [
+                    {
+                      autogenerate: {
+                        directory:
+                          'docs/getting-started/distribution-scenarios',
+                      },
+                    },
+                  ],
+                },
+                {
+                  label: 'Account',
+                  items: [
+                    {autogenerate: {directory: 'docs/getting-started/account'}},
+                  ],
+                },
+              ],
+            },
+            {
+              label: 'Deployment Controllers',
+              link: '/docs/controllers/',
+              icon: 'random',
+              items: [
+                {
+                  label: 'Overview & Setup',
+                  items: [
+                    {autogenerate: {directory: 'docs/controllers/overview'}},
+                  ],
+                },
+                {
+                  label: 'Configuration',
+                  items: [
+                    {
+                      autogenerate: {
+                        directory: 'docs/controllers/configuration',
+                      },
+                    },
+                  ],
+                },
+                {
+                  label: 'Monitoring',
+                  items: [
+                    {autogenerate: {directory: 'docs/controllers/monitoring'}},
+                  ],
+                },
+              ],
+            },
+            {
+              label: 'Artifact Registry',
+              link: '/docs/registry/',
+              icon: 'download',
+              items: [
+                {
+                  label: 'Overview',
+                  items: [
+                    {autogenerate: {directory: 'docs/registry/overview'}},
+                  ],
+                },
+              ],
+            },
+            {
+              label: 'Distribution Platform',
+              link: '/docs/platform/',
+              icon: 'list-format',
+              items: [
+                {
+                  label: 'License Management',
+                  items: [
+                    {autogenerate: {directory: 'docs/platform/licenses'}},
+                  ],
+                },
+                {
+                  label: 'Support',
+                  items: [{autogenerate: {directory: 'docs/platform/support'}}],
+                },
+                {
+                  label: 'Customer Portal',
+                  items: [
+                    {
+                      autogenerate: {
+                        directory: 'docs/platform/customer-portal',
+                      },
+                    },
+                  ],
+                },
+                {
+                  label: 'Customer Management',
+                  items: [
+                    {autogenerate: {directory: 'docs/platform/customers'}},
+                  ],
+                },
+                {
+                  label: 'User Management',
+                  items: [
+                    {
+                      autogenerate: {
+                        directory: 'docs/platform/user-management',
+                      },
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              label: 'Integrations & API',
+              link: '/docs/integrations/',
+              icon: 'rocket',
+              items: [
+                {
+                  label: 'GitHub Actions',
+                  items: [
+                    {
+                      label: 'Automatic Deployments from GitHub',
+                      link: '/docs/integrations/github-actions/',
+                    },
+                    {
+                      label: 'GitHub Action Reference',
+                      link: '/docs/integrations/gh-action/',
+                    },
+                  ],
+                },
+                {
+                  label: 'Air-Gapped Packaging',
+                  items: [
+                    {
+                      label: 'Air-Gapped Deployments with Zarf',
+                      link: '/docs/integrations/zarf/',
+                    },
+                  ],
+                },
+                {
+                  label: 'Kubernetes Cluster Setup',
+                  items: [
+                    {
+                      label: 'Cluster Setup with k3s',
+                      link: '/docs/integrations/k3s/',
+                    },
+                  ],
+                },
+                {
+                  label: 'Amazon Elastic Container Service (ECS)',
+                  items: [
+                    {
+                      label: 'Deploying to Amazon ECS',
+                      link: '/docs/integrations/aws-ecs/',
+                    },
+                  ],
+                },
+                {
+                  label: 'Remote Access',
+                  items: [
+                    {
+                      label: 'Remote Access Overview',
+                      link: '/docs/integrations/remote-access/',
+                    },
+                    {
+                      label: 'Docker Compose with Tailscale',
+                      link: '/docs/integrations/remote-access/tailscale/',
+                    },
+                    {
+                      label: 'Kubernetes with Cloudflare Tunnel',
+                      link: '/docs/integrations/remote-access/cloudflare-tunnel/',
+                    },
+                  ],
+                },
+                {
+                  label: 'API & SDK',
+                  items: [
+                    {label: 'Distr API', link: '/docs/integrations/api/'},
+                    {
+                      label: 'API Reference',
+                      link: 'https://app.distr.sh/docs',
+                      attrs: {target: '_blank'},
+                    },
+                    {label: 'Distr SDK', link: '/docs/integrations/sdk/'},
+                    {
+                      label: 'Personal Access Tokens',
+                      link: '/docs/integrations/personal-access-token/',
+                    },
+                  ],
+                },
+              ],
+            },
+            {
+              label: 'Self-Hosting',
+              link: '/docs/self-hosting/',
+              icon: 'laptop',
+              items: [
+                {
+                  label: 'Overview',
+                  items: [{autogenerate: {directory: 'docs/self-hosting'}}],
+                },
+              ],
+            },
+          ],
+          {
+            exclude: [
+              '**/privacy-policy',
+              '**/terms-of-service',
+              '**/data-processing-agreement',
+              '**/404',
+              '**/changelog',
+            ],
+          },
+        ),
+        starlightLinksValidator({
+          exclude: [
+            '/',
+            '/compare/**',
+            '/case-studies{,/**}',
+            '/contact/',
+            '/pricing/',
+            '/blog/**',
+            '/glossary/**',
+            '/cyber-resilience-act{,/**}',
+            '/get-started/',
+            '/onboarding/',
+            'mailto:**',
+            // The validator treats a localhost URL as a link into this site.
+            'http://localhost:**',
+          ],
+        }),
+        starlightLlmsTxt(llmsTxtOptions(site)),
+      ],
+    }),
+    mdx(),
+  ],
+  markdown: {
+    processor: unified({
+      rehypePlugins: [
+        [
+          rehypeExternalLinks,
+          {target: '_blank', rel: ['noopener', 'noreferrer']},
+        ],
+      ],
+    }),
+  },
+  vite: {
+    plugins: [tailwindcss()],
+  },
+  redirects: {
+    // Legacy deep-link redirects
+    '/docs/getting-started/': '/docs/',
+    '/docs/getting-started/about/': '/docs/',
+    '/docs/getting-started/what-is-distr/': '/docs/',
+    '/docs/getting-started/how-it-works/': '/docs/core-concepts/',
+    '/docs/getting-started/core-concepts/': '/docs/core-concepts/',
+    '/docs/getting-started/quickstart/': '/docs/quickstart/',
+    '/docs/getting-started/deployment-methods/':
+      '/docs/subscription/#distr-cloud-or-self-hosted',
+    '/docs/privacy-policy/': '/privacy-policy/',
+
+    // product/ redirects
+    '/docs/product/vendor-portal/': '/docs/vendor-portal/',
+    '/docs/product/agents/': '/docs/controllers/',
+    '/docs/product/alerts/': '/docs/controllers/alerts/',
+    '/docs/product/registry/': '/docs/registry/',
+    '/docs/product/support-bundles/': '/docs/platform/support-bundles/',
+    '/docs/product/customer-portal/': '/docs/platform/customer-portal/',
+    '/docs/product/branding/': '/docs/platform/branding/',
+    '/docs/product/rbac/': '/docs/platform/rbac/',
+    '/docs/product/license-management/': '/docs/platform/license-management/',
+    '/docs/product/subscription-management/': '/docs/subscription-management/',
+    '/docs/product/distr-hub/': '/docs/vendor-portal/',
+    '/docs/product/faqs/': '/docs/faqs/',
+
+    // use-cases
+    '/docs/use-cases/self-managed/': '/docs/use-cases/fully-self-managed/',
+    '/docs/use-cases/byoc/': '/docs/use-cases/byoc-bring-your-own-cloud/',
+    '/docs/use-cases/air-gapped/': '/docs/use-cases/air-gapped-deployments/',
+
+    // guides/ redirects (slugs that existed on main)
+    '/docs/guides/': '/docs/quickstart/',
+    '/docs/guides/secrets/': '/docs/controllers/secrets/',
+    '/docs/guides/application-links/': '/docs/controllers/application-links/',
+    '/docs/guides/preflight-checks/': '/docs/controllers/preflight-checks/',
+    '/docs/guides/application-entitlements/':
+      '/docs/platform/application-entitlements/',
+    '/docs/guides/artifact-entitlements/':
+      '/docs/platform/artifact-entitlements/',
+    '/docs/guides/license-keys/': '/docs/platform/license-keys/',
+    '/docs/guides/vulnerability-scanning/':
+      '/docs/platform/vulnerability-scanning/',
+    '/docs/guides/container-registry/': '/docs/registry/configuration/',
+    '/docs/guides/docker-secrets/': '/docs/controllers/docker-compose-secrets/',
+    '/docs/guides/container-registry-for-end-customers/':
+      '/docs/platform/customer-portal/registry/',
+    '/docs/guides/license-mgmt/': '/docs/platform/license-management/',
+    '/docs/guides/application-licenses/':
+      '/docs/platform/application-entitlements/',
+    '/docs/guides/artifact-licenses/': '/docs/platform/artifact-entitlements/',
+    '/docs/guides/onboarding-a-new-customer/':
+      '/docs/platform/customer-management/',
+    '/docs/guides/onboarding-a-docker-app/': '/docs/controllers/application/',
+    '/docs/guides/onboarding-a-helm-app/': '/docs/controllers/application/',
+    '/docs/guides/distr-on-macos/': '/docs/controllers/distr-on-macos/',
+
+    // agents/ was renamed to controllers/
+    '/docs/agents/': '/docs/controllers/',
+    '/docs/agents/application/': '/docs/controllers/application/',
+    '/docs/agents/deployment/': '/docs/controllers/deployment/',
+    '/docs/agents/docker-agent/': '/docs/controllers/docker-controller/',
+    '/docs/agents/kubernetes-agent/':
+      '/docs/controllers/kubernetes-controller/',
+    '/docs/agents/distr-on-macos/': '/docs/controllers/distr-on-macos/',
+    '/docs/agents/distr-on-windows-wsl/':
+      '/docs/controllers/distr-on-windows-wsl/',
+    '/docs/agents/application-links/': '/docs/controllers/application-links/',
+    '/docs/agents/docker-compose-secrets/':
+      '/docs/controllers/docker-compose-secrets/',
+    '/docs/agents/docker-env/': '/docs/controllers/docker-env/',
+    '/docs/agents/helm-registry-auth/': '/docs/controllers/helm-registry-auth/',
+    '/docs/agents/preflight-checks/': '/docs/controllers/preflight-checks/',
+    '/docs/agents/secrets/': '/docs/controllers/secrets/',
+    '/docs/agents/alerts/': '/docs/controllers/alerts/',
+    '/docs/agents/logs-and-metrics/': '/docs/controllers/logs-and-metrics/',
+    '/docs/agents/update-notifications/':
+      '/docs/controllers/update-notifications/',
+
+    // Integration redirects
+    '/docs/integrations/mcp/': '/docs/integrations/',
+
+    // Self-hosting redirects
+    '/docs/self-hosting/getting-started/': '/docs/self-hosting/',
+    '/docs/self-hosting/oidc/':
+      '/docs/self-hosting/configuration/#oidc-authentication',
+
+    // Legacy blog redirects (content superseded by /compare/ pages)
+    '/blog/distr-vs-replicated/': '/compare/replicated/',
+
+    // CRA hub: early slug renamed guide → introduction
+    '/cyber-resilience-act/guide/': '/cyber-resilience-act/introduction/',
+
+    // Renamed / superseded blog posts
+    '/blog/self-managed-vs-cloud-vs-byoc/': '/blog/self-hosted-spectrum/',
+    '/blog/self-hosted-vs-saas-vs-byoc/': '/blog/self-hosted-spectrum/',
+    '/blog/protect-source-code-docker-container/':
+      '/blog/secure-source-code-docker-container/',
+
+    // Glossary redirects
+    '/glossary/self-managed-software/': '/glossary/self-hosted-software/',
+
+    // Case study redirects
+    '/case-studies/sophris/': '/case-studies/candor/',
+
+    // Legal page short links
+    '/tos/': '/terms-of-service/',
+    '/dpa/': '/data-processing-agreement/',
+    '/pp/': '/privacy-policy/',
+  },
+});

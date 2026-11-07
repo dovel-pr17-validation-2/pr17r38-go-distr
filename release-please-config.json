@@ -1,0 +1,124 @@
+{
+  "packages": {
+    ".": {
+      "include-v-in-tag": false,
+      "release-type": "go",
+      "prerelease": false,
+      "draft": false,
+      "bump-minor-pre-major": true,
+      "bump-patch-for-minor-pre-major": false,
+      "extra-files": [
+        "README.md",
+        "deploy/docker/quickstart/docker-compose.yaml",
+        "deploy/docker/community/docker-compose.yaml",
+        "deploy/docker/enterprise/docker-compose.yaml",
+        "deploy/docker/enterprise-aws/docker-compose.yaml",
+        "deploy/docker/enterprise-gcp/docker-compose.yaml",
+        "deploy/charts/distr/README.md",
+        "deploy/charts/distr/README.md.gotmpl",
+        "deploy/charts/distr/examples/community/values.yaml",
+        "deploy/charts/distr/examples/enterprise/values.yaml",
+        "deploy/charts/distr/examples/enterprise-aws/values.yaml",
+        "deploy/charts/distr/examples/enterprise-gcp/values.yaml",
+        "deploy/charts/distr/examples/quickstart/values.yaml",
+        "deploy/charts/distr/examples/quickstart/custom-domains-values.yaml",
+        {
+          "type": "json",
+          "path": "package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        },
+        {
+          "type": "json",
+          "path": "sdk/js/package.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "sdk/js/package-lock.json",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "json",
+          "path": "sdk/js/package-lock.json",
+          "jsonpath": "$.packages[''].version"
+        },
+        {
+          "type": "yaml",
+          "path": "deploy/charts/distr/Chart.yaml",
+          "jsonpath": "$.version"
+        },
+        {
+          "type": "yaml",
+          "path": "deploy/charts/distr/Chart.yaml",
+          "jsonpath": "$.appVersion"
+        }
+      ],
+      "changelog-sections": [
+        {
+          "type": "feat",
+          "section": "Features"
+        },
+        {
+          "type": "fix",
+          "section": "Bug Fixes"
+        },
+        {
+          "type": "chore",
+          "section": "Other"
+        },
+        {
+          "type": "docs",
+          "section": "Docs"
+        },
+        {
+          "type": "perf",
+          "section": "Performance"
+        },
+        {
+          "type": "build",
+          "hidden": true,
+          "section": "Build"
+        },
+        {
+          "type": "deps",
+          "section": "Dependency Updates"
+        },
+        {
+          "type": "ci",
+          "hidden": true,
+          "section": "CI"
+        },
+        {
+          "type": "refactor",
+          "section": "Refactoring"
+        },
+        {
+          "type": "revert",
+          "hidden": true,
+          "section": "Reverts"
+        },
+        {
+          "type": "style",
+          "hidden": true,
+          "section": "Styling"
+        },
+        {
+          "type": "test",
+          "hidden": true,
+          "section": "Tests"
+        }
+      ]
+    }
+  },
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json"
+}

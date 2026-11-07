@@ -1,0 +1,253 @@
+---
+title: 'Software Distribution Platform: Complete Guide (2026)'
+slug: software-distribution-platform
+description: 'Complete guide to software distribution platforms: what they are, vendor-to-customer vs IT admin tools, key features, distribution methods for on-premises, air-gapped, BYOC, and self-hosted customer deployments.'
+term: Software Distribution Platform
+alternateNames:
+  - Software Distribution
+shortDefinition: 'A software distribution platform is the system software vendors use to get their applications into customer environments. It sits on dedicated infrastructure built to distribute software into self-hosted environments: on-premises data centers, customer cloud accounts (including BYOC), air-gapped networks, edge locations, and hybrid setups.'
+lastUpdated: 2026-11-03
+faq:
+  - question: What is a software distribution platform?
+    answer: "It's the system software vendors use to distribute, deploy, and manage applications in self-hosted customer environments (on-premises, BYOC, air-gapped, edge)."
+  - question: What is software distribution?
+    answer: 'The process of getting software applications from software vendors to their customers. Packaging, delivery, deployment, licensing, updates, and ongoing management are all part of it.'
+  - question: What is the difference between internal and vendor-to-customer distribution platforms?
+    answer: 'Internal distribution platforms (SCCM, ManageEngine) help IT departments deploy software to employees inside one organization. Vendor-to-customer platforms help software companies distribute commercial products to external paying customers who host the software in their own environments (operation may sit with the vendor or the customer).'
+  - question: What is a software distribution system?
+    answer: 'The technical infrastructure and processes used to move software from source to destination. Distribution platforms are effectively comprehensive software distribution systems.'
+  - question: Why do software vendors need distribution platforms?
+    answer: 'Modern enterprise customers want deployment options beyond multi-tenant SaaS: self-hosted postures across on-premises, BYOC, air-gapped, and edge. Distribution platforms make managing software across that spectrum tractable.'
+  - question: What is application distribution?
+    answer: "Moving complete applications (rather than individual code files or libraries) to end users. In a B2B context, it's synonymous with software distribution."
+  - question: What are software distribution tools?
+    answer: 'Components or utilities used to distribute software: artifact registries, deployment scripts, package managers, orchestration systems. Distribution platforms combine several of these tools into one system.'
+  - question: What is a software delivery platform?
+    answer: 'Often used interchangeably with software distribution platform. Some people distinguish delivery (moving artifacts) from distribution (full lifecycle management including licensing and monitoring).'
+  - question: How do software distribution platforms handle air-gapped environments?
+    answer: 'Through offline methods: downloadable bundles with all dependencies, physical media transfer, disconnected registry sync, and portable installation packages that work without internet connectivity.'
+  - question: What is the difference between a software distribution platform and a container registry?
+    answer: 'Container registries store and serve container images. Software distribution platforms include registry functionality plus customer portals, licensing, deployment orchestration, monitoring, and full customer lifecycle management.'
+  - question: How do software distribution platforms handle licensing?
+    answer: 'Through customer-specific access controls (who can see which versions), feature flagging, usage quotas, seat limits, expiration dates, and subscription-tier management across distributed installations.'
+---
+
+import TestimonialCTA from '~/components/cta/TestimonialCTA.astro';
+
+## What is a Software Distribution Platform?
+
+A **software distribution platform** is the system software vendors use to get their applications into customer environments. It's not the same as file hosting or a download link. These platforms sit on top of dedicated infrastructure built to distribute software into [self-hosted](/glossary/self-hosted-software/) environments across the spectrum: [on-premises](/glossary/on-premises-definition/) data centers, customer cloud accounts ([BYOC](/glossary/byoc-definition/)), [air-gapped](/glossary/air-gapped-meaning/) networks, edge locations, and hybrid setups. [The self-hosted spectrum](/blog/self-hosted-spectrum/) explains how those postures relate.
+
+The core problem they solve is the gap between vendor infrastructure and customer infrastructure. That covers version management, licensing enforcement, automated updates, deployment orchestration, health monitoring, and customer self-service, all stretched across the full software lifecycle.
+
+## Two Types of Software Distribution Platforms
+
+"Software distribution platform" gets used for two fairly different categories of tool.
+
+### 1. IT admin tools (internal software distribution)
+
+These platforms help IT departments push software out to employee laptops and devices within a single organization. Examples: ManageEngine Desktop Central, Microsoft SCCM, V2 Cloud. Their focus:
+
+- Deploying software to employee workstations
+- Patching and updating internal systems
+- Managing software inventory across corporate networks
+- Automating desktop software installation
+
+**Primary users**: IT administrators, corporate IT departments.
+
+**Use case**: internal enterprise software management.
+
+### 2. Vendor-to-customer distribution platforms
+
+These platforms help software vendors and [ISVs](/glossary/isv-meaning/) distribute commercial software to external customers who then run that software in their own infrastructure.
+
+- Distributing applications to customer-controlled environments
+- Managing licensing and entitlements per customer
+- Distributing updates to customers
+- Providing self-service portals for customers
+- Supporting [self-hosted](/glossary/self-hosted-software/) and BYOC deployment models
+
+**Primary users**: software vendors, SaaS companies offering self-hosted options, [ISVs](/glossary/isv-meaning/).
+
+**Use case**: commercial software distribution to paying customers.
+
+This article is about vendor-to-customer software distribution platforms. Those are the platforms solving the harder problem: shipping software to enterprise customers whose deployment requirements don't end at a SaaS login.
+
+## What is Software Distribution?
+
+**Software distribution** is the process of moving software applications from software vendors to their customers. In the vendor-to-customer case, that covers:
+
+- **Packaging.** Bundling application code, dependencies, configuration, and metadata into distributable artifacts ([container images](/glossary/oci-container-artifact-registry/), [Helm charts](/glossary/helm-chart/), binaries).
+- **Delivery.** Moving artifacts from vendor infrastructure into customer environments.
+- **Deployment.** Installing and configuring software once it lands in customer infrastructure.
+- **Licensing.** Controlling which customers get which software versions and features.
+- **Updates.** Getting patches, security fixes, and new versions out to distributed installations.
+- **Monitoring.** Tracking health, performance, and usage across customer deployments.
+
+Traditional software distribution meant physical media or a download page. Modern platforms automate and orchestrate the whole lifecycle, because the lifecycle got much more complicated.
+
+## Why Software Vendors Need Distribution Platforms
+
+Pressure on vendors keeps mounting to support deployment flexibility. [SaaS](/glossary/saas-definition/) still dominates, but a significant share of enterprise customers want alternatives.
+
+### Customer requirements driving distribution complexity
+
+**Data sovereignty and compliance.** Regulated industries (healthcare, finance, government) often can't use vendor-hosted SaaS because of data residency requirements. They need software running in their own infrastructure, under their own controls.
+
+**Security and air-gapped environment requirements.** Military, intelligence, critical infrastructure, and high-security organizations run [air-gapped networks](/glossary/air-gapped-meaning/) with no internet connectivity. They need a completely offline distribution path.
+
+**Cost optimization.** Large enterprises want to run vendor software in their own cloud accounts (AWS, Azure, GCP) to consolidate billing, use committed spend, and squeeze down total cost. That's the [BYOC (Bring Your Own Cloud)](/glossary/byoc-definition/) model.
+
+**Performance and latency.** Global operations and edge computing need software deployed close to users or devices, not funneled through a centralized SaaS region.
+
+**Customization and integration.** Enterprises with complex existing stacks need deep integration with their identity systems, networking, storage, and adjacent applications. That's usually easier when the software runs in their environment.
+
+### Distribution challenges without a platform
+
+Vendors who try to do customer-facing distribution without a purpose-built platform run into the same set of problems:
+
+- **Limited visibility.** Once software leaves vendor infrastructure, you lose insight into usage patterns, performance, errors, and customer health.
+- **Update management nightmare.** Shipping updates to dozens or hundreds of customer installations, each with its own configuration, network constraint, and change window, stops being manageable pretty quickly.
+- **Version fragmentation.** Without automation or installation insights, customers end up on many different versions, which creates a support tail and security exposure.
+- **Licensing complexity.** Enforcing subscription tiers, feature access, seat counts, and expiration dates across distributed installations requires its own system.
+- **Poor customer experience.** Enterprise customers expect professional portals with documentation, installation wizards, deployment scripts, and health dashboards.
+- **Overwhelming support burden.** Troubleshooting customer environments without direct access means one-click [support bundle](/glossary/support-bundle/) downloads (logs, configs, diagnostics) and shared deployment log viewers become essential.
+
+## Key Features of Software Distribution Platforms
+
+Modern software distribution platforms bring together several capabilities you'd otherwise need to build separately.
+
+### Artifact registry and management
+
+Platforms include [OCI-compliant container registries](/glossary/oci-container-artifact-registry/) or artifact repositories that store and manage software versions:
+
+- Store container images, Helm charts, and configuration files
+- Version tagging and immutable artifact addressing
+- Customer-specific access controls (customer A sees version 2.0, customer B sees version 2.1)
+- [Vulnerability scanning](/glossary/vulnerability-scanning/) and security policy enforcement
+
+### Customer portal and self-service
+
+Enterprise customers expect professional self-service:
+
+- White-labeled end-customer portals matching vendor branding
+- View available software versions, documentation, and release notes
+- Generate access credentials (API tokens, registry credentials)
+- Download installation scripts or deployment manifests
+- View deployment health and status dashboards
+
+### License management and entitlements
+
+Commercial terms have to be enforceable across distributed installations through [license management](/glossary/software-license-management/) and [entitlements](/glossary/software-entitlement/):
+
+- Grant specific customers access to specific software versions
+- Control feature access based on subscription tier
+- Enforce seat limits or usage quotas
+- Set license expiration dates
+- Revoke access when a subscription ends
+- Tag-based access (customers see only "production" tags, not "beta")
+
+### Multi-environment deployment support
+
+Software distribution platforms accept that customers run everything, everywhere:
+
+- **Public cloud** (AWS, Azure, GCP) in customer accounts
+- **[On-premises](/glossary/on-premises-definition/)** data centers
+- **[Air-gapped](/glossary/air-gapped-meaning/)** networks with offline distribution
+- **Edge locations** and distributed infrastructure
+- **[Kubernetes](/glossary/kubernetes/) clusters** running Helm or operator-based deployments
+- **VM-based** environments with traditional installation
+
+### Automated update distribution
+
+The ability to push updates reliably across all customer installations:
+
+- Staged rollouts and release channels (canary deployments to a subset of customers)
+- Scheduled updates that respect customer maintenance windows
+- Rollback capabilities when updates fail
+- Notifications when updates are available
+
+### Health monitoring and telemetry
+
+Visibility into distributed deployments:
+
+- Collect metrics, logs, and diagnostics from customer environments
+- Track software-version adoption (which customers run which versions)
+- Monitor uptime and performance across installations
+- Alert on errors or anomalies
+
+### Support and troubleshooting tools
+
+Making customer support tractable at scale:
+
+- Remote diagnostics without direct environment access
+- Temporary [vendor remote access](/glossary/vendor-remote-access/) for the cases diagnostics cannot solve
+- Support bundle generation (logs, configuration, system info)
+- Issue detection and automated remediation
+
+## Software Distribution Models
+
+### Direct distribution (vendor-to-customer)
+
+Vendors distribute straight to paying customers. The platform handles customer onboarding, licensing, and delivery. Common among [ISVs](/glossary/isv-meaning/) with their own sales teams.
+
+### Marketplace distribution
+
+Vendors list software in cloud marketplaces (AWS Marketplace, Azure Marketplace, Google Cloud Marketplace). The distribution platform integrates with marketplace billing and provisioning.
+
+### Reseller / channel distribution
+
+Vendors distribute through partners, VARs, or resellers. The platform manages multi-tier licensing, partner entitlements, and white-labeling.
+
+## Software Distribution Platform vs related concepts
+
+### Software distribution platform vs container registry
+
+A [container registry](/blog/container-image-registry-comparison/) is one component of a distribution platform. Registries store and serve container images. Distribution platforms layer on licensing, customer portals, deployment orchestration, and monitoring.
+
+### Software distribution platform vs CI/CD platform
+
+CI/CD platforms (GitHub Actions, GitLab CI, Jenkins) help vendors build and test software. Distribution platforms help vendors ship that software to customers and manage it once it's out there. The two are complementary.
+
+### Software distribution platform vs deployment tool
+
+Deployment tools (Helm, Terraform, Ansible) automate installation and configuration. Distribution platforms orchestrate deployment across many customer environments, enforce licensing, and handle lifecycle management after deployment.
+
+### Software distribution platform vs marketplace platform
+
+Marketplace platforms (AppDirect, CloudBlue) focus on reseller ecosystems, billing, and storefronts. Distribution platforms focus on technical distribution into customer infrastructure. Some platforms combine elements of both.
+
+<TestimonialCTA name="artifact" />
+
+## Benefits of Software Distribution Platforms
+
+### For software vendors
+
+- **Faster time to market.** Pre-built distribution infrastructure accelerates the launch of self-hosted offerings. Vendors avoid building custom deployment tooling.
+- **Reduced operational burden.** Platforms automate update distribution, license management, and customer provisioning, which cuts manual work and human error.
+- **Better customer visibility.** Telemetry and monitoring show how customers use the software, which versions are deployed, and where issues emerge.
+- **Improved support efficiency.** Diagnostic tools and remote troubleshooting reduce time-to-resolution.
+- **Competitive advantage.** A professional distribution experience differentiates vendors in enterprise sales cycles. Customers prefer vendors offering deployment flexibility.
+- **Revenue expansion.** Supporting self-hosted models opens market segments that can't or won't use SaaS.
+
+### For customers
+
+- **Deployment flexibility.** Run software where it makes sense: public cloud, on-premises, air-gapped, edge. No being forced into vendor-hosted SaaS.
+- **Data control and compliance.** Keep sensitive data in controlled environments that meet regulatory requirements.
+- **Cost optimization.** Take advantage of existing cloud commitments and optimize infrastructure costs.
+- **Integration freedom.** Deep integration with existing infrastructure, identity systems, and adjacent applications.
+- **Performance and latency.** Run software close to users or data sources for optimal performance.
+
+## Distribute Software to Customer Environments with Distr
+
+Distr is an open-source software distribution platform built specifically for software vendors distributing applications across [self-hosted](/glossary/self-hosted-software/) environments, including [BYOC](/glossary/byoc-definition/), [on-premises](/glossary/on-premises-definition/), [air-gapped](/glossary/air-gapped-meaning/), and edge.
+
+**Key capabilities:**
+
+- **OCI-compliant artifact registry** with customer-specific access controls
+- **Customer portal** for self-service deployment and management
+- **License management** controlling versions, features, and entitlements per customer
+- **Deployment controllers** for automated installation and updates in customer infrastructure
+- **Health monitoring** providing visibility across distributed deployments
+- **Air-gapped support** for disconnected environment distribution
+- **Open source** and available as managed SaaS or self-hosted

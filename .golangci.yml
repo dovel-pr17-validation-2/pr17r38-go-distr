@@ -1,0 +1,90 @@
+version: '2'
+run:
+  allow-parallel-runners: true
+issues:
+  max-issues-per-linter: 100
+  max-same-issues: 100
+linters:
+  enable:
+    - asasalint
+    - asciicheck
+    - bidichk
+    - contextcheck
+    - copyloopvar
+    - decorder
+    - dogsled
+    - dupl
+    - dupword
+    - errcheck
+    - errchkjson
+    - errname
+    - forbidigo
+    - ginkgolinter
+    - gocheckcompilerdirectives
+    - goconst
+    - gocyclo
+    - goprintffuncname
+    - govet
+    - importas
+    - ineffassign
+    - lll
+    - loggercheck
+    - makezero
+    - mirror
+    - misspell
+    - nakedret
+    - prealloc
+    - staticcheck
+    - unconvert
+    - unparam
+    - unused
+    - whitespace
+    - gocritic
+    - misspell
+  exclusions:
+    generated: lax
+    presets:
+      - comments
+      - common-false-positives
+      - legacy
+      - std-error-handling
+    paths:
+      - third_party$
+      - builtin$
+      - examples$
+    rules:
+      - linters:
+          - forbidigo
+        path-except: ^internal/(handlers|middleware)/
+      - linters:
+          - forbidigo
+        path: ^internal/middleware/
+        text: http\.ResponseWriter
+  settings:
+    forbidigo:
+      forbid:
+        - pattern: ^http\.ResponseWriter$
+          msg: return a respond.Responder from a handler registered with respond.Handler
+        - pattern: ^http\.Error$
+          msg: return a respond.ErrorResponse such as respond.BadRequest
+        - pattern: ^distrerr\.New
+          msg: return a respond.ErrorResponse such as respond.BadRequest instead of an error the caller maps back
+    gocritic:
+      disabled-checks:
+        - ifElseChain
+        - singleCaseSwitch
+    goconst:
+      min-len: 30
+
+formatters:
+  enable:
+    - gci
+    - gofmt
+    - gofumpt
+    - goimports
+  exclusions:
+    generated: lax
+    paths:
+      - third_party$
+      - builtin$
+      - examples$

@@ -1,0 +1,295 @@
+---
+title: Maintenance Jobs
+description: Configure automated cleanup jobs to prune metrics, logs, registry blobs, deleted organizations, orphaned user accounts and unreferenced files from your Distr database and storage.
+slug: docs/self-hosting/maintenance
+sidebar:
+  label: Maintenance Jobs
+  order: 6
+---
+
+import {Aside} from '@astrojs/starlight/components';
+
+## Database Cleanup Jobs
+
+Distr includes built-in CLI tasks for database and storage pruning to prevent unbounded growth of resources such as metrics, logs and status entries.
+
+The cleanup routine can be executed manually. One or more targets can be specified in a single invocation.
+
+```shell
+distr cleanup $CLEANUP_TARGET...
+```
+
+Available cleanup targets:
+
+| Target                    | Description                                                                                   |
+| ------------------------- | --------------------------------------------------------------------------------------------- |
+| `DeploymentTargetMetrics` | Deployment target metrics entries                                                             |
+| `OIDCState`               | Expired OIDC state entries                                                                    |
+| `ArtifactBlob`            | Unreferenced registry blobs from S3 (requires registry to be enabled)                         |
+| `Organization`            | Permanently delete soft-deleted organizations past the retention period                       |
+| `UserAccount`             | Permanently delete user accounts that belong to no organization past the retention period     |
+| `File`                    | Uploaded files that nothing references any more, such as logos and avatars that were replaced |
+
+For production deployments we recommend scheduling these jobs automatically, either using the built-in job scheduler for single instance deployments
+or using Kubernetes CronJobs for high-availability deployments.
+
+### Automated job scheduling for Single Instance deployments
+
+If you only have one instance of Distr running (e.g., using Docker Compose), you can use the integrated job scheduling.
+
+The internal scheduling can be configured via environment variables.
+
+An example configuration file can be found on
+[`github.com/distr-sh/distr/deploy/docker/quickstart`](https://github.com/distr-sh/distr/blob/main/deploy/docker/quickstart/.env):
+
+```dotenv
+# Cron interval for cleaning metrics older than METRICS_ENTRIES_MAX_AGE
+CLEANUP_DEPLOYMENT_TARGET_METRICS_CRON="0 * * * *"
+CLEANUP_DEPLOYMENT_TARGET_METRICS_TIMEOUT="10m"
+# Cron interval for cleaning expired OIDC state entries
+CLEANUP_OIDC_STATE_CRON="0 * * * *"
+CLEANUP_OIDC_STATE_CRON_TIMEOUT="10m"
+# Cron interval for cleaning unreferenced artifact blobs from S3 (requires registry)
+CLEANUP_ARTIFACT_BLOB_CRON="0 * * * *"
+CLEANUP_ARTIFACT_BLOB_TIMEOUT="10m"
+CLEANUP_ARTIFACT_BLOB_MIN_AGE="24h"
+# Cron interval for permanently deleting soft-deleted organizations older than CLEANUP_ORGANIZATION_MIN_AGE
+# CLEANUP_ORGANIZATION_CRON="0 0 * * *"
+# CLEANUP_ORGANIZATION_TIMEOUT="10m"
+# CLEANUP_ORGANIZATION_MIN_AGE="720h"
+# Cron interval for permanently deleting user accounts without an organization older than CLEANUP_USER_ACCOUNT_MIN_AGE
+# CLEANUP_USER_ACCOUNT_CRON="0 0 * * *"
+# CLEANUP_USER_ACCOUNT_TIMEOUT="10m"
+# CLEANUP_USER_ACCOUNT_MIN_AGE="720h"
+# Cron interval for deleting unreferenced files older than CLEANUP_FILE_MIN_AGE
+CLEANUP_FILE_CRON="0 * * * *"
+CLEANUP_FILE_TIMEOUT="10m"
+CLEANUP_FILE_MIN_AGE="24h"
+```
+
+If these variables are not set, no cleanup jobs are scheduled.
+
+### Automated job scheduling for High-Availability deployments
+
+For high-availability deployments with multiple instances of Distr (e.g., using Kubernetes), the built-in job scheduling
+is not suitable, as it would lead to multiple instances trying to perform the same cleanup tasks concurrently.
+
+Therefore, we recommend using [CronJobs](https://kubernetes.io/docs/core-concepts/workloads/controllers/cron-jobs/) in Kubernetes to handle the cleanup tasks.
+But the concept can apply to any HA setup where the cleanup jobs are triggered externally.
+
+These jobs can also be configured via our Helm Chart.
+
+An example configuration can be found in
+[`github.com/distr-sh/distr/deploy/charts/distr`](https://github.com/distr-sh/distr/blob/main/deploy/charts/distr/values.yaml):
+
+```yaml
+cronJobs:
+  - name: deployment-target-metrics-cleanup
+    labels:
+      distr.sh/job: deployment-target-metrics-cleanup
+    args: [cleanup, DeploymentTargetMetrics, --timeout, 10m]
+  - name: oidcstate-cleanup
+    labels:
+      distr.sh/job: oidcstate-cleanup
+    args: [cleanup, OIDCState, --timeout, 10m]
+  - name: artifact-blob-cleanup
+    labels:
+      distr.sh/job: artifact-blob-cleanup
+    args: [cleanup, ArtifactBlob, --timeout, 10m]
+  - name: file-cleanup
+    labels:
+      distr.sh/job: file-cleanup
+    args: [cleanup, File, --timeout, 10m]
+  # - name: organization-cleanup
+  #   labels:
+  #     distr.sh/job: organization-cleanup
+  #   args: [cleanup, Organization, --timeout, 10m]
+  # - name: user-account-cleanup
+  #   labels:
+  #     distr.sh/job: user-account-cleanup
+  #   args: [cleanup, UserAccount, --timeout, 10m]
+```
+
+## Additional configuration
+
+Some cleanup targets allow for additional customization using the following environment variables:
+
+```dotenv
+METRICS_ENTRIES_MAX_AGE="24h"
+CLEANUP_ARTIFACT_BLOB_MIN_AGE="24h"
+CLEANUP_ORGANIZATION_MIN_AGE="720h"
+CLEANUP_USER_ACCOUNT_MIN_AGE="720h"
+CLEANUP_FILE_MIN_AGE="24h"
+```
+
+<Aside type="caution">
+  `METRICS_ENTRIES_MAX_AGE` does not have a default value. If unset, the cleanup
+  routine for that target will have no effect.
+</Aside>
+
+<Aside type="caution">
+  The `Organization` cleanup target permanently and irreversibly deletes
+  organizations and all their associated data. The default retention period is
+  30 days (`720h`). Only enable this job if you are sure you want to purge
+  soft-deleted organizations.
+</Aside>
+
+<Aside type="caution">
+  The `UserAccount` cleanup target permanently and irreversibly deletes user
+  accounts that belong to no organization, which is the state an account is left
+  in after its last organization was removed or purged. The default retention
+  period is 30 days (`720h`) since the last login, or since the account was
+  created if it never logged in. Super admin accounts are never deleted, as they
+  belong to no organization by design.
+</Aside>
+
+<Aside type="note">
+  `CLEANUP_FILE_MIN_AGE` exists because the branding settings and the user
+  profile upload an image as soon as it is picked, but only attach it when the
+  form is saved. Keep it well above the time a user may spend in such a form: an
+  image deleted in between can no longer be attached, and saving the form then
+  fails.
+</Aside>
+
+## Upstream Tag Synchronization
+
+When the pull-through cache is in use, Distr can automatically sync tags from upstream registries on a schedule.
+This is configured via a single environment variable:
+
+```dotenv
+# Cron schedule for syncing tags from upstream registries
+REGISTRY_UPSTREAM_SYNC_CRON="15,45 * * * *"
+```
+
+If `REGISTRY_UPSTREAM_SYNC_CRON` is not set, no automatic sync is scheduled.
+Tags are still fetched on demand when a client pulls an image, but the tag list will not be proactively refreshed.
+
+<Aside type="note">
+  In high-availability deployments, the built-in scheduler runs on every
+  instance. To avoid redundant upstream requests, consider using a Kubernetes
+  CronJob to trigger syncs externally instead.
+</Aside>
+
+## Custom Domain Verification
+
+When [custom domains](/docs/self-hosting/configuration#custom-domains) are enabled, a job checks that
+each registered domain still points at your CNAME target. A domain is only used for links, mails,
+controller manifests and registry URLs while that check succeeds.
+
+```shell
+distr maintenance verify-custom-domains --timeout 10m
+```
+
+For single instance deployments, schedule it with the built-in scheduler:
+
+```dotenv
+CUSTOM_DOMAIN_VERIFICATION_CRON="*/15 * * * *"
+CUSTOM_DOMAIN_VERIFICATION_TIMEOUT="4m"
+```
+
+For high-availability deployments, use a CronJob instead, as our Helm Chart does:
+
+```yaml
+cronJobs:
+  - name: custom-domain-verification
+    labels:
+      distr.sh/job: custom-domain-verification
+    schedule: '*/15 * * * *'
+    args: [maintenance, verify-custom-domains, --timeout, 10m]
+```
+
+<Aside type="caution">
+  If you set `CUSTOM_DOMAIN_TARGET` without scheduling this job, domains are
+  only ever checked when they are registered or when a vendor triggers the check
+  from the organization settings. A domain whose record is fixed afterwards
+  keeps falling back to your instance host until someone does.
+</Aside>
+
+## Database Encryption
+
+Distr encrypts the [sensitive columns of its database](/docs/self-hosting/security#database-encryption).
+Values written before you upgraded to a version that does so are still in plaintext, and after a key
+rotation some values are still encrypted with the previous key. This command moves both to the active key:
+
+```shell
+distr maintenance encrypt-database --timeout 60m
+```
+
+Unlike the jobs above this is not recurring work, so do not schedule it. There are exactly two
+occasions on which it has anything to do, the upgrade to a version that encrypts and a rotation of
+`DATABASE_ENCRYPTION_KEY`, and both are things you do deliberately. Run it once afterwards. Nothing
+in Distr writes a plaintext value, so once it reports that there is nothing left, that stays true.
+
+It is safe to run while Distr is serving traffic, it can be interrupted and resumed, and it is a no-op
+once everything is on the active key. Until then, Distr logs a warning on every start naming the
+columns that are left.
+
+<Aside type="caution">
+  If you run more than one replica, wait until the upgrade to a version that
+  encrypts has rolled out completely before you run this. The command clears
+  each plaintext column as it encrypts it, and a replica still running the
+  previous version reads that column instead of the encrypted one, so it would
+  see those values as empty until it is replaced. Once the migration is done no
+  value is left in plaintext, so this cannot happen again. A key rotation never
+  produces an empty value, since it only ever rewrites the encrypted column, but
+  it has a rollout order of its own, see [Rotating the
+  key](/docs/self-hosting/security#rotating-the-key).
+</Aside>
+
+On Kubernetes, run it in a Distr pod, which already has the database URL and the encryption key in its
+environment:
+
+```shell
+kubectl exec deploy/distr -- /distr maintenance encrypt-database --timeout 60m
+```
+
+The command dies with the pod if it is replaced while running, and a long run can outlive the
+`kubectl exec` connection. Neither loses work: every batch is committed on its own, so run it again
+and it continues where it stopped.
+
+For single instance deployments you can instead have it run during startup:
+
+```dotenv
+DATABASE_ENCRYPTION_MIGRATE_ON_BOOT=true
+```
+
+Leave this off if you run more than one replica, for the reason above: the first replica of the new
+version would start encrypting while replicas of the previous one are still serving.
+
+## Removed features
+
+### Deployment Revision Status Cleanup (removed in v4.2.0)
+
+Prior to v4.2.0, every status a controller reported was appended to a `DeploymentRevisionStatus`
+table, which the portal showed as a status history per deployment. Since controllers report once per
+`CONTROLLER_INTERVAL` that table grew continuously, and the `DeploymentRevisionStatus` cleanup target
+pruned entries older than `STATUS_ENTRIES_MAX_AGE`, always keeping the newest one per deployment.
+
+Distr now stores only the latest status, on the deployment revision itself, so there is nothing
+left to prune. The cleanup target, its cron environment variables
+(`CLEANUP_DEPLOYMENT_REVISION_STATUS_CRON`, `CLEANUP_DEPLOYMENT_REVISION_STATUS_TIMEOUT`) and
+`STATUS_ENTRIES_MAX_AGE` have been removed, along with the `GET /api/v1/deployments/{id}/status`
+and `GET /api/v1/deployments/{id}/status/export` endpoints. Remove the
+`deployment-revision-status-cleanup` CronJob from your Helm values and the variables from your
+environment; Distr ignores them.
+
+What a controller reports is now written to the controller logs instead, which you reach from the menu of a
+deployment target in the portal. Their retention is the Loki retention described below.
+
+### Deployment & Deployment Target Log Cleanup (removed in v3.0.0)
+
+Prior to v3.0.0, deployment and deployment target logs were stored in PostgreSQL and pruned
+by the `DeploymentLogRecord` and `DeploymentTargetLogRecord` cleanup targets, keeping the
+newest `LOG_RECORD_ENTRIES_MAX_COUNT` entries per deployment resource or deployment target
+(count-based retention).
+
+Logs are now stored in [Grafana Loki](https://grafana.com/oss/loki/) and retention is
+time-based, managed entirely by the Loki configuration (the shipped default is 30 days via
+`limits_config.retention_period`). The cleanup targets, their cron environment variables
+(`CLEANUP_DEPLOYMENT_LOG_RECORD_*`, `CLEANUP_DEPLOYMENT_TARGET_LOG_RECORD_*`), and
+`LOG_RECORD_ENTRIES_MAX_COUNT` have been removed.
+
+### Deployment Target Status (removed in v2.20.0)
+
+Prior to v2.20.0, Distr tracked a separate `DeploymentTargetStatus` per deployment target.
+This concept has been removed and is no longer available as a cleanup target.

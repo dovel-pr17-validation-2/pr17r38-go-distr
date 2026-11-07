@@ -1,0 +1,349 @@
+import {HttpClient, HttpErrorResponse, HttpInterceptorFn, HttpRequest} from '@angular/common/http';
+import {inject, Injectable} from '@angular/core';
+import {LoginResponse, TokenResponse, UserRole} from '@distr-sh/distr-sdk';
+import dayjs from 'dayjs';
+import {jwtDecode} from 'jwt-decode';
+import {firstValueFrom, map, Observable, of, tap, throwError} from 'rxjs';
+const tokenStorageKey = 'cloud_token';
+const actionTokenStorageKey = 'distr_action_token';
+const authBaseUrl = '/api/v1/auth';
+
+export interface JWTClaims {
+  sub: string;
+  // Special tokens (password reset, invite, verification) are not scoped to an organization.
+  org?: string;
+  c_org?: string;
+  p_org?: string;
+  email: string;
+  // Purpose a special token was minted for; absent on regular login tokens.
+  scope?: 'password_reset' | 'invite';
+  // The custom OIDC configuration that authenticated the session; absent on every other login.
+  oidc?: string;
+  // Present while the session is in the lens of a customer organization its user is not a member of.
+  lens?: boolean;
+  email_verified: boolean;
+  name: string;
+  exp: string;
+  role: UserRole;
+  image_url: string | undefined;
+  is_super_admin?: boolean;
+  [claim: string]: unknown;
+}
+
+@Injectable({providedIn: 'root'})
+export class AuthService {
+  private readonly httpClient = inject(HttpClient);
+
+  // Decoding a JWT costs a base64 decode and a JSON.parse, and the role and context checks below are called
+  // from templates, so they can run thousands of times per change detection pass on a page with many rows.
+  private decodeCache?: {token: string; claims: JWTClaims};
+
+  private get token(): string | null {
+    return localStorage.getItem(tokenStorageKey);
+  }
+
+  private set token(value: string | null) {
+    if (value !== null) {
+      localStorage.setItem(tokenStorageKey, value);
+    } else {
+      localStorage.removeItem(tokenStorageKey);
+    }
+  }
+
+  public get actionToken(): string | null {
+    return sessionStorage.getItem(actionTokenStorageKey);
+  }
+
+  public set actionToken(value: string | null) {
+    if (value !== null) {
+      sessionStorage.setItem(actionTokenStorageKey, value);
+    } else {
+      sessionStorage.removeItem(actionTokenStorageKey);
+    }
+  }
+
+  public hasRole(role: UserRole): boolean {
+    return this.getClaims()?.role === role;
+  }
+
+  public hasAnyRole(...roles: UserRole[]): boolean {
+    return roles.some((role) => this.hasRole(role));
+  }
+
+  public isVendor(): boolean {
+    const claims = this.getClaims();
+    return claims?.org !== undefined && claims.c_org === undefined && claims.p_org === undefined;
+  }
+
+  public isCustomer(): boolean {
+    return this.getClaims()?.c_org !== undefined;
+  }
+
+  public isPartner(): boolean {
+    return this.getClaims()?.p_org !== undefined;
+  }
+
+  public getPartnerOrganizationId(): string | undefined {
+    return this.getClaims()?.p_org;
+  }
+
+  public isSuperAdmin(): boolean {
+    return this.getClaims()?.is_super_admin === true;
+  }
+
+  public isLens(): boolean {
+    return this.getClaims()?.lens === true;
+  }
+
+  public isCustomOidcSession(): boolean {
+    return this.getClaims()?.oidc !== undefined;
+  }
+
+  /**
+   * Whether the current credential is a regular session. Login tokens always carry an organization, whereas the
+   * special tokens of the password reset, invite and email verification flows do not. Those are not sessions and
+   * are rejected by every organization-scoped endpoint, so they must not be used to request one.
+   */
+  public isLoggedIn(): boolean {
+    return this.getClaims()?.org !== undefined;
+  }
+
+  public login(
+    email: string,
+    password: string,
+    mfaCode?: string
+  ): Observable<{requiresMfa: boolean; redirectUrl?: string}> {
+    return this.httpClient.post<LoginResponse>(`${authBaseUrl}/login`, {email, password, mfaCode}).pipe(
+      tap((r) => {
+        if (!r.requiresMfa) {
+          this.token = r.token;
+          this.actionToken = null;
+        }
+      }),
+      map((r) => (r.requiresMfa ? {requiresMfa: true} : {requiresMfa: false, redirectUrl: r.redirectUrl}))
+    );
+  }
+
+  public loginWithToken(jwt: string) {
+    this.token = jwt;
+    this.actionToken = null;
+  }
+
+  public acceptInvite(
+    name: string | undefined,
+    password: string,
+    mfaCode?: string
+  ): Observable<{requiresMfa: boolean}> {
+    return this.httpClient
+      .post<LoginResponse>(`${authBaseUrl}/invite/accept`, {name, password, mfaCode})
+      .pipe(map((r) => this.loginAfterPasswordSet(r)));
+  }
+
+  public resetPassword(email: string): Observable<void> {
+    return this.httpClient.post<void>(`${authBaseUrl}/reset`, {email});
+  }
+
+  public confirmPasswordReset(password: string, mfaCode?: string): Observable<{requiresMfa: boolean}> {
+    return this.httpClient
+      .post<LoginResponse>(`${authBaseUrl}/reset/confirm`, {password, mfaCode})
+      .pipe(map((r) => this.loginAfterPasswordSet(r)));
+  }
+
+  /**
+   * Logs the user in with the token of an invite-accept or reset-confirm response, unless the account has MFA
+   * enabled, in which case the password was not set and the request has to be repeated with a code.
+   */
+  private loginAfterPasswordSet(response: LoginResponse): {requiresMfa: boolean} {
+    if (response.requiresMfa) {
+      return {requiresMfa: true};
+    }
+    this.loginWithToken(response.token);
+    return {requiresMfa: false};
+  }
+
+  public register(
+    email: string,
+    name: string | null | undefined,
+    organizationName: string | null | undefined,
+    password: string,
+    turnstileToken?: string
+  ): Observable<void> {
+    let body: any = {email, password};
+    if (name) {
+      body = {...body, name};
+    }
+    if (organizationName) {
+      body = {...body, organizationName};
+    }
+    if (turnstileToken) {
+      body = {...body, turnstileToken};
+    }
+    return this.httpClient.post<TokenResponse>(`${authBaseUrl}/register`, body).pipe(
+      tap((r) => this.loginWithToken(r.token)),
+      map(() => undefined)
+    );
+  }
+
+  public getClaims(): JWTClaims | undefined {
+    const {claims} = this.getTokenAndClaims();
+    return claims;
+  }
+
+  public getTokenAndClaims(): {token: string | null; claims: JWTClaims | undefined} {
+    const token = this.actionToken ?? this.token;
+    if (token !== null) {
+      const claims = this.decodeClaims(token);
+      if (claims !== undefined) {
+        return {token, claims};
+      }
+    }
+    return {token: null, claims: undefined};
+  }
+
+  private decodeClaims(token: string): JWTClaims | undefined {
+    if (this.decodeCache?.token === token) {
+      return this.decodeCache.claims;
+    }
+    try {
+      const claims = jwtDecode<JWTClaims>(token);
+      this.decodeCache = {token, claims};
+      return claims;
+    } catch (e) {
+      console.error(e);
+      return undefined;
+    }
+  }
+
+  public requestEmailVerification(): Observable<void> {
+    return this.httpClient.post<void>(`${authBaseUrl}/verify/request`, undefined);
+  }
+
+  public confirmEmailVerification(): Observable<void> {
+    return this.httpClient.post<void>(`${authBaseUrl}/verify/confirm`, undefined);
+  }
+
+  public getUserStatus(): Observable<{active: boolean}> {
+    return this.httpClient.get<{active: boolean}>(`${authBaseUrl}/status`);
+  }
+
+  public async switchContext(organizationId: string): Promise<void> {
+    if (await this.requestContextToken('switch-context', {organizationId})) {
+      location.assign('/');
+    }
+  }
+
+  /** Enters the lens of a customer organization of the organization the session operates in. */
+  public async enterLens(customerOrganizationId: string): Promise<void> {
+    if (await this.requestContextToken('enter-lens', {customerOrganizationId})) {
+      location.assign('/');
+    }
+  }
+
+  private async requestContextToken(endpoint: 'switch-context' | 'enter-lens', body: object): Promise<boolean> {
+    const response = await firstValueFrom(
+      this.httpClient.post<TokenResponse | null>(`${authBaseUrl}/${endpoint}`, body)
+    );
+    if (response) {
+      this.token = response.token;
+      this.actionToken = null;
+    }
+    return !!response;
+  }
+
+  public logout(): Observable<void> {
+    this.token = null;
+    this.actionToken = null;
+    return of(undefined);
+  }
+}
+
+export const tokenInterceptor: HttpInterceptorFn = (req, next) => {
+  const auth = inject(AuthService);
+  if (authenticatedRoute(req)) {
+    const {token, claims} = auth.getTokenAndClaims();
+    try {
+      if (claims && dayjs.unix(parseInt(claims.exp)).isAfter(dayjs())) {
+        return next(req.clone({headers: req.headers.set('Authorization', `Bearer ${token}`)})).pipe(
+          tap({
+            error: (e) => {
+              if (e instanceof HttpErrorResponse && e.status == 401 && !isUnrelatedToActionFlow(auth, req)) {
+                auth.logout();
+                removeJwtQueryParamAndRefresh(claims?.email);
+              }
+            },
+          })
+        );
+      } else {
+        auth.logout();
+        removeJwtQueryParamAndRefresh(claims?.email);
+        return throwError(() => new Error('no token or token has expired'));
+      }
+    } catch (cause) {
+      return throwError(() => new Error('no token', {cause}));
+    }
+  } else {
+    return next(req);
+  }
+};
+
+// Pages on which the user is setting up their credentials with a special token instead of a session.
+export const actionFlowPaths = ['/reset', '/join', '/verify'];
+
+/** The page of the credential-setup flow the given organization-less token was minted for. */
+export function actionFlowPath(claims: JWTClaims): string {
+  switch (claims.scope) {
+    case 'password_reset':
+      return '/reset';
+    case 'invite':
+      return '/join';
+    default:
+      return '/verify';
+  }
+}
+
+/**
+ * Whether a rejected request should be ignored because it has nothing to do with the flow the user is in. The
+ * special tokens of these pages carry no organization and are only accepted by the endpoints of their own flow,
+ * so a 401 from anywhere else says nothing about the validity of the link the user followed and must not send
+ * them to the "link expired" page.
+ */
+function isUnrelatedToActionFlow(auth: AuthService, req: HttpRequest<unknown>): boolean {
+  return !auth.isLoggedIn() && !req.url.startsWith(authBaseUrl) && actionFlowPaths.includes(location.pathname);
+}
+
+function authenticatedRoute(req: HttpRequest<unknown>): boolean {
+  if (req.url.startsWith('/ready') || req.url.startsWith('/api/public/')) {
+    return false;
+  }
+
+  return (
+    !req.url.startsWith(authBaseUrl) ||
+    req.url === `${authBaseUrl}/switch-context` ||
+    req.url === `${authBaseUrl}/enter-lens` ||
+    req.url === `${authBaseUrl}/status` ||
+    req.url.startsWith(`${authBaseUrl}/verify/`) ||
+    req.url.startsWith(`${authBaseUrl}/invite/`) ||
+    req.url === `${authBaseUrl}/reset/confirm`
+  );
+}
+
+function removeJwtQueryParamAndRefresh(email?: string) {
+  const url = new URL(location.href);
+  if (url.searchParams.has('jwt')) {
+    url.searchParams.delete('jwt');
+  }
+  if (url.pathname === '/join') {
+    url.pathname = '/forgot';
+    url.searchParams.append('reason', 'invite-expired');
+  } else if (url.pathname === '/reset') {
+    url.pathname = '/forgot';
+    url.searchParams.append('reason', 'reset-expired');
+  } else {
+    url.pathname = '/login';
+    url.searchParams.append('reason', 'session-expired');
+  }
+  if (email) {
+    url.searchParams.append('email', email);
+  }
+  location.assign(url);
+}

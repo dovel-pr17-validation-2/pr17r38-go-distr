@@ -1,0 +1,198 @@
+import {ChangeDetectionStrategy, Component, inject, OnInit, signal} from '@angular/core';
+import {takeUntilDestroyed} from '@angular/core/rxjs-interop';
+import {FormBuilder, ReactiveFormsModule, Validators} from '@angular/forms';
+import {ActivatedRoute, Router, RouterLink} from '@angular/router';
+import {distinctUntilChanged, filter, lastValueFrom, map, take} from 'rxjs';
+import {getFormDisplayedError} from '../../util/errors';
+import {MfaCodeInputComponent, newMfaCodeControl} from '../components/mfa-code-input.component';
+import {OidcButtonsComponent} from '../components/oidc-buttons.component';
+import {PortalLogoComponent} from '../components/portal-logo/portal-logo.component';
+import {AutotrimDirective} from '../directives/autotrim.directive';
+import {PlaceholderDirective} from '../directives/placeholder.directive';
+import {AuthService} from '../services/auth.service';
+import {PortalBrandingService} from '../services/portal-branding.service';
+import {PortalService} from '../services/portal.service';
+import {ToastService} from '../services/toast.service';
+import {PortalLoginConfig} from '../types/portal';
+
+@Component({
+  selector: 'app-login',
+  imports: [
+    ReactiveFormsModule,
+    RouterLink,
+    AutotrimDirective,
+    PlaceholderDirective,
+    OidcButtonsComponent,
+    PortalLogoComponent,
+    MfaCodeInputComponent,
+  ],
+  changeDetection: ChangeDetectionStrategy.Eager,
+  templateUrl: './login.component.html',
+})
+export class LoginComponent implements OnInit {
+  private readonly auth = inject(AuthService);
+  private readonly router = inject(Router);
+  private readonly route = inject(ActivatedRoute);
+  private readonly toast = inject(ToastService);
+  private readonly portalBranding = inject(PortalBrandingService);
+  private readonly fb = inject(FormBuilder).nonNullable;
+
+  protected readonly emailPasswordForm = this.fb.group({
+    email: this.fb.control('', [Validators.required, Validators.email]),
+    password: this.fb.control('', [Validators.required]),
+  });
+
+  protected readonly mfaCodeForm = this.fb.group({
+    mfaCode: newMfaCodeControl(),
+  });
+
+  protected readonly mfaRequired = signal(false);
+  protected readonly loading = signal(false);
+  protected readonly errorMessage = signal<string | undefined>(undefined);
+
+  private readonly portalService = inject(PortalService);
+  readonly loginConfig = this.portalService.loginConfig;
+  readonly isJWTLogin = signal(false);
+
+  constructor() {
+    this.route.queryParamMap
+      .pipe(
+        map((params) => params.get('email')),
+        filter((email) => email !== null),
+        distinctUntilChanged(),
+        takeUntilDestroyed()
+      )
+      .subscribe((email) => this.emailPasswordForm.patchValue({email}));
+
+    this.route.queryParamMap
+      .pipe(
+        map((params) => params.get('inviteSuccess')),
+        filter((inviteSuccess) => inviteSuccess === 'true'),
+        takeUntilDestroyed(),
+        take(1)
+      )
+      .subscribe(() => this.toast.success('Account activated successfully. You can now log in!'));
+
+    this.portalService.portal$
+      .pipe(take(1), takeUntilDestroyed())
+      .subscribe(({loginConfig}) => this.redirectToSingleSignOn(loginConfig));
+  }
+
+  public ngOnInit(): void {
+    const reason = this.route.snapshot.queryParamMap.get('reason');
+    switch (reason) {
+      case 'password-reset':
+        this.toast.success('Your password has been updated, you can now log in.');
+        break;
+      case 'session-expired':
+        this.toast.info('You have been logged out because your session has expired.');
+        break;
+      case 'oidc-failed':
+        this.toast.error(
+          'Login with this provider failed. Please try again, or contact your administrator if the problem persists.'
+        );
+        break;
+      case 'oidc-expired':
+        this.toast.error('Your login attempt took too long or was already used. Please try again.');
+        break;
+      case 'oidc-registration-disabled':
+        this.toast.error('Sign-up is not available here. Please contact your administrator.');
+        break;
+      case 'oidc-unavailable':
+        this.toast.error('This login method is not available on this domain. Please contact your administrator.');
+        break;
+      case 'oidc-no-account':
+        this.toast.error('You do not have an account in this organization. Please contact your administrator.');
+        break;
+      case 'oidc-unknown-user':
+        this.toast.error('There is no account for this email address. Please note that you must be invited to log in.');
+        break;
+      case 'oidc-user-limit':
+        this.toast.error(
+          'This organization has no user seats left, so no account could be created. ' +
+            'Please contact your administrator.'
+        );
+        break;
+      case 'oidc-email-blocked':
+        this.toast.error('Email addresses from this domain are not allowed. Please contact your administrator.');
+        break;
+      case 'oidc-org-limit':
+        this.toast.error(
+          'This instance has reached its organization limit, so no account could be created. ' +
+            'Please contact your administrator.'
+        );
+        break;
+    }
+
+    const jwt = this.route.snapshot.queryParamMap.get('jwt');
+    if (jwt) {
+      this.isJWTLogin.set(true);
+      this.auth.loginWithToken(jwt);
+      window.location.href = '/';
+      return;
+    }
+  }
+
+  private redirectToSingleSignOn(loginConfig: PortalLoginConfig): void {
+    const params = this.route.snapshot.queryParamMap;
+    // Read from the query params rather than isJWTLogin, which ngOnInit may set only after the portal
+    // response arrived. Redirecting then would throw away a token handed over by the login forwarding.
+    if (params.has('jwt') || params.has('manual') || params.has('reason')) {
+      return;
+    }
+    const spInitiated = loginConfig.oidcProviders.filter((provider) => provider.spInitiated);
+    if (spInitiated.length === 1) {
+      window.location.href = spInitiated[0].loginPath;
+    }
+  }
+
+  public async submit(): Promise<void> {
+    this.emailPasswordForm.markAllAsTouched();
+    this.errorMessage.set(undefined);
+
+    const email = this.emailPasswordForm.value.email;
+    const password = this.emailPasswordForm.value.password;
+    const mfaCode = this.mfaCodeForm.value.mfaCode || undefined;
+
+    if (this.emailPasswordForm.invalid || !email || !password) {
+      this.emailPasswordForm.markAllAsTouched();
+      return;
+    }
+
+    if (this.mfaRequired() && (this.mfaCodeForm.invalid || !mfaCode)) {
+      this.mfaCodeForm.markAllAsTouched();
+      return;
+    }
+
+    this.loading.set(true);
+
+    try {
+      const response = await lastValueFrom(this.auth.login(email, password, mfaCode));
+      if (response.requiresMfa) {
+        this.mfaRequired.set(true);
+      } else if (response.redirectUrl && !this.route.snapshot.queryParamMap.has('stay')) {
+        window.location.href = response.redirectUrl;
+      } else {
+        // Re-apply branding now that the user is authenticated, since this SPA navigation does not
+        // reload the app and re-run the bootstrap initializer.
+        this.portalBranding.apply();
+        if (this.auth.isCustomer()) {
+          await this.router.navigate(['/home']);
+        } else {
+          await this.router.navigate(['/dashboard'], {queryParams: {from: 'login'}});
+        }
+      }
+    } catch (e) {
+      this.errorMessage.set(getFormDisplayedError(e));
+    } finally {
+      this.loading.set(false);
+    }
+  }
+
+  public reset() {
+    this.emailPasswordForm.reset();
+    this.mfaCodeForm.reset();
+    this.mfaRequired.set(false);
+    this.errorMessage.set(undefined);
+  }
+}

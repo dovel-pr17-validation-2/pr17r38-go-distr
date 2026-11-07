@@ -1,0 +1,75 @@
+---
+title: 'Distr v1.1 is Here!'
+description: 'All the details about the inaugural release of Distr v1.0'
+publishDate: 2025-02-17
+lastUpdated: 2025-02-17
+slug: 'distr-v1-release-post'
+authors:
+  - name: 'Jake Page'
+    role: 'Software Distribution Specialist'
+    image: '/src/assets/blog/authors/jpage.jpg'
+    linkedIn: https://www.linkedin.com/in/jakepage91/
+    gitHub: https://github.com/jakepage91
+image: '/src/assets/blog/2025-02-17-distr-1-1-release/blog-thumb.png'
+tags:
+  - Releases
+---
+
+The inaugural release of [Distr](https://github.com/distr-sh/distr) v1.0 shipped just a little over a week ago, and we're already back with a minor update that packs some major features. These updates expand what Distr can do for your software distribution needs.
+
+### 1. Feature: GitHub Release Action
+
+This action creates a new version of a [Distr](https://github.com/distr-sh/distr) application, fully automating the software release lifecycle.
+
+- **Why it matters:** No more manual steps. With this action, you can ship new Docker and Helm based application versions automatically from end to end, so they're instantly available on Distr for deployment. It ties up the loose ends of your CI/CD workflow and saves you time.
+
+- **How to use it:** Check out the [action documentation](https://github.com/marketplace/actions/distr-create-version#usage) to get started.
+
+This example shows how to create a new version of a Docker based application.
+
+![docker-based-image](../../assets/blog/2025-02-17-distr-1-1-release/docker-github-action.png)
+
+### 2. Feature: Docker environment variable Management
+
+This feature simplifies managing environment variables in your Docker Compose setup for a smoother, more secure deployment.
+
+- **Why it matters:** Managing environment variables can be tricky, especially in complex applications. With this feature, you can centralize and simplify env management, reducing errors and making it easier to maintain consistency across different environments.
+
+- **How to get started:** Check out the [guide](/docs/controllers/docker-env/) on how to manage environment variables in Docker Compose files.
+
+![env-management](../../assets/blog/2025-02-17-distr-1-1-release/docker-env-management.png)
+
+Have questions or feedback? [Join the discussion](https://github.com/distr-sh/distr/discussions) or request a [demo call](https://cal.glasskube.com/team/gk/demo?duration=30)!
+
+### Upgrading to v1.1
+
+Our hosted version of Distr was already upgraded to the latest v1.1 release.
+
+To take advantage of all new features in Distr v1.1, here's what you need to do **if you're using the previous version of the controllers**:
+
+- If you're running an older controller version, click update controller via the deployment web UI to ensure compatibility with the latest improvements.
+
+If you are self-hosting Distr make sure to check out our [changelog](https://github.com/distr-sh/distr/blob/main/CHANGELOG.md).
+
+### What's Coming Next
+
+Based on user feedback and feature requests, we are currently working on licensing and private repository support. Here's how it will look:
+
+- Each license is uniquely named within its organization and can optionally include an expiration date (the controller can revoke access to the software if there is no renewal)
+- Licenses are tied to a specific application and can apply either to all versions or only to selected ones.
+- Deployments can be linked to a license. If the license is activated, customers see only applications and versions they have a license for
+- For organizations using private container registries, licenses can also include Docker login credentials (such as a registry URL, username, and password) so the controller can authenticate and pull images securely.
+
+Would love to get your thoughts on the licensing feature and hear what else you would like us to ship next.
+
+### Join the Conversation
+
+We'd love to hear your thoughts on this release. Share your feedback, ideas, or questions:
+
+- [Join the discussion](https://github.com/distr-sh/distr/discussions)
+- [Book a demo call](https://cal.glasskube.com/team/gk/demo?duration=30)
+- Reach out on [LinkedIn](https://www.linkedin.com/company/glasskube) or Twitter
+
+### Thank You!
+
+Thank you for being part of the Distr community. We're excited to keep building the best open source software distribution platform together.

@@ -1,0 +1,329 @@
+import {DatePipe} from '@angular/common';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  inject,
+  input,
+  Signal,
+  signal,
+  TemplateRef,
+  viewChild,
+} from '@angular/core';
+import {takeUntilDestroyed, toObservable, toSignal} from '@angular/core/rxjs-interop';
+import {FormBuilder, FormControl, FormRecord, ReactiveFormsModule, Validators} from '@angular/forms';
+import {CustomerOrganization, DeploymentTarget, Named} from '@distr-sh/distr-sdk';
+import {FaIconComponent} from '@fortawesome/angular-fontawesome';
+import {faCheck, faPen, faPlus, faTrash, faXmark} from '@fortawesome/free-solid-svg-icons';
+import {combineLatest, firstValueFrom, startWith, Subject, switchMap} from 'rxjs';
+import {getFormDisplayedError} from '../../util/errors';
+import {loadWhileOpen, refreshInBackground} from '../../util/refresh';
+import {validateRecordAtLeast} from '../../util/validation';
+import {SearchBarComponent} from '../components/search-bar.component';
+import {SpinnerComponent} from '../components/spinner/spinner.component';
+import {ClickableRowDirective} from '../directives/clickable-row.directive';
+import {AlertConfigurationsService} from '../services/alert-configurations.service';
+import {AuthService} from '../services/auth.service';
+import {CustomerOrganizationsService} from '../services/customer-organizations.service';
+import {DeploymentTargetsService} from '../services/deployment-targets.service';
+import {DialogRef, OverlayService} from '../services/overlay.service';
+import {ToastService} from '../services/toast.service';
+import {UsersService} from '../services/users.service';
+import {AlertConfiguration, CreateUpdateAlertConfigurationRequest} from '../types/alert-configuration';
+
+@Component({
+  selector: 'app-alert-configurations',
+  templateUrl: './alert-configurations.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  imports: [
+    FaIconComponent,
+    ReactiveFormsModule,
+    DatePipe,
+    SearchBarComponent,
+    ClickableRowDirective,
+    SpinnerComponent,
+  ],
+})
+export class AlertConfigurationsComponent {
+  /** customerOrganizationId scopes the page to what one customer is notified about. */
+  public readonly customerOrganizationId = input<string>();
+
+  protected readonly auth = inject(AuthService);
+  protected readonly canEdit = this.auth.hasAnyRole('read_write', 'admin');
+  private readonly svc = inject(AlertConfigurationsService);
+  private readonly fb = inject(FormBuilder).nonNullable;
+  private readonly overlay = inject(OverlayService);
+  private readonly usersService = inject(UsersService);
+  private readonly deploymentTargetsService = inject(DeploymentTargetsService);
+  private readonly customersService = inject(CustomerOrganizationsService);
+  private readonly toast = inject(ToastService);
+
+  protected readonly editConfigForm = this.fb.group(
+    {
+      id: this.fb.control(''),
+      name: this.fb.control(''),
+      enabled: this.fb.control(true),
+      statusTriggerEnabled: this.fb.control(true),
+      cpuTriggerEnabled: this.fb.control(false),
+      cpuTriggerThresholdPercent: this.fb.control(75, [Validators.min(1), Validators.max(100), Validators.required]),
+      memoryTriggerEnabled: this.fb.control(false),
+      memoryTriggerThresholdPercent: this.fb.control(75, [Validators.min(1), Validators.max(100), Validators.required]),
+      diskTriggerEnabled: this.fb.control(false),
+      diskTriggerThresholdPercent: this.fb.control(75, [Validators.min(1), Validators.max(100), Validators.required]),
+      userAccountIds: this.fb.record<boolean>({}, {validators: [validateRecordAtLeast(1)]}),
+      deploymentTargetIds: this.fb.record<boolean>({}, {validators: [validateRecordAtLeast(1)]}),
+    },
+    {
+      validators: [
+        (ctrl) => {
+          const v = ctrl.value;
+          return v.statusTriggerEnabled || v.cpuTriggerEnabled || v.memoryTriggerEnabled || v.diskTriggerEnabled
+            ? null
+            : {anyTrigger: 1};
+        },
+      ],
+    }
+  );
+
+  constructor() {
+    if (this.auth.isVendor()) {
+      refreshInBackground(this.customersService.refresh());
+    }
+    const thresholdPairs: [FormControl<boolean>, FormControl<number | null>][] = [
+      [this.editConfigForm.controls.cpuTriggerEnabled, this.editConfigForm.controls.cpuTriggerThresholdPercent],
+      [this.editConfigForm.controls.memoryTriggerEnabled, this.editConfigForm.controls.memoryTriggerThresholdPercent],
+      [this.editConfigForm.controls.diskTriggerEnabled, this.editConfigForm.controls.diskTriggerThresholdPercent],
+    ];
+    for (const [enabledCtrl, thresholdCtrl] of thresholdPairs) {
+      enabledCtrl.valueChanges.pipe(takeUntilDestroyed()).subscribe((enabled) => {
+        if (enabled) {
+          thresholdCtrl.enable();
+          if (!thresholdCtrl.value) {
+            thresholdCtrl.setValue(75);
+          }
+        } else {
+          thresholdCtrl.disable();
+        }
+      });
+    }
+  }
+  protected readonly editFormLoading = signal(false);
+  protected readonly drawerLoading = signal(false);
+  private readonly editConfigDrawerTpl = viewChild.required<TemplateRef<unknown>>('editConfigDrawer');
+  private editConfigDrawerRef?: DialogRef;
+
+  private readonly togglingConfigIds = new Set<string>();
+
+  /** scope is the customer whose users and deployments a configuration of this page reaches. */
+  private readonly scope = computed(() => this.customerOrganizationId() ?? this.auth.getClaims()?.c_org);
+
+  private readonly reload$ = new Subject<void>();
+  protected readonly configs = toSignal(
+    combineLatest([this.reload$.pipe(startWith(undefined)), toObservable(this.customerOrganizationId)]).pipe(
+      switchMap(([, customerOrganizationId]) => this.svc.list(customerOrganizationId))
+    )
+  );
+  private readonly allUsers = toSignal(this.usersService.getUsers());
+  protected readonly users = computed(() =>
+    this.allUsers()?.filter((it) => it.customerOrganizationId === this.scope())
+  );
+  private readonly allDeploymentTargets = toSignal(this.deploymentTargetsService.list());
+  private readonly deploymentTargets = computed(() =>
+    this.customerOrganizationId()
+      ? this.allDeploymentTargets()?.filter((it) => it.customerOrganization?.id === this.customerOrganizationId())
+      : this.allDeploymentTargets()
+  );
+  private readonly customers = this.auth.isVendor()
+    ? toSignal(this.customersService.getCustomerOrganizations())
+    : signal([]).asReadonly();
+  protected readonly deploymentTargetCustomers: Signal<
+    {customer?: CustomerOrganization; deploymentTargets: DeploymentTarget[]}[]
+  > = computed(() => {
+    const deploymentTargets = this.deploymentTargets() ?? [];
+    const customers = this.customerOrganizationId() ? [] : this.customers();
+    return customers?.length
+      ? [
+          {deploymentTargets: deploymentTargets.filter((it) => it.customerOrganization === undefined)},
+          ...customers.map((customer) => ({
+            customer,
+            deploymentTargets: deploymentTargets.filter((it) => it.customerOrganization?.id === customer.id),
+          })),
+        ].filter((entry) => entry.deploymentTargets.length > 0)
+      : [{deploymentTargets}];
+  });
+
+  protected readonly filterForm = this.fb.group({
+    search: '',
+  });
+
+  private readonly filterValue = toSignal(this.filterForm.controls.search.valueChanges);
+
+  protected readonly filteredConfigs = computed(() => {
+    const value = this.filterValue()?.toLowerCase();
+    const configs = this.configs();
+    return !value ? configs : configs?.filter((it) => it.name.toLowerCase().includes(value));
+  });
+
+  protected readonly faPlus = faPlus;
+  protected readonly faPen = faPen;
+  protected readonly faTrash = faTrash;
+  protected readonly faCheck = faCheck;
+  protected readonly faXmark = faXmark;
+
+  protected async showDrawer(config?: AlertConfiguration) {
+    this.hideDrawer();
+    this.editConfigForm.reset();
+    const records: FormRecord<FormControl<boolean>>[] = [
+      this.editConfigForm.controls.userAccountIds,
+      this.editConfigForm.controls.deploymentTargetIds,
+    ];
+    for (const record of records) {
+      Object.keys(record.controls).forEach((id) => record.removeControl(id, {emitEvent: false}));
+    }
+    try {
+      const loaded = await loadWhileOpen(
+        this.drawerLoading,
+        () => (this.editConfigDrawerRef = this.overlay.showDrawer(this.editConfigDrawerTpl())),
+        Promise.all([this.usersService.refresh(), this.deploymentTargetsService.refresh()])
+      );
+      if (loaded === undefined) {
+        return;
+      }
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+      this.hideDrawer();
+      return;
+    }
+
+    this.users()
+      ?.map((user) => user.id)
+      .filter((id) => id !== undefined)
+      .forEach((id) => this.editConfigForm.controls.userAccountIds.addControl(id, this.fb.control(false)));
+
+    this.deploymentTargets()
+      ?.map((dt) => dt.id)
+      .filter((id) => id !== undefined)
+      .forEach((id) => this.editConfigForm.controls.deploymentTargetIds.addControl(id, this.fb.control(false)));
+
+    if (config) {
+      this.editConfigForm.patchValue({
+        id: config.id,
+        name: config.name,
+        enabled: config.enabled,
+        statusTriggerEnabled: config.statusTriggerEnabled,
+        cpuTriggerEnabled: config.cpuTriggerThresholdPercent !== undefined,
+        cpuTriggerThresholdPercent: config.cpuTriggerThresholdPercent,
+        memoryTriggerEnabled: config.memoryTriggerThresholdPercent !== undefined,
+        memoryTriggerThresholdPercent: config.memoryTriggerThresholdPercent,
+        diskTriggerEnabled: config.diskTriggerThresholdPercent !== undefined,
+        diskTriggerThresholdPercent: config.diskTriggerThresholdPercent,
+        deploymentTargetIds: config.deploymentTargetIds?.reduce((acc, id) => ({...acc, [id]: true}), {}),
+        userAccountIds: config.userAccountIds?.reduce((acc, id) => ({...acc, [id]: true}), {}),
+      });
+    }
+  }
+
+  protected hideDrawer() {
+    this.editConfigDrawerRef?.dismiss();
+  }
+
+  protected async saveConfig() {
+    if (this.editConfigForm.invalid) {
+      this.editConfigForm.markAllAsTouched();
+      return;
+    }
+
+    const formValue = this.editConfigForm.value;
+    const requestValue: CreateUpdateAlertConfigurationRequest = {
+      customerOrganizationId: this.customerOrganizationId(),
+      name: formValue.name ?? '',
+      enabled: formValue.enabled ?? true,
+      statusTriggerEnabled: formValue.statusTriggerEnabled ?? false,
+      cpuTriggerThresholdPercent: formValue.cpuTriggerThresholdPercent,
+      memoryTriggerThresholdPercent: formValue.memoryTriggerThresholdPercent,
+      diskTriggerThresholdPercent: formValue.diskTriggerThresholdPercent,
+      deploymentTargetIds: Object.entries(formValue.deploymentTargetIds ?? {})
+        .filter(([_, checked]) => checked)
+        .map(([id]) => id),
+      userAccountIds: Object.entries(formValue.userAccountIds ?? {})
+        .filter(([_, checked]) => checked)
+        .map(([id]) => id),
+    };
+
+    this.editFormLoading.set(true);
+
+    try {
+      if (formValue.id) {
+        await firstValueFrom(this.svc.update(formValue.id, requestValue));
+        this.toast.success('Alert configuration updated');
+      } else {
+        await firstValueFrom(this.svc.create(requestValue));
+        this.toast.success('Alert configuration created');
+      }
+      this.reload$.next();
+      this.hideDrawer();
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    } finally {
+      this.editFormLoading.set(false);
+    }
+  }
+
+  protected async toggleConfigEnabled(config: AlertConfiguration, toggle: HTMLInputElement, event: Event) {
+    if (this.togglingConfigIds.has(config.id)) {
+      event.preventDefault();
+      return;
+    }
+    this.togglingConfigIds.add(config.id);
+    try {
+      const request = {...config, enabled: !config.enabled, customerOrganizationId: this.customerOrganizationId()};
+      await firstValueFrom(this.svc.update(config.id, request));
+      this.toast.success(`Alert configuration ${request.enabled ? 'enabled' : 'disabled'}`);
+      this.reload$.next();
+    } catch (e) {
+      toggle.checked = config.enabled;
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    } finally {
+      this.togglingConfigIds.delete(config.id);
+    }
+  }
+
+  protected async deleteConfig(config: AlertConfiguration) {
+    if (!(await firstValueFrom(this.overlay.confirm(`Really delete the alert "${config.name}"?`)))) {
+      return;
+    }
+
+    try {
+      await firstValueFrom(this.svc.delete(config.id, this.customerOrganizationId()));
+      this.toast.success('Alert configuration deleted');
+      this.reload$.next();
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    }
+  }
+
+  protected getTriggersCount(config: AlertConfiguration): number {
+    return [
+      config.statusTriggerEnabled,
+      config.cpuTriggerThresholdPercent !== undefined,
+      config.memoryTriggerThresholdPercent !== undefined,
+      config.diskTriggerThresholdPercent !== undefined,
+    ].filter((v) => v).length;
+  }
+
+  protected getNames(named: Named[] | undefined) {
+    return named?.map((it) => it.name).join('\n');
+  }
+}

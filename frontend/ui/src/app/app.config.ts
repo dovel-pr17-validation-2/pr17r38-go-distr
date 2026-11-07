@@ -1,0 +1,36 @@
+import {OVERLAY_DEFAULT_CONFIG} from '@angular/cdk/overlay';
+import {provideHttpClient, withInterceptors} from '@angular/common/http';
+import {
+  ApplicationConfig,
+  ErrorHandler,
+  inject,
+  provideAppInitializer,
+  provideZoneChangeDetection,
+} from '@angular/core';
+import {provideRouter, TitleStrategy} from '@angular/router';
+import * as Sentry from '@sentry/angular';
+import {routes} from './app.routes';
+import {tokenInterceptor} from './services/auth.service';
+import {errorToastInterceptor} from './services/error-toast.interceptor';
+import {PageTitleStrategy} from './services/page-title.strategy';
+import {PortalBrandingService} from './services/portal-branding.service';
+import {trimInterceptor} from './services/trim.interceptor';
+
+export const appConfig: ApplicationConfig = {
+  providers: [
+    {
+      provide: ErrorHandler,
+      useValue: Sentry.createErrorHandler(),
+    },
+    provideZoneChangeDetection({eventCoalescing: true}),
+    provideRouter(routes),
+    {provide: TitleStrategy, useExisting: PageTitleStrategy},
+    provideHttpClient(withInterceptors([tokenInterceptor, trimInterceptor, errorToastInterceptor])),
+    provideAppInitializer(async () => inject(Sentry.TraceService)),
+    provideAppInitializer(() => {
+      // Branding is best-effort and resolves asynchronously, so it never blocks bootstrap.
+      inject(PortalBrandingService).apply();
+    }),
+    {provide: OVERLAY_DEFAULT_CONFIG, useValue: {usePopover: false}},
+  ],
+};

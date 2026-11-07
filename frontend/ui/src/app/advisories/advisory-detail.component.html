@@ -1,0 +1,333 @@
+<app-page>
+  <a
+    [routerLink]="backRoute"
+    class="mb-4 inline-flex items-center text-sm text-gray-600 hover:text-primary-700 dark:text-gray-400 dark:hover:text-white">
+    <fa-icon [icon]="faArrowLeft" class="me-2" />
+    Back to advisories
+  </a>
+
+  @if (advisory(); as advisory) {
+    <div class="distr-panel mb-6">
+      <div class="flex items-start justify-between gap-4">
+        <div>
+          <div class="flex flex-wrap items-center gap-2">
+            <h1 class="text-2xl font-semibold text-gray-900 dark:text-white">{{ advisory.title }}</h1>
+            @if (canEdit) {
+              <app-badge-select
+                ariaLabel="Change severity"
+                [options]="severitySelectOptions"
+                [value]="advisory.severity"
+                [disabled]="patching()"
+                (selected)="changeSeverity($event)" />
+            } @else {
+              <app-advisory-severity-badge [severity]="advisory.severity" />
+            }
+            @if (showsAffectedState) {
+              <app-advisory-affected-badge [affected]="advisory.affected" />
+            } @else if (canEdit) {
+              <app-badge-select
+                ariaLabel="Change status"
+                [options]="statusSelectOptions"
+                [value]="advisory.status"
+                [disabled]="patching()"
+                (selected)="changeStatus($event)" />
+            } @else {
+              <app-advisory-status-badge [status]="advisory.status" />
+            }
+          </div>
+          @if (advisory.tags.length > 0) {
+            <div class="mt-3 flex flex-wrap items-center gap-2">
+              @for (tag of advisory.tags; track tag) {
+                <span class="distr-badge distr-badge-neutral">{{ tag }}</span>
+              }
+            </div>
+          }
+          <p class="mt-3 text-sm text-gray-500 dark:text-gray-400">
+            Created {{ advisory.createdAt | date: 'medium' }}
+            @if (advisory.createdByUserName) {
+              by {{ advisory.createdByUserName }}
+            }
+            @if (advisory.publishedAt) {
+              &middot; Published {{ advisory.publishedAt | date: 'medium' }}
+            }
+            @if (!showsAffectedState && advisory.resolvedAt) {
+              &middot; Resolved {{ advisory.resolvedAt | date: 'medium' }}
+            }
+          </p>
+        </div>
+
+        @if (canEdit) {
+          <button
+            type="button"
+            (click)="openEditDialog(editAdvisoryDialog)"
+            class="distr-btn-secondary flex shrink-0 items-center gap-2 px-4 py-2 text-sm font-medium">
+            <fa-icon [icon]="faPen" />
+            Edit
+          </button>
+        }
+      </div>
+    </div>
+
+    <div class="grid grid-cols-1 gap-6 lg:grid-cols-3">
+      <div class="space-y-6 lg:col-span-2">
+        <div class="distr-panel">
+          <h2 class="mb-3 text-lg font-semibold text-gray-900 dark:text-white">Description</h2>
+          @if (advisory.description) {
+            <div
+              class="markdown markdown-compact text-gray-900 dark:text-white"
+              [innerMarkdown]="advisory.description"></div>
+          } @else {
+            <p class="text-sm text-gray-500 dark:text-gray-400">No description provided.</p>
+          }
+        </div>
+
+        <div class="distr-panel">
+          @if (auth.isCustomer()) {
+            <h2 class="mb-1 text-lg font-semibold text-gray-900 dark:text-white">Your Exposure</h2>
+            <p class="mb-4 text-sm text-gray-500 dark:text-gray-400">
+              Your deployments that run, or previously ran, an affected version, and your downloads of an affected
+              artifact version.
+            </p>
+          } @else {
+            <h2 class="mb-1 text-lg font-semibold text-gray-900 dark:text-white">Affected Customers</h2>
+            <p class="mb-4 text-sm text-gray-500 dark:text-gray-400">
+              Deployments that run, or previously ran, an affected application version, and registry pulls of an
+              affected artifact version.
+            </p>
+          }
+
+          @if (impactResult(); as impact) {
+            @if (auth.isCustomer() && (impact.deployments.length > 0 || impact.pulls.length > 0)) {
+              @if (advisory.affected) {
+                <app-alert type="warning" heading="Action required." class="mb-4">
+                  @if (stillAffectedCount() > 0) {
+                    {{ stillAffectedCount() }} of your deployments still
+                    <ng-container [ngPlural]="stillAffectedCount()">
+                      <ng-template ngPluralCase="=1">runs</ng-template>
+                      <ng-template ngPluralCase="other">run</ng-template>
+                    </ng-container>
+                    an affected version.
+                  } @else {
+                    You downloaded an affected artifact version.
+                  }
+                  @if (hasPatchedVersions()) {
+                    Move to a version listed under Patched In.
+                  } @else {
+                    No patched version has been released yet.
+                  }
+                </app-alert>
+              } @else {
+                <app-alert type="success" heading="You might no longer be affected." class="mb-4">
+                  You have deployed or downloaded a patched version, so Distr no longer sees exposure to this advisory.
+                </app-alert>
+              }
+            }
+
+            @if (impact.deployments.length > 0) {
+              <h3 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">
+                {{ auth.isCustomer() ? 'Your Deployments' : 'Deployments' }}
+              </h3>
+              <div class="mb-6 overflow-x-auto">
+                <table class="distr-table">
+                  <thead class="distr-table-head">
+                    <tr>
+                      @if (!auth.isCustomer()) {
+                        <th scope="col" class="p-3">Customer</th>
+                      }
+                      <th scope="col" class="p-3">Deployment Target</th>
+                      <th scope="col" class="p-3">Application</th>
+                      <th scope="col" class="p-3">State</th>
+                      <th scope="col" class="p-3">Affected Version</th>
+                      <th scope="col" class="p-3">Current Version</th>
+                      <th scope="col" class="p-3">Affected Version Deployed</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (deployment of impact.deployments; track deployment.deploymentId) {
+                      <tr class="border-t border-gray-200 dark:border-gray-600">
+                        @if (!auth.isCustomer()) {
+                          <td class="px-3 py-2">{{ deployment.customerOrganizationName || 'Internal' }}</td>
+                        }
+                        <td class="px-3 py-2">{{ deployment.deploymentTargetName }}</td>
+                        <td class="px-3 py-2">{{ deployment.applicationName }}</td>
+                        <td class="px-3 py-2">
+                          <app-advisory-impact-state-badge [state]="deployment.state" />
+                        </td>
+                        <td class="px-3 py-2">{{ deployment.applicationVersionName }}</td>
+                        <td class="px-3 py-2">{{ deployment.currentApplicationVersionName }}</td>
+                        <td class="px-3 py-2">{{ deployment.lastDeployedAt | date: 'medium' }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+
+            @if (impact.pulls.length > 0) {
+              <h3 class="mb-2 text-sm font-semibold text-gray-900 dark:text-white">
+                {{ auth.isCustomer() ? 'Your Downloads' : 'Artifact Downloads' }}
+              </h3>
+              <div class="overflow-x-auto">
+                <table class="distr-table">
+                  <thead class="distr-table-head">
+                    <tr>
+                      @if (!auth.isCustomer()) {
+                        <th scope="col" class="p-3">Customer</th>
+                      }
+                      <th scope="col" class="p-3">Artifact</th>
+                      <th scope="col" class="p-3">Version</th>
+                      <th scope="col" class="p-3">Pulls</th>
+                      <th scope="col" class="p-3">Last Pulled At</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    @for (pull of impact.pulls; track pull.artifactVersionId + (pull.customerOrganizationId ?? '')) {
+                      <tr class="border-t border-gray-200 dark:border-gray-600">
+                        @if (!auth.isCustomer()) {
+                          <td class="px-3 py-2">{{ pull.customerOrganizationName || 'Internal' }}</td>
+                        }
+                        <td class="px-3 py-2">{{ pull.artifactName }}</td>
+                        <td class="px-3 py-2 font-mono text-xs">{{ pull.artifactVersionName }}</td>
+                        <td class="px-3 py-2">{{ pull.pullCount }}</td>
+                        <td class="px-3 py-2">{{ pull.lastPulledAt | date: 'medium' }}</td>
+                      </tr>
+                    }
+                  </tbody>
+                </table>
+              </div>
+            }
+
+            @if (impact.deployments.length === 0 && impact.pulls.length === 0) {
+              <p class="text-sm text-gray-500 dark:text-gray-400">
+                @if (auth.isCustomer()) {
+                  Distr has no record of you deploying or downloading an affected version.
+                } @else {
+                  No customer has deployed or downloaded an affected version.
+                }
+              </p>
+            }
+          } @else if (impactFailed()) {
+            <p class="text-sm text-red-600 dark:text-red-400">
+              The impact analysis could not be loaded. Please try again.
+            </p>
+          } @else {
+            <p class="text-sm text-gray-500 dark:text-gray-400">Loading impact analysis...</p>
+          }
+        </div>
+
+        @if (auth.isVendor()) {
+          <app-activity-timeline
+            [entries]="timelineEntries()"
+            [emptyText]="
+              advisory.publishedAt ? 'No activity yet.' : 'The timeline starts once this advisory is published.'
+            "
+            placeholder="Add a note to the timeline"
+            [canComment]="canEdit"
+            [submitting]="submittingComment()"
+            (commentSubmitted)="submitComment($event)" />
+        }
+      </div>
+
+      <div class="space-y-6">
+        <div class="distr-panel">
+          <h2 class="mb-3 text-lg font-semibold text-gray-900 dark:text-white">Versions</h2>
+
+          <h3 class="mb-2 text-xs font-semibold text-gray-500 uppercase dark:text-gray-400">Affected</h3>
+          @if (affectedApplicationVersions().length > 0 || affectedArtifactVersions().length > 0) {
+            <ul class="mb-4 space-y-2 text-sm text-gray-900 dark:text-white">
+              @for (version of affectedApplicationVersions(); track version.applicationVersion.id) {
+                <ng-container *ngTemplateOutlet="applicationVersionItem; context: {$implicit: version}" />
+              }
+              @for (version of affectedArtifactVersions(); track version.artifactVersionId) {
+                <ng-container *ngTemplateOutlet="artifactVersionItem; context: {$implicit: version}" />
+              }
+            </ul>
+          } @else {
+            <p class="mb-4 text-sm text-gray-500 dark:text-gray-400">No affected versions recorded.</p>
+          }
+
+          <h3 class="mb-2 text-xs font-semibold text-gray-500 uppercase dark:text-gray-400">Patched In</h3>
+          @if (hasPatchedVersions()) {
+            <ul class="space-y-2 text-sm text-gray-900 dark:text-white">
+              @for (version of patchedApplicationVersions(); track version.applicationVersion.id) {
+                <ng-container *ngTemplateOutlet="applicationVersionItem; context: {$implicit: version}" />
+              }
+              @for (version of patchedArtifactVersions(); track version.artifactVersionId) {
+                <ng-container *ngTemplateOutlet="artifactVersionItem; context: {$implicit: version}" />
+              }
+            </ul>
+          } @else {
+            <p class="text-sm text-gray-500 dark:text-gray-400">No patched version released yet.</p>
+          }
+        </div>
+
+        <div class="distr-panel">
+          <h2 class="mb-3 text-lg font-semibold text-gray-900 dark:text-white">References</h2>
+
+          <h3 class="mb-2 text-xs font-semibold text-gray-500 uppercase dark:text-gray-400">CVE ID</h3>
+          @if (advisory.cveId) {
+            <p class="mb-4 font-mono text-sm text-gray-900 dark:text-white">{{ advisory.cveId }}</p>
+          } @else {
+            <p class="mb-4 text-sm text-gray-500 dark:text-gray-400">No CVE ID assigned.</p>
+          }
+
+          <h3 class="mb-2 text-xs font-semibold text-gray-500 uppercase dark:text-gray-400">Links</h3>
+          @if (advisory.references.length > 0) {
+            <ul class="space-y-2">
+              @for (reference of advisory.references; track reference.url) {
+                <li>
+                  <a
+                    [href]="reference.url"
+                    target="_blank"
+                    rel="noopener noreferrer"
+                    class="text-sm break-all text-primary-600 hover:underline dark:text-primary-500">
+                    {{ reference.label || reference.url }}
+                    <fa-icon [icon]="faUpRightFromSquare" class="text-xs" />
+                  </a>
+                </li>
+              }
+            </ul>
+          } @else {
+            <p class="text-sm text-gray-500 dark:text-gray-400">No links added.</p>
+          }
+        </div>
+      </div>
+    </div>
+  }
+</app-page>
+
+<ng-template #applicationVersionItem let-version>
+  <li>
+    <app-application-preview
+      [name]="version.applicationName"
+      [type]="version.applicationType"
+      [imageUrl]="version.applicationImageUrl"
+      [version]="version.applicationVersion.name" />
+  </li>
+</ng-template>
+
+<ng-template #artifactVersionItem let-version>
+  <li>
+    <app-artifact-preview
+      [name]="version.artifactName"
+      [imageUrl]="version.artifactImageUrl"
+      [digest]="version.artifactVersionDigest"
+      [tags]="version.artifactVersionTags" />
+  </li>
+</ng-template>
+
+<ng-template #editAdvisoryDialog>
+  @if (editDialogOpen()) {
+    @if (advisory(); as current) {
+      <app-advisory-form
+        animate.enter="animate-fly-in-top"
+        animate.leave="animate-fly-out-top"
+        [advisory]="current"
+        [draft]="editDraft()"
+        (draftChanged)="editDraft.set($event)"
+        (dismissed)="closeEditDialog()"
+        (cancelled)="cancelEditDialog()"
+        (saved)="onSaved($event)" />
+    }
+  }
+</ng-template>

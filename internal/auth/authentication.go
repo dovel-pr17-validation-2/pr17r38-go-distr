@@ -1,0 +1,167 @@
+package auth
+
+import (
+	"context"
+	"errors"
+	"net/http"
+
+	"github.com/distr-sh/distr/internal/authjwt"
+	accesstoken "github.com/distr-sh/distr/internal/authkey"
+	"github.com/distr-sh/distr/internal/authn"
+	"github.com/distr-sh/distr/internal/authn/authinfo"
+	"github.com/distr-sh/distr/internal/authn/authkey"
+	"github.com/distr-sh/distr/internal/authn/jwt"
+	authnSupportBundle "github.com/distr-sh/distr/internal/authn/supportbundle"
+	"github.com/distr-sh/distr/internal/authn/token"
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/requestlog"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/getsentry/sentry-go"
+	"go.uber.org/zap"
+)
+
+// Authentication supports Bearer (classic JWT) and AccessToken (PAT) headers and uses authinfo.DbAuthenticator
+// to verify the token against the database, thereby ensuring the user exists in the database.
+var Authentication = authn.New(
+	authn.Chain4(
+		token.NewExtractor(token.WithExtractorFuncs(token.FromHeader("Bearer"))),
+		jwt.Authenticator(authjwt.VerifyToken),
+		authinfo.UserJWTAuthenticator(),
+		authinfo.DbAuthenticator(),
+	),
+	authn.Chain4(
+		token.NewExtractor(token.WithExtractorFuncs(token.FromHeader("AccessToken"))),
+		authkey.Authenticator(),
+		authinfo.AuthKeyAuthenticator(),
+		authinfo.DbAuthenticator(),
+	),
+)
+
+// ControllerAuthentication supports only Bearer JWT tokens
+var ControllerAuthentication = authn.New(
+	authn.Chain3(
+		token.NewExtractor(token.WithExtractorFuncs(token.FromHeader("Bearer"))),
+		jwt.Authenticator(authjwt.VerifyToken),
+		authinfo.ControllerJWTAuthenticator(),
+		// for controllers, db check is done in the controller auth middleware, therefore no DbAuthenticator here
+	),
+)
+
+// AnonymousRegistryToken is the token the registry's token endpoint hands to a client without
+// credentials. A client sends it back as a Bearer token, which the registry treats as no credentials.
+const AnonymousRegistryToken = "anonymous"
+
+// ArtifactsAuthentication supports Basic auth login for OCI clients, where the password should be a PAT
+// or a controller JWT, and the Bearer token the registry's token endpoint hands out for either of them.
+// The given PAT is verified against the database, to make sure that the user still exists.
+var ArtifactsAuthentication = authn.New(
+	authn.Chain(
+		token.NewExtractor(token.WithExtractorFuncs(artifactsCredentialExtractors...)),
+		authn.Alternative[string, authinfo.AuthInfoWithOrganization](
+			// Authenticate UserAccount with PAT
+			authn.Chain4(
+				authkey.Authenticator(),
+				authinfo.AuthKeyAuthenticator(),
+				authinfo.DbAuthenticator(),
+				authinfo.DropUser(),
+			),
+			// Authenticate with controller JWT
+			authn.Chain3(
+				jwt.Authenticator(authjwt.VerifyToken),
+				authinfo.ControllerJWTAuthenticator(),
+				authinfo.ControllerDbAuthenticator(),
+			),
+		),
+	),
+)
+
+var (
+	registryBearer                = token.FromHeader("Bearer")
+	artifactsCredentialExtractors = []token.TokenExtractorFunc{token.FromBasicAuth(), fromRegistryBearer}
+)
+
+func fromRegistryBearer(r *http.Request) string {
+	if t := registryBearer(r); t != AnonymousRegistryToken {
+		return t
+	}
+	return ""
+}
+
+// ArtifactsCredential returns the credential ArtifactsAuthentication reads from a registry request, or
+// an empty string when it carries none.
+func ArtifactsCredential(r *http.Request) string {
+	for _, fn := range artifactsCredentialExtractors {
+		if t := fn(r); t != "" {
+			return t
+		}
+	}
+	return ""
+}
+
+// ArtifactsPrincipal returns the principal of a registry request, or false when the request carries
+// no credentials, which the registry allows so that public artifacts can be pulled anonymously.
+func ArtifactsPrincipal(ctx context.Context) (authinfo.AuthInfoWithOrganization, bool) {
+	if principal, err := ArtifactsAuthentication.Get(ctx); err != nil {
+		return nil, false
+	} else {
+		return principal, true
+	}
+}
+
+// SupportBundleAuthentication authenticates collect script requests using
+// a query-param token tied to a specific support bundle.
+var SupportBundleAuthentication = authn.New[*types.SupportBundle](
+	authnSupportBundle.Authenticator(),
+)
+
+func handleUnknownError(w http.ResponseWriter, r *http.Request, err error) {
+	if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+		internalctx.GetLogger(r.Context()).Error("error authenticating request", zap.Error(err))
+		sentry.GetHubFromContext(r.Context()).CaptureException(err)
+	}
+	http.Error(w, http.StatusText(http.StatusInternalServerError), http.StatusInternalServerError)
+}
+
+func recordAuthInfo(ctx context.Context, info authinfo.AuthInfo) {
+	requestlog.FromContext(ctx).Update(func(f *requestlog.Fields) {
+		if token, ok := info.Token().(accesstoken.Token); ok {
+			f.TokenID = new(token.ID())
+		}
+		f.OrganizationID = info.CurrentOrgID()
+		f.CustomerOrganizationID = info.CurrentCustomerOrgID()
+		f.PartnerOrganizationID = info.CurrentPartnerOrgID()
+		f.Lens = info.IsLens()
+		if deploymentTargetID := info.CurrentDeploymentTargetID(); deploymentTargetID != nil {
+			f.DeploymentTargetID = deploymentTargetID
+		} else {
+			f.UserID = new(info.CurrentUserID())
+			f.OrganizationScoped = new(info.OrganizationScoped())
+		}
+	})
+}
+
+func init() {
+	Authentication.SetUnknownErrorHandler(handleUnknownError)
+	ControllerAuthentication.SetUnknownErrorHandler(handleUnknownError)
+	ArtifactsAuthentication.SetUnknownErrorHandler(handleUnknownError)
+	SupportBundleAuthentication.SetUnknownErrorHandler(handleUnknownError)
+
+	Authentication.SetAuthenticatedHook(func(ctx context.Context, info authinfo.AuthInfoWithUserAndOrganization) {
+		recordAuthInfo(ctx, info)
+	})
+	ArtifactsAuthentication.SetAuthenticatedHook(func(ctx context.Context, info authinfo.AuthInfoWithOrganization) {
+		recordAuthInfo(ctx, info)
+	})
+	ControllerAuthentication.SetAuthenticatedHook(func(ctx context.Context, info authinfo.ControllerAuthInfo) {
+		requestlog.FromContext(ctx).Update(func(f *requestlog.Fields) {
+			f.OrganizationID = new(info.CurrentOrgID())
+			f.DeploymentTargetID = new(info.CurrentDeploymentTargetID())
+		})
+	})
+	SupportBundleAuthentication.SetAuthenticatedHook(func(ctx context.Context, bundle *types.SupportBundle) {
+		requestlog.FromContext(ctx).Update(func(f *requestlog.Fields) {
+			f.OrganizationID = &bundle.OrganizationID
+			f.CustomerOrganizationID = &bundle.CustomerOrganizationID
+		})
+	})
+}

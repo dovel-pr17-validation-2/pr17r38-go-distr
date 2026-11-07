@@ -1,0 +1,82 @@
+<section class="bg-gray-50 dark:bg-gray-900">
+  <div class="mx-auto flex flex-col items-center justify-center px-6 py-8 md:h-screen lg:py-0">
+    <app-portal-logo />
+    <div
+      class="w-full rounded-lg bg-white shadow-sm sm:max-w-md md:mt-0 xl:p-0 dark:border dark:border-gray-700 dark:bg-gray-800">
+      <div class="space-y-4 p-6 sm:p-8 md:space-y-6">
+        <h1 class="text-xl leading-tight font-bold tracking-tight text-gray-900 md:text-2xl dark:text-white">
+          Welcome
+          @if (form.value.name; as name) {
+            {{ name }}!
+          } @else {
+            {{ email }}!
+          }
+        </h1>
+        <form class="space-y-4 md:space-y-6" [formGroup]="form" (ngSubmit)="submit()">
+          <div>
+            <label for="name" class="distr-label mb-2">Full name (optional)</label>
+            <input
+              type="text"
+              formControlName="name"
+              autotrim
+              autocomplete="name"
+              id="name"
+              class="distr-input"
+              appPlaceholder="name" />
+          </div>
+          <div>
+            <label for="username" class="distr-label mb-2">Your email</label>
+            <input
+              readonly
+              [value]="email"
+              type="email"
+              id="username"
+              class="distr-input cursor-not-allowed text-gray-600 dark:text-gray-400" />
+          </div>
+          <div>
+            <label for="password" class="distr-label mb-2">Password</label>
+            <input
+              type="password"
+              formControlName="password"
+              id="password"
+              autotrim
+              autocomplete="new-password"
+              class="distr-input"
+              required="" />
+            @if (form.controls.password.touched && form.controls.password.errors) {
+              <span class="text-red-500">Password is required and must have at least 8 characters</span>
+            }
+          </div>
+          <div>
+            <label for="confirm-password" class="distr-label mb-2">Confirm password</label>
+            <input
+              type="password"
+              formControlName="passwordConfirm"
+              id="confirm-password"
+              autotrim
+              autocomplete="new-password"
+              class="distr-input"
+              required="" />
+            @if (form.controls.passwordConfirm.touched && form.errors?.['passwordMismatch']) {
+              <span class="text-red-500">Password mismatch</span>
+            }
+          </div>
+          @if (mfaRequired()) {
+            <div>
+              <app-mfa-code-input [control]="mfaCode" />
+            </div>
+          }
+          @if (errorMessage(); as errorMessage) {
+            <div class="text-sm text-red-500">{{ errorMessage }}</div>
+          }
+          <button
+            type="submit"
+            [disabled]="submitted()"
+            class="w-full rounded-lg bg-primary-600 px-5 py-2.5 text-center text-sm font-medium text-white hover:bg-primary-700 focus:ring-4 focus:ring-primary-300 focus:outline-none dark:bg-primary-600 dark:hover:bg-primary-700 dark:focus:ring-primary-800">
+            Get started
+          </button>
+        </form>
+      </div>
+    </div>
+  </div>
+</section>

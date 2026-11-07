@@ -1,0 +1,263 @@
+<app-page variant="narrow">
+  <div class="flex flex-col gap-6">
+    <div class="distr-panel">
+      <nav class="flex justify-between" aria-label="Breadcrumb">
+        <ol class="mb-3 inline-flex items-center sm:mb-0">
+          <li class="flex items-center">
+            <a
+              [routerLink]="['/', 'settings', 'access-tokens']"
+              class="inline-flex items-center text-sm font-medium text-gray-700 hover:text-blue-600 dark:text-gray-400 dark:hover:text-white">
+              <fa-icon class="mr-2" [icon]="faKey" />
+              Personal Access Tokens
+            </a>
+          </li>
+          @if (token()) {
+            <span class="mx-2 text-gray-400">/</span>
+            <li aria-current="page">
+              <div class="flex items-center">
+                <button
+                  cdkOverlayOrigin
+                  #dropdownTrigger="cdkOverlayOrigin"
+                  #dropdownTriggerButton
+                  (click)="toggleBreadcrumbDropdown()"
+                  class="inline-flex items-center rounded-lg px-3 py-2 text-center text-sm font-normal text-gray-700 hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 focus:outline-none dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white dark:focus:ring-gray-700">
+                  <span class="block max-w-64 overflow-hidden text-ellipsis whitespace-nowrap" [title]="name()">
+                    {{ name() }}
+                  </span>
+                  <fa-icon class="ml-2" [icon]="faChevronDown" />
+                </button>
+                <ng-template
+                  cdkConnectedOverlay
+                  [cdkConnectedOverlayHasBackdrop]="true"
+                  (backdropClick)="breadcrumbDropdown.set(false)"
+                  [cdkConnectedOverlayBackdropClass]="'transparent'"
+                  [cdkConnectedOverlayOrigin]="dropdownTrigger"
+                  [cdkConnectedOverlayMinWidth]="breadcrumbDropdownWidth() + 'px'"
+                  [cdkConnectedOverlayOpen]="breadcrumbDropdown()">
+                  <div
+                    animate.enter="animate-flip-in-top"
+                    animate.leave="animate-flip-out-top"
+                    class="distr-dropdown-panel w-full max-w-80">
+                    <ul>
+                      @for (sibling of siblings(); track sibling.id) {
+                        <li>
+                          <a
+                            class="distr-dropdown-item"
+                            [routerLink]="['/', 'settings', 'access-tokens', sibling.id]"
+                            [title]="sibling.name"
+                            (click)="breadcrumbDropdown.set(false)">
+                            <span class="truncate">{{ sibling.name }}</span>
+                          </a>
+                        </li>
+                      }
+                    </ul>
+                  </div>
+                </ng-template>
+              </div>
+            </li>
+          }
+        </ol>
+        @if (token()) {
+          <button type="button" (click)="deleteAccessToken()" class="distr-btn-danger px-3 py-2">
+            <fa-icon [icon]="faTrash" class="mr-2 h-4 w-4" />
+            Delete Token
+          </button>
+        }
+      </nav>
+
+      @if (token(); as token) {
+        <app-inline-edit
+          class="mt-4 block"
+          tag="h3"
+          size="lg"
+          [value]="token.label ?? ''"
+          [required]="false"
+          placeholder="Token label"
+          emptyLabel="No label"
+          textClass="block max-w-lg overflow-hidden text-ellipsis whitespace-nowrap text-2xl font-bold tracking-tight text-gray-900 dark:text-white"
+          [loading]="savingLabel()"
+          (save)="saveLabel($event)" />
+
+        <dl class="mt-4 grid grid-cols-3 gap-6 text-sm">
+          @if (!legacy()) {
+            <div>
+              <dt class="distr-label mb-2">Token prefix</dt>
+              <dd>
+                <code
+                  data-ph-mask-text="true"
+                  class="rounded border border-gray-300 bg-gray-100 px-1 py-0.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white">
+                  {{ token.keyId }}…
+                </code>
+              </dd>
+            </div>
+          }
+          <div>
+            <dt class="distr-label mb-2">Created</dt>
+            <dd class="text-gray-900 dark:text-white" [title]="token.createdAt | date: 'medium'">
+              {{ token.createdAt | date: 'shortDate' }}
+            </dd>
+          </div>
+          <div>
+            <dt class="distr-label mb-2">Role</dt>
+            <dd class="text-gray-900 dark:text-white">{{ roleLabel() }}</dd>
+          </div>
+        </dl>
+      } @else if (!loading()) {
+        <p class="mt-4 text-sm text-gray-500 dark:text-gray-400">
+          This token does not exist. It may have been deleted in the meantime.
+        </p>
+      }
+    </div>
+
+    @if (token()) {
+      <div class="distr-table-panel">
+        <div class="distr-toolbar p-4">
+          <h2 class="text-lg font-semibold text-gray-900 dark:text-white">Tokens</h2>
+          <div class="distr-toolbar-actions">
+            @if (canCreateSecret()) {
+              <button
+                type="button"
+                (click)="openSecretModal(secretModalTemplate)"
+                class="distr-btn-secondary flex w-full items-center justify-center px-4 py-2 text-sm font-medium md:w-auto">
+                <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+                Add token
+              </button>
+            }
+          </div>
+        </div>
+
+        @if (createdToken(); as created) {
+          <app-created-access-token
+            class="mx-4 mb-4 block"
+            [tokenKey]="created.key"
+            [dismissible]="true"
+            (dismissed)="createdToken.set(null)" />
+        }
+
+        @if (legacy()) {
+          <app-alert type="warning" class="mx-4 mb-4">
+            Please migrate this access token to the new, more secure format. Add a token, roll it out everywhere the
+            legacy one is in use, then delete the legacy one. It keeps working until you do.
+          </app-alert>
+        }
+
+        <div class="overflow-x-auto">
+          <table class="distr-table">
+            <thead class="distr-table-head">
+              <tr>
+                <th scope="col" class="p-4">Token</th>
+                @if (legacy()) {
+                  <th scope="col" class="p-4">Prefix</th>
+                }
+                <th scope="col" class="p-4">Created</th>
+                <th scope="col" class="p-4">Expires</th>
+                <th scope="col" class="p-4">Last used</th>
+                <th scope="col" class="p-4"></th>
+              </tr>
+            </thead>
+            <tbody>
+              @for (credential of credentials(); track credential.label) {
+                <tr class="distr-table-row">
+                  <td class="px-4 py-3">
+                    @if (credential.slot) {
+                      <span class="distr-badge distr-badge-neutral">{{ credential.label }}</span>
+                    } @else {
+                      <span class="distr-badge distr-badge-warning">
+                        <fa-icon [icon]="faTriangleExclamation" />
+                        {{ credential.label }}
+                      </span>
+                    }
+                  </td>
+                  @if (legacy()) {
+                    <td class="px-4 py-3">
+                      <code
+                        data-ph-mask-text="true"
+                        class="rounded border border-gray-300 bg-gray-100 px-1 py-0.5 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-700 dark:text-white">
+                        {{ credential.keyId }}…
+                      </code>
+                    </td>
+                  }
+                  <td class="px-4 py-3" [title]="credential.createdAt | date: 'medium'">
+                    {{ credential.createdAt | date: 'shortDate' }}
+                  </td>
+                  <td class="px-4 py-3">
+                    @if (credential.expiresAt; as expiresAt) {
+                      <span [title]="expiresAt | date: 'medium'">{{ expiresAt | date: 'shortDate' }}</span>
+                      @if (credential.expired) {
+                        <span class="distr-badge distr-badge-error ml-1">
+                          <fa-icon [icon]="faCircleExclamation" />
+                          Expired
+                        </span>
+                      }
+                    } @else {
+                      never
+                    }
+                  </td>
+                  <td class="px-4 py-3">
+                    @if (credential.lastUsedAt; as lastUsedAt) {
+                      {{ lastUsedAt | relativeDate }}
+                    } @else {
+                      never
+                    }
+                  </td>
+                  <td class="flex justify-end px-4 py-3">
+                    @if (canDeleteCredential()) {
+                      <button
+                        type="button"
+                        aria-label="Delete token"
+                        (click)="deleteCredential(credential)"
+                        class="distr-btn-danger px-3 py-2">
+                        <fa-icon [icon]="faTrash" class="h-4 w-4" />
+                      </button>
+                    }
+                  </td>
+                </tr>
+              }
+            </tbody>
+          </table>
+        </div>
+      </div>
+    }
+  </div>
+</app-page>
+
+<ng-template #secretModalTemplate>
+  <div
+    class="mt-12 max-h-full w-lg rounded-lg bg-white p-4 shadow-sm dark:bg-gray-900"
+    animate.enter="animate-fly-in-top"
+    animate.leave="animate-fly-out-top">
+    <div class="flex items-center justify-between rounded-t border-b border-gray-200 p-4 dark:border-gray-600">
+      <h2 class="text-xl font-semibold text-gray-900 dark:text-white">Add token</h2>
+      <button
+        type="button"
+        (click)="closeSecretModal()"
+        class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white">
+        <fa-icon [icon]="faXmark" />
+        <span class="sr-only">Close modal</span>
+      </button>
+    </div>
+
+    <form [formGroup]="secretForm" (ngSubmit)="createSecret()" class="space-y-4 p-4">
+      <p class="text-sm text-gray-500 dark:text-gray-400">
+        The new token authenticates alongside the existing one, so the one in use keeps working until you delete it.
+      </p>
+
+      <div>
+        <label for="secretExpiresAt" class="distr-label mb-2">Expires At</label>
+        <app-expires-at-picker formControlName="expiresAt" inputId="secretExpiresAt" />
+      </div>
+
+      <div class="flex justify-end gap-2">
+        <button type="button" (click)="closeSecretModal()" class="distr-btn-secondary px-4 py-2 text-sm font-medium">
+          Cancel
+        </button>
+        <button
+          type="submit"
+          [disabled]="secretFormLoading() || secretForm.invalid"
+          class="distr-btn-primary px-4 py-2 text-sm font-medium">
+          Add token
+        </button>
+      </div>
+    </form>
+  </div>
+</ng-template>

@@ -1,0 +1,46 @@
+import {OverlayModule} from '@angular/cdk/overlay';
+import {PercentPipe} from '@angular/common';
+import {Component, computed, input, signal} from '@angular/core';
+import {FaIconComponent} from '@fortawesome/angular-fontawesome';
+import {faExclamation, faHardDrive, faTriangleExclamation} from '@fortawesome/free-solid-svg-icons';
+import dayjs from 'dayjs';
+import {RelativeDatePipe} from '../../../util/dates';
+import {isStale} from '../../../util/model';
+import {BytesPipe} from '../../../util/units';
+import {StatusDotDirective} from '../../components/status-dot';
+import {DeploymentTargetLatestMetrics} from '../../types/deployment-target-metrics';
+
+// Controllers report metrics every 30 seconds, so one missed report must not mark them as outdated yet.
+const metricsStaleThreshold = dayjs.duration({minutes: 2});
+
+@Component({
+  selector: 'app-deployment-target-metrics',
+  templateUrl: './deployment-target-metrics.component.html',
+  imports: [OverlayModule, BytesPipe, PercentPipe, FaIconComponent, StatusDotDirective, RelativeDatePipe],
+  styleUrls: ['./deployment-target-metrics.component.scss'],
+})
+export class DeploymentTargetMetricsComponent {
+  public readonly metrics = input.required<DeploymentTargetLatestMetrics>();
+  protected readonly hovered = signal(false);
+  protected readonly anyDiskWarning = computed(() =>
+    this.metrics().diskMetrics?.some((disk) => disk.bytesUsed / disk.bytesTotal > 0.75)
+  );
+  protected readonly controllerUsage = computed(() => {
+    const {controllerCpuUsageMillis, controllerMemoryBytes} = this.metrics();
+    if (controllerCpuUsageMillis === undefined || controllerMemoryBytes === undefined) {
+      return undefined;
+    }
+    return {cpuUsageMillis: controllerCpuUsageMillis, memoryBytes: controllerMemoryBytes};
+  });
+  protected readonly outdated = computed(() => isStale(this.metrics(), metricsStaleThreshold));
+  protected readonly cpuUsageDegrees = computed(() => usageDegrees(this.metrics().cpuUsage));
+  protected readonly memoryUsageDegrees = computed(() => usageDegrees(this.metrics().memoryUsage));
+
+  protected readonly faHardDrive = faHardDrive;
+  protected readonly faExclamation = faExclamation;
+  protected readonly faTriangleExclamation = faTriangleExclamation;
+}
+
+function usageDegrees(value: number): string {
+  return (360 * value).toFixed() + 'deg';
+}

@@ -1,0 +1,207 @@
+package authjwt
+
+import (
+	"maps"
+	"sync"
+	"time"
+
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/mapping"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwt"
+)
+
+const (
+	defaultTokenExpiration = 24 * time.Hour
+)
+
+const (
+	UserNameKey          = "name"
+	UserEmailKey         = "email"
+	UserEmailVerifiedKey = "email_verified"
+	UserRoleKey          = "role"
+	UserImageURLKey      = "image_url"
+	OrgIdKey             = "org"
+	CustomerOrgIDKey     = "c_org"
+	PartnerOrgIDKey      = "p_org"
+	TokenScopeKey        = "scope"
+	SuperAdminKey        = "is_super_admin"
+
+	// CustomOIDCConfigurationIDKey marks a session as authenticated by an organization's own identity
+	// provider. Only its presence is ever evaluated; the configuration ID it carries is for support and
+	// for logging.
+	CustomOIDCConfigurationIDKey = "oidc"
+
+	// LensKey marks a session in the lens of a customer organization its user is not a member of. It is
+	// meant for the frontend only: authentication decides this against the database on every request.
+	LensKey = "lens"
+
+	audienceUserValue = "user"
+	// audienceControllerValue keeps the value from before the rename to controller, so a token issued before
+	// an upgrade still carries the audience of one issued after it.
+	audienceControllerValue = "agent"
+)
+
+// TokenScope identifies the purpose a special, unscoped user token was minted for, so that
+// endpoints which change account credentials only accept the token issued for them.
+type TokenScope string
+
+const (
+	TokenScopePasswordReset TokenScope = "password_reset"
+	TokenScopeInvite        TokenScope = "invite"
+)
+
+// signingKey is the symmetric key for generating/validating JWTs.
+// Here we use symmetric encryption for now. This has the downside that the token can not be validated by clients,
+// which should be OK for now.
+//
+// TODO: Maybe migrate to asymmetric encryption at some point.
+var signingKey = sync.OnceValues(func() (jwk.SymmetricKey, error) {
+	return jwk.Import[jwk.SymmetricKey](env.JWTSecret())
+})
+
+func VerifyToken(token string) (jwt.Token, error) {
+	key, err := signingKey()
+	if err != nil {
+		return nil, err
+	}
+	return jwt.ParseString(token, jwt.WithKey(jwa.HS256(), key))
+}
+
+func encode(claims map[string]any) (jwt.Token, string, error) {
+	key, err := signingKey()
+	if err != nil {
+		return nil, "", err
+	}
+	builder := jwt.NewBuilder()
+	for k, v := range claims {
+		builder = builder.Claim(k, v)
+	}
+	token, err := builder.Build()
+	if err != nil {
+		return nil, "", err
+	}
+	signed, err := jwt.Sign(token, jwt.WithKey(jwa.HS256(), key))
+	if err != nil {
+		return nil, "", err
+	}
+	return token, string(signed), nil
+}
+
+func GenerateDefaultToken(user types.UserAccount, org types.OrganizationWithUserRole) (jwt.Token, string, error) {
+	return generateUserToken(user, &org, defaultTokenExpiration, nil)
+}
+
+// GenerateCustomOIDCToken generates a login token for a sign-in through an organization's own identity
+// provider. Such a provider is controlled by the organization rather than by the account's owner and
+// authenticates every address its configuration allows, so the token is marked to confine the session to
+// that organization: it must not reach another organization the account happens to be a member of, and it
+// is not proof that the owner of the account is present.
+func GenerateCustomOIDCToken(
+	user types.UserAccount,
+	org types.OrganizationWithUserRole,
+	customOIDCConfigurationID uuid.UUID,
+) (jwt.Token, string, error) {
+	return generateUserToken(user, &org, defaultTokenExpiration, map[string]any{
+		CustomOIDCConfigurationIDKey: customOIDCConfigurationID.String(),
+	})
+}
+
+// GenerateContextToken generates the token that switches the session of current to another organization or
+// lens. isLens marks a session that operates in a customer organization its user is not a member of.
+// A session of a custom OIDC provider stays one, so that switching cannot lift the confinement
+// GenerateCustomOIDCToken describes.
+func GenerateContextToken(
+	current jwt.Token,
+	user types.UserAccount,
+	org types.OrganizationWithUserRole,
+	isLens bool,
+) (jwt.Token, string, error) {
+	extraClaims := map[string]any{}
+	if isLens {
+		extraClaims[LensKey] = true
+	}
+	if customOIDCConfigurationID, ok := current.Field(CustomOIDCConfigurationIDKey); ok {
+		extraClaims[CustomOIDCConfigurationIDKey] = customOIDCConfigurationID
+	}
+	return generateUserToken(user, &org, defaultTokenExpiration, extraClaims)
+}
+
+func GenerateResetToken(user types.UserAccount) (jwt.Token, string, error) {
+	return generateUserToken(user, nil, env.ResetTokenValidDuration(), map[string]any{
+		TokenScopeKey:        TokenScopePasswordReset,
+		UserEmailVerifiedKey: true,
+	})
+}
+
+func GenerateVerificationTokenValidFor(user types.UserAccount) (jwt.Token, string, error) {
+	return generateUserToken(user, nil, env.InviteTokenValidDuration(), map[string]any{UserEmailVerifiedKey: true})
+}
+
+// GenerateInviteToken generates a token for accepting an invitation. When emailVerified is true (the invite link
+// was delivered via email to the invitee's address) the resulting token carries a verified email claim, so the
+// invitee does not need to verify their email separately. When false (e.g. the invite URL was handed out manually
+// via the API response) the email_verified claim is left to the default, so the invitee still has to verify their
+// email after accepting the invitation when verification is required, but is treated as verified when it is not.
+func GenerateInviteToken(user types.UserAccount, emailVerified bool) (jwt.Token, string, error) {
+	extraClaims := map[string]any{TokenScopeKey: TokenScopeInvite}
+	if emailVerified {
+		extraClaims[UserEmailVerifiedKey] = true
+	}
+	return generateUserToken(user, nil, env.InviteTokenValidDuration(), extraClaims)
+}
+
+func generateUserToken(
+	user types.UserAccount,
+	org *types.OrganizationWithUserRole,
+	validFor time.Duration,
+	extraClaims map[string]any,
+) (jwt.Token, string, error) {
+	now := time.Now()
+	claims := map[string]any{
+		jwt.IssuedAtKey:      now,
+		jwt.NotBeforeKey:     now,
+		jwt.ExpirationKey:    now.Add(validFor),
+		jwt.SubjectKey:       user.ID.String(),
+		jwt.AudienceKey:      audienceUserValue,
+		UserNameKey:          user.Name,
+		UserEmailKey:         user.Email,
+		UserEmailVerifiedKey: !env.UserEmailVerificationRequired() || user.EmailVerifiedAt != nil,
+	}
+	if url := mapping.CreateImageURL(user.ImageID); url != nil {
+		claims[UserImageURLKey] = *url
+	}
+	if user.IsSuperAdmin {
+		claims[SuperAdminKey] = true
+	}
+	if org != nil {
+		claims[OrgIdKey] = org.ID.String()
+		if !user.IsSuperAdmin {
+			claims[UserRoleKey] = org.UserRole
+		}
+		if org.CustomerOrganizationID != nil {
+			claims[CustomerOrgIDKey] = org.CustomerOrganizationID.String()
+		}
+		if org.PartnerOrganizationID != nil {
+			claims[PartnerOrgIDKey] = org.PartnerOrganizationID.String()
+		}
+	}
+	maps.Copy(claims, extraClaims)
+	return encode(claims)
+}
+
+func GenerateControllerTokenValidFor(targetID, orgID uuid.UUID, validFor time.Duration) (jwt.Token, string, error) {
+	now := time.Now()
+	claims := map[string]any{
+		jwt.IssuedAtKey:   now,
+		jwt.NotBeforeKey:  now,
+		jwt.ExpirationKey: now.Add(validFor),
+		jwt.SubjectKey:    targetID.String(),
+		jwt.AudienceKey:   audienceControllerValue,
+		OrgIdKey:          orgID.String(),
+	}
+	return encode(claims)
+}

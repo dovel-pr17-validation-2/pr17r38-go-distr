@@ -1,0 +1,570 @@
+import {AsyncPipe} from '@angular/common';
+import {
+  AfterViewInit,
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  forwardRef,
+  inject,
+  Injector,
+  input,
+  OnDestroy,
+  OnInit,
+  signal,
+} from '@angular/core';
+import {toObservable} from '@angular/core/rxjs-interop';
+import {
+  ControlValueAccessor,
+  FormBuilder,
+  NG_VALUE_ACCESSOR,
+  NgControl,
+  ReactiveFormsModule,
+  TouchedChangeEvent,
+  Validators,
+} from '@angular/forms';
+import {RouterLink} from '@angular/router';
+import {ApplicationVersionResource, DeploymentRequest, DeploymentType, HelmOptions} from '@distr-sh/distr-sdk';
+import {
+  BehaviorSubject,
+  catchError,
+  combineLatest,
+  debounceTime,
+  distinctUntilChanged,
+  filter,
+  map,
+  NEVER,
+  of,
+  shareReplay,
+  startWith,
+  Subject,
+  switchMap,
+  takeUntil,
+} from 'rxjs';
+import {isArchived} from '../../../util/dates';
+import {toBase64} from '../../../util/encoding';
+import {DURATION_REGEX, HELM_RELEASE_NAME_MAX_LENGTH, HELM_RELEASE_NAME_REGEX} from '../../../util/validation';
+import {
+  allowsAutomaticUpdates,
+  applicationVersionComparator,
+  latestApplicationVersion,
+  sortApplicationVersions,
+} from '../../../util/versions';
+import {EditorComponent} from '../../components/editor.component';
+import {AutotrimDirective} from '../../directives/autotrim.directive';
+import {InnerMarkdownDirective} from '../../directives/inner-markdown.directive';
+import {ApplicationEntitlementsService} from '../../services/application-entitlements.service';
+import {ApplicationsService} from '../../services/applications.service';
+import {AuthService} from '../../services/auth.service';
+import {FeatureFlagService} from '../../services/feature-flag.service';
+
+export type DeploymentFormValue = Partial<{
+  deploymentId: string;
+  applicationId: string;
+  applicationVersionId: string;
+  applicationEntitlementId: string;
+  valuesYaml: string;
+  releaseName: string;
+  envFileData: string;
+  swarmMode: boolean;
+  forceRestart: boolean;
+  ignoreRevisionSkew: boolean;
+  automaticApplicationUpdatesEnabled: boolean;
+  helmOptions: Partial<HelmOptions>;
+}>;
+
+export function mapToDeploymentRequest(value: DeploymentFormValue, deploymentTargetId: string): DeploymentRequest {
+  return {
+    deploymentTargetId: deploymentTargetId,
+    applicationVersionId: value.applicationVersionId!,
+    applicationEntitlementId: value.applicationEntitlementId || undefined,
+    deploymentId: value.deploymentId || undefined,
+    releaseName: value.releaseName || undefined,
+    valuesYaml: value.valuesYaml ? toBase64(value.valuesYaml) : undefined,
+    dockerType: value.swarmMode ? 'swarm' : 'compose',
+    envFileData: value.envFileData ? toBase64(value.envFileData) : undefined,
+    forceRestart: value.forceRestart ?? false,
+    ignoreRevisionSkew: value.ignoreRevisionSkew ?? false,
+    // Absent while the control is disabled, which leaves the deployment's setting as it is.
+    automaticApplicationUpdatesEnabled: value.automaticApplicationUpdatesEnabled,
+    helmOptions: value.helmOptions as HelmOptions | undefined,
+  };
+}
+
+type DeploymentFormValueCallback = (v: DeploymentFormValue | undefined) => void;
+
+@Component({
+  selector: 'app-deployment-form',
+  imports: [ReactiveFormsModule, AsyncPipe, EditorComponent, AutotrimDirective, RouterLink, InnerMarkdownDirective],
+  providers: [
+    {
+      provide: NG_VALUE_ACCESSOR,
+      useExisting: forwardRef(() => DeploymentFormComponent),
+      multi: true,
+    },
+  ],
+  changeDetection: ChangeDetectionStrategy.Eager,
+  templateUrl: './deployment-form.component.html',
+})
+export class DeploymentFormComponent implements OnInit, AfterViewInit, OnDestroy, ControlValueAccessor {
+  disableApplicationSelect = input(false);
+  deploymentType = input<DeploymentType>('docker');
+  customerOrganizationId = input<string>();
+  deploymentTargetName = input<string>('default');
+
+  protected readonly secretsUrl = computed(() => {
+    const customerOrgId = this.customerOrganizationId();
+    return customerOrgId ? `/customers/${customerOrgId}/secrets` : '/secrets';
+  });
+
+  /**
+   * Links to /license-keys for customers or /licenses/$customerOrgId for vendors/partners.
+   * For internal deployments (no customerOrgId) licenses are not available.
+   */
+  protected readonly licenseKeysUrl = computed(() => {
+    if (this.auth.isCustomer()) return '/license-keys';
+    const customerOrgId = this.customerOrganizationId();
+    if (customerOrgId) return `/licenses/${customerOrgId}`;
+    return null;
+  });
+
+  protected readonly featureFlags = inject(FeatureFlagService);
+  protected readonly auth = inject(AuthService);
+  private readonly applications = inject(ApplicationsService);
+  private readonly applicationEntitlements = inject(ApplicationEntitlementsService);
+  private readonly fb = inject(FormBuilder).nonNullable;
+  private readonly injector = inject(Injector);
+
+  protected readonly deployForm = this.fb.group({
+    deploymentId: this.fb.control<string | undefined>(undefined),
+    applicationId: this.fb.control('', Validators.required),
+    applicationVersionId: this.fb.control('', Validators.required),
+    applicationEntitlementId: this.fb.control('', Validators.required),
+    releaseName: this.fb.control('', [
+      Validators.required,
+      Validators.maxLength(HELM_RELEASE_NAME_MAX_LENGTH),
+      Validators.pattern(HELM_RELEASE_NAME_REGEX),
+    ]),
+    valuesYaml: this.fb.control(''),
+    envFileData: this.fb.control(''),
+    swarmMode: this.fb.control(false),
+    forceRestart: this.fb.control(false),
+    ignoreRevisionSkew: this.fb.control(false),
+    automaticApplicationUpdatesEnabled: this.fb.control(false),
+    helmOptionsEnabled: this.fb.control(false),
+    helmOptions: this.fb.group({
+      timeout: this.fb.control('10m', [Validators.required, Validators.pattern(DURATION_REGEX)]),
+      waitStrategy: this.fb.control('watcher', [Validators.required]),
+      rollbackOnFailure: this.fb.control(true),
+      cleanupOnFailure: this.fb.control(true),
+      forceConflicts: this.fb.control(false),
+    }),
+  });
+  protected readonly composeFile = this.fb.control({disabled: true, value: ''});
+  protected readonly resources = signal<ApplicationVersionResource[]>([]);
+  protected readonly activeTab = signal('environment');
+
+  private readonly deploymentId$ = this.deployForm.controls.deploymentId.valueChanges.pipe(
+    startWith(this.deployForm.controls.deploymentId.value),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  private readonly applicationId$ = this.deployForm.controls.applicationId.valueChanges.pipe(
+    startWith(this.deployForm.controls.applicationId.value),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  private readonly applicationVersionId$ = this.deployForm.controls.applicationVersionId.valueChanges.pipe(
+    startWith(this.deployForm.controls.applicationVersionId.value),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  private readonly applicationEntitlementId$ = this.deployForm.controls.applicationEntitlementId.valueChanges.pipe(
+    startWith(this.deployForm.controls.applicationEntitlementId.value),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  private readonly deploymentType$ = toObservable(this.deploymentType);
+  private readonly customerOrganizationId$ = toObservable(this.customerOrganizationId);
+
+  protected readonly allApplicationEntitlements$ = this.featureFlags.isLicensingEnabled$.pipe(
+    switchMap((enabled) => (enabled ? this.applicationEntitlements.list() : of([])))
+  );
+
+  protected readonly applicationEntitlements$ = combineLatest([
+    this.applicationId$,
+    this.featureFlags.isLicensingEnabled$,
+    this.customerOrganizationId$,
+  ]).pipe(
+    switchMap(([applicationId, isLicensingEnabled, customerOrgId]) =>
+      isLicensingEnabled && applicationId && (this.auth.isCustomer() || customerOrgId)
+        ? this.applicationEntitlements
+            .list(applicationId)
+            .pipe(
+              map((entitlements) =>
+                this.auth.isVendor() || this.auth.isPartner()
+                  ? entitlements.filter((l) => l.customerOrganizationId === customerOrgId)
+                  : entitlements
+              )
+            )
+        : of([])
+    ),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  protected readonly licenseUpdateRequired$ = new BehaviorSubject<boolean>(false);
+
+  /**
+   * The license control is VISIBLE for users editing a customer managed deployment.
+   */
+  protected readonly licenseControlVisible$ = combineLatest([
+    this.allApplicationEntitlements$,
+    this.customerOrganizationId$,
+  ]).pipe(
+    map(([entitlements, customerOrgId]) => (this.auth.isCustomer() || !!customerOrgId) && entitlements.length > 0),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  /**
+   * The license control is ENABLED when deploying to a customer managed target and there is no deployment yet,
+   * or the deployment was created without an initial license, and license management was later activated.
+   * A vendor might be required to choose a license for a customer managed deployment target with no previous
+   * deployment but they may only choose a license owned by the same customer.
+   */
+  private readonly licenseControlEnabled$ = combineLatest([
+    this.licenseControlVisible$,
+    this.deploymentId$,
+    this.licenseUpdateRequired$,
+  ]).pipe(
+    map(([isVisible, deploymentId, licenseUpdateRequired]) => isVisible && (!deploymentId || licenseUpdateRequired)),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  protected readonly swarmModeVisible$ = toObservable(computed(() => this.deploymentType() === 'docker'));
+
+  protected readonly applications$ = combineLatest([
+    this.applications.list(),
+    this.deploymentType$,
+    this.customerOrganizationId$,
+    this.allApplicationEntitlements$,
+  ]).pipe(
+    map(([applications, applicationType, customerOrganizationId, entitlements]) =>
+      applications.filter(
+        (application) =>
+          application.type === applicationType &&
+          (!customerOrganizationId ||
+            entitlements.length === 0 ||
+            entitlements.some(
+              (license) =>
+                license.applicationId === application.id && license.customerOrganizationId === customerOrganizationId
+            ))
+      )
+    )
+  );
+
+  private selectedApplication$ = combineLatest([this.applicationId$, this.applications$]).pipe(
+    map(([applicationId, applications]) => applications.find((application) => application.id === applicationId)),
+    distinctUntilChanged((a, b) => a?.id === b?.id),
+    shareReplay(1)
+  );
+
+  private readonly selectedLicense$ = combineLatest([
+    this.applicationEntitlementId$,
+    this.applicationEntitlements$,
+  ]).pipe(map(([entitlementId, entitlements]) => entitlements.find((entitlement) => entitlement.id === entitlementId)));
+
+  protected availableApplicationVersions$ = combineLatest([
+    this.licenseControlVisible$,
+    this.selectedLicense$,
+    this.selectedApplication$,
+    this.applicationVersionId$,
+  ]).pipe(
+    map(([shouldShowLicense, license, application, selectedApplicationVersionId]) => {
+      let versions;
+
+      if (shouldShowLicense) {
+        // if the license has no version associations, assume that the application has all available versions
+        versions = license?.versions?.length ? license.versions : (application?.versions ?? []);
+      } else {
+        versions = application?.versions ?? [];
+      }
+
+      const filtered = versions.filter((av) => {
+        if (av.id === selectedApplicationVersionId) {
+          return true;
+        }
+        return !isArchived(av);
+      });
+      return sortApplicationVersions(application?.versioningStrategy, filtered, application?.versions ?? versions);
+    }),
+    shareReplay(1)
+  );
+
+  private readonly latestAvailableApplicationVersion$ = combineLatest([
+    this.selectedApplication$,
+    this.availableApplicationVersions$,
+  ]).pipe(
+    map(([application, versions]) =>
+      latestApplicationVersion(
+        applicationVersionComparator(application?.versioningStrategy, application?.versions ?? []),
+        versions
+      )
+    ),
+    shareReplay(1)
+  );
+
+  protected readonly automaticUpdatesVisible$ = combineLatest([
+    this.featureFlags.isAutoUpdatesEnabled$,
+    this.selectedApplication$,
+  ]).pipe(
+    map(([enabled, application]) => enabled && application !== undefined && allowsAutomaticUpdates(application)),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  // A deployment keeps the flag after the application stops allowing automatic updates, where the
+  // hidden toggle can no longer clear it. The deployment therefore counts as automatically updated
+  // only while the toggle is shown, so that a saved change does not move it to the latest version.
+  private readonly automaticUpdatesEnabled$ = combineLatest([
+    this.deployForm.controls.automaticApplicationUpdatesEnabled.valueChanges.pipe(
+      startWith(this.deployForm.controls.automaticApplicationUpdatesEnabled.value)
+    ),
+    this.automaticUpdatesVisible$,
+  ]).pipe(
+    map(([enabled, visible]) => enabled && visible),
+    distinctUntilChanged(),
+    shareReplay(1)
+  );
+
+  private readonly destroyed$ = new Subject<void>();
+
+  private onChange?: DeploymentFormValueCallback;
+  private onTouched?: DeploymentFormValueCallback;
+
+  ngOnInit(): void {
+    combineLatest([this.deployForm.valueChanges, this.deployForm.statusChanges])
+      .pipe(takeUntil(this.destroyed$))
+      .subscribe(([value, status]) => {
+        // value omits disabled controls, so add back the ones a caller still needs.
+        const raw = this.deployForm.getRawValue();
+        const callbackArg =
+          status === 'VALID'
+            ? {...value, applicationId: raw.applicationId, applicationVersionId: raw.applicationVersionId}
+            : undefined;
+        this.onChange?.(callbackArg);
+        this.onTouched?.(callbackArg);
+      });
+
+    this.licenseControlEnabled$.pipe(takeUntil(this.destroyed$)).subscribe((licenseControlEnabled) => {
+      if (licenseControlEnabled) {
+        this.deployForm.controls.applicationEntitlementId.enable();
+      } else {
+        this.deployForm.controls.applicationEntitlementId.disable();
+      }
+    });
+
+    this.deploymentType$.pipe(takeUntil(this.destroyed$)).subscribe((type) => {
+      if (type) {
+        if (type === 'kubernetes') {
+          this.deployForm.controls.releaseName.enable();
+          this.deployForm.controls.valuesYaml.enable();
+          this.deployForm.controls.helmOptionsEnabled.enable();
+          this.deployForm.controls.envFileData.disable();
+
+          const targetName = this.deploymentTargetName();
+          if (!this.deployForm.value.releaseName && targetName) {
+            this.deployForm.patchValue({
+              releaseName: targetName.trim().toLowerCase().replaceAll(/\W+/g, '-'),
+            });
+          }
+        } else {
+          this.deployForm.controls.envFileData.enable();
+          this.deployForm.controls.releaseName.disable();
+          this.deployForm.controls.valuesYaml.disable();
+          this.deployForm.controls.helmOptionsEnabled.disable();
+        }
+      }
+    });
+
+    combineLatest([this.deploymentId$, this.deploymentType$]).subscribe(([deploymentId, deploymentType]) => {
+      if (deploymentType === 'kubernetes' && deploymentId) {
+        this.deployForm.controls.ignoreRevisionSkew.enable();
+      } else {
+        this.deployForm.controls.ignoreRevisionSkew.disable();
+      }
+    });
+
+    this.deploymentId$.pipe(takeUntil(this.destroyed$)).subscribe((id) => {
+      if (id) {
+        this.deployForm.controls.applicationId.disable();
+        this.deployForm.controls.swarmMode.disable();
+        this.deployForm.controls.forceRestart.enable();
+      } else {
+        if (!this.disableApplicationSelect()) {
+          this.deployForm.controls.applicationId.enable();
+        }
+        this.deployForm.controls.swarmMode.enable();
+        this.deployForm.controls.forceRestart.disable();
+      }
+    });
+
+    combineLatest([this.applicationId$, this.applicationVersionId$, this.deploymentId$, this.deploymentType$])
+      .pipe(
+        debounceTime(5),
+        switchMap(([applicationId, versionId, deploymentId, type]) =>
+          versionId && applicationId && !deploymentId
+            ? this.applications.getTemplateFile(applicationId, versionId).pipe(
+                catchError(() => NEVER),
+                map((templateFile) => ({templateFile, type}))
+              )
+            : NEVER
+        ),
+        takeUntil(this.destroyed$)
+      )
+      .subscribe(({templateFile, type}) => {
+        if (type === 'kubernetes') {
+          this.deployForm.controls.valuesYaml.patchValue(templateFile ?? '');
+        } else {
+          this.deployForm.controls.envFileData.patchValue(templateFile ?? '');
+        }
+      });
+
+    combineLatest([this.applicationId$, this.applicationVersionId$, this.deploymentType$])
+      .pipe(
+        debounceTime(5),
+        switchMap(([applicationId, versionId, type]) =>
+          versionId && applicationId && type === 'docker'
+            ? this.applications.getComposeFile(applicationId, versionId).pipe(catchError(() => NEVER))
+            : NEVER
+        ),
+        takeUntil(this.destroyed$)
+      )
+      .subscribe((composeFile) => {
+        this.composeFile.patchValue(composeFile ?? '');
+      });
+
+    combineLatest([this.applicationId$, this.applicationVersionId$])
+      .pipe(
+        debounceTime(5),
+        switchMap(([applicationId, versionId]) =>
+          versionId && applicationId
+            ? this.applications.getResources(applicationId, versionId).pipe(catchError(() => of([])))
+            : of([])
+        ),
+        takeUntil(this.destroyed$)
+      )
+      .subscribe((resources) => {
+        this.resources.set(resources);
+        this.activeTab.set(this.deploymentType() === 'docker' ? 'environment' : 'values');
+      });
+
+    this.applicationEntitlements$.pipe(takeUntil(this.destroyed$)).subscribe((entitlements) => {
+      // Only update the form control, if the previously selected license is no longer in the list
+      if (
+        entitlements.length > 0 &&
+        entitlements[0].id &&
+        entitlements.every((l) => l.id !== this.deployForm.controls.applicationEntitlementId.value)
+      ) {
+        this.licenseUpdateRequired$.next(true);
+        this.deployForm.controls.applicationEntitlementId.setValue(entitlements[0].id);
+      }
+    });
+
+    combineLatest([
+      this.availableApplicationVersions$,
+      this.latestAvailableApplicationVersion$,
+      this.automaticUpdatesEnabled$,
+    ])
+      .pipe(takeUntil(this.destroyed$))
+      .subscribe(([versions, latest, automaticUpdates]) => {
+        if (versions.length === 0) {
+          this.deployForm.controls.applicationVersionId.setValue('');
+          this.deployForm.controls.applicationVersionId.disable();
+          return;
+        }
+        if (automaticUpdates) {
+          // An automatically updated deployment always runs the latest version, so the version is
+          // chosen here rather than left to be superseded by the first update.
+          this.deployForm.controls.applicationVersionId.disable();
+          if (latest?.id) {
+            this.deployForm.controls.applicationVersionId.setValue(latest.id);
+          }
+          return;
+        }
+        this.deployForm.controls.applicationVersionId.enable();
+        // Only update the form control, if the previously selected version is no longer in the list
+        if (latest?.id && versions.every((v: {id?: string}) => v.id !== this.deployForm.value.applicationVersionId)) {
+          this.deployForm.controls.applicationVersionId.setValue(latest.id);
+        }
+      });
+
+    this.automaticUpdatesVisible$.pipe(takeUntil(this.destroyed$)).subscribe((visible) => {
+      if (visible) {
+        this.deployForm.controls.automaticApplicationUpdatesEnabled.enable();
+      } else {
+        this.deployForm.controls.automaticApplicationUpdatesEnabled.disable();
+      }
+    });
+
+    this.deployForm.controls.helmOptionsEnabled.valueChanges.pipe(takeUntil(this.destroyed$)).subscribe((enabled) => {
+      if (enabled) {
+        this.deployForm.controls.helmOptions.enable();
+      } else {
+        this.deployForm.controls.helmOptions.disable();
+      }
+    });
+
+    // This is needed because the first value could be missed otherwise
+    // TODO: Find a better solution for this
+    this.applicationEntitlementId$.pipe(takeUntil(this.destroyed$)).subscribe();
+
+    // Disable application selector if requested
+    if (this.disableApplicationSelect()) {
+      this.deployForm.controls.applicationId.disable();
+    }
+  }
+
+  ngAfterViewInit(): void {
+    // adapted from https://github.com/angular/angular/issues/45089
+    this.injector
+      .get(NgControl)
+      .control!.events.pipe(
+        takeUntil(this.destroyed$),
+        filter((event) => event instanceof TouchedChangeEvent && event.touched)
+      )
+      .subscribe(() => this.deployForm.markAllAsTouched());
+  }
+
+  ngOnDestroy(): void {
+    this.destroyed$.next();
+    this.destroyed$.complete();
+  }
+
+  registerOnChange(fn: DeploymentFormValueCallback): void {
+    this.onChange = fn;
+  }
+
+  registerOnTouched(fn: DeploymentFormValueCallback): void {
+    this.onTouched = fn;
+  }
+
+  setDisabledState(isDisabled: boolean): void {
+    if (isDisabled) {
+      console.warn('DeploymentFormComponent does not support setDisabledState');
+    }
+  }
+
+  writeValue(obj: DeploymentFormValue | null | undefined): void {
+    if (obj) {
+      this.deployForm.patchValue({...obj, helmOptionsEnabled: !!obj.helmOptions});
+    } else {
+      this.deployForm.reset();
+    }
+  }
+}

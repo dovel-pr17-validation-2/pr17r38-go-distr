@@ -1,0 +1,94 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+
+name: Build Docker Autoheal
+
+on:
+  push:
+    branches:
+      - 'main'
+    tags:
+      - '*'
+    paths:
+      - 'docker-autoheal/**'
+      - '.github/workflows/build-docker-autoheal.yaml'
+  pull_request:
+    paths:
+      - 'docker-autoheal/**'
+      - '.github/workflows/build-docker-autoheal.yaml'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref == 'refs/heads/main' && github.run_id || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+      packages: write
+    steps:
+      - name: Login to GitHub Container Registry (tag only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Login to Distr Registry (tag only)
+        if: ${{ startsWith(github.ref, 'refs/tags/') && !contains(github.ref_name, '-rc.') }}
+        uses: docker/login-action@81c6f93d4bc991e510b342a00b419b3bb4efc5c6 # v4.7.0
+        with:
+          registry: registry.distr.sh
+          username: ${{ github.actor }}
+          password: ${{ secrets.DISTR_CONTROLLER_REPOSITORY_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Generate Docker Metadata
+        id: meta
+        uses: docker/metadata-action@dc802804100637a589fabce1cb79ff13a1411302 # v6.2.0
+        with:
+          images: |
+            ghcr.io/distr-sh/distr/docker-autoheal
+            ${{ !contains(github.ref_name, '-rc.') && 'registry.distr.sh/distr/docker-autoheal' || '' }}
+          tags: |
+            type=ref,event=branch
+            type=semver,pattern={{version}}
+          flavor: |
+            latest=false
+          labels: |
+            org.opencontainers.image.description=Docker Autoheal
+            org.opencontainers.image.vendor=Glasskube
+
+      - name: Docker build (push on tag only)
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        id: build-push
+        with:
+          context: '{{defaultContext}}:docker-autoheal'
+          platforms: ${{ startsWith(github.ref, 'refs/tags/') && 'linux/amd64,linux/arm64' || 'linux/amd64' }}
+          push: ${{ startsWith(github.ref, 'refs/tags/') }}
+          sbom: true
+          provenance: mode=max
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - uses: sigstore/cosign-installer@756fe2d284c7292c4e9b62c8a28f1e5629c59532 # v4.1.3
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+
+      - name: Sign the images with GitHub OIDC Token
+        if: ${{ startsWith(github.ref, 'refs/tags/') }}
+        env:
+          DIGEST: ${{ steps.build-push.outputs.digest }}
+          TAGS: ${{ steps.meta.outputs.tags }}
+        run: |
+          images=""
+          for tag in ${TAGS}; do
+            images+="${tag}@${DIGEST} "
+          done
+          cosign sign --yes ${images}

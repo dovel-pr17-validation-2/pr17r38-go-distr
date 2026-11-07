@@ -1,0 +1,182 @@
+<div class="distr-table-panel">
+  <div class="distr-toolbar p-4">
+    <app-search-bar
+      [control]="filterForm.controls.search"
+      placeholder="Filter artifact entitlements"
+      [hotkey]="hotkey()" />
+    <div class="distr-toolbar-actions">
+      @if ((auth.isVendor() || auth.isPartner()) && auth.hasAnyRole('read_write', 'admin')) {
+        <button
+          (click)="openDrawer(manageEntitlementDrawer)"
+          type="button"
+          id="createArtifactEntitlementButton"
+          class="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none md:w-auto dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+          <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+          Create Artifact Entitlement
+        </button>
+      }
+    </div>
+  </div>
+  <div class="overflow-x-auto">
+    <table class="distr-table">
+      <thead class="distr-table-head">
+        <tr>
+          <th scope="col" class="p-4">Name</th>
+          @if (!customerOrganizationId()) {
+            <th scope="col" class="p-4">Customer</th>
+          }
+          <th scope="col" class="p-4">Artifact</th>
+          <th scope="col" class="p-4">Creation Date</th>
+          <th scope="col" class="p-4">Expires</th>
+          <th scope="col" class="p-4"></th>
+        </tr>
+      </thead>
+      <tbody>
+        @for (entitlement of entitlements$ | async; track entitlement.id) {
+          <tr
+            appClickableRow
+            [appClickableRowDisabled]="!canOpenDetails"
+            (rowActivate)="openDrawer(manageEntitlementDrawer, entitlement)"
+            class="distr-table-row">
+            <td class="distr-table-cell">
+              <div class="mr-3 flex items-center">
+                <span class="max-w-32 overflow-hidden text-ellipsis sm:max-w-64 lg:max-w-128">
+                  {{ entitlement.name }}
+                </span>
+              </div>
+            </td>
+            @if (!customerOrganizationId()) {
+              <td class="distr-table-cell">
+                <div class="mr-3 flex items-center">
+                  <span class="max-w-32 overflow-hidden text-ellipsis sm:max-w-64 lg:max-w-128">
+                    {{ getOwnerColumn(entitlement.customerOrganizationId) | async }}
+                  </span>
+                </div>
+              </td>
+            }
+            <td class="distr-table-cell">
+              <div class="mr-3 flex items-center">
+                <span class="max-w-32 overflow-hidden text-ellipsis sm:max-w-64 lg:max-w-128">
+                  {{ getArtifactColumn(entitlement.artifacts) | async }}
+                </span>
+              </div>
+            </td>
+            <td class="distr-table-cell">
+              <div class="flex items-center">
+                {{ entitlement.createdAt | date: 'short' }}
+              </div>
+            </td>
+            <td class="distr-table-cell">
+              @if (entitlement.expiresAt; as d) {
+                {{ d | date }}
+                @if (isExpired(entitlement)) {
+                  <span class="distr-badge distr-badge-error ml-1">
+                    <fa-icon [icon]="faCircleExclamation" />
+                    Expired
+                  </span>
+                }
+              } @else {
+                never
+              }
+            </td>
+            <td class="px-4 py-3 text-end">
+              @if (canOpenDetails && auth.hasAnyRole('read_write', 'admin')) {
+                <button
+                  type="button"
+                  aria-label="Delete"
+                  (click)="deleteEntitlement(entitlement)"
+                  class="distr-btn-danger px-3 py-2">
+                  <fa-icon [icon]="faTrash" class="h-4 w-4" />
+                </button>
+              }
+            </td>
+          </tr>
+        }
+      </tbody>
+    </table>
+  </div>
+</div>
+
+<ng-template #manageEntitlementDrawer>
+  <div
+    id="manage-artifact-entitlement-drawer"
+    class="h-screen w-160 overflow-y-auto bg-white p-4 dark:bg-gray-800"
+    animate.enter="animate-fly-in-right"
+    animate.leave="animate-fly-out-right"
+    tabindex="-1"
+    aria-labelledby="artifact-entitlement-drawer-label">
+    <div class="mb-6">
+      <div class="flex items-center gap-3 pe-10">
+        <h5
+          id="artifact-entitlement-drawer-label"
+          class="inline-flex items-center text-sm font-semibold text-gray-500 uppercase dark:text-gray-400">
+          Manage Artifact Entitlement
+        </h5>
+        @if (auth.hasAnyRole('admin', 'read_write')) {
+          <button
+            type="button"
+            class="distr-btn-secondary px-2 py-1 text-xs font-medium"
+            [disabled]="entitlementFormSwitchDisabled()"
+            [title]="entitlementFormSwitchTitle()"
+            (click)="switchEntitlementForm(otherEntitlementForm())">
+            Switch to {{ otherEntitlementForm() }} view
+          </button>
+        }
+      </div>
+      @if (drawerCustomerName(); as customerName) {
+        <p class="mt-1 text-sm text-gray-600 dark:text-gray-400">
+          Customer: <span class="font-medium text-gray-900 dark:text-white">{{ customerName }}</span>
+        </p>
+      }
+    </div>
+    <button
+      type="button"
+      (click)="hideDrawer()"
+      class="absolute top-2.5 right-2.5 inline-flex items-center rounded-lg bg-transparent p-1.5 text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white">
+      <fa-icon [icon]="faXmark" class="h-5 w-5" />
+      <span class="sr-only">Close menu</span>
+    </button>
+
+    @if (drawerLoading()) {
+      <div class="flex items-center justify-center py-12">
+        <app-spinner class="size-8" />
+      </div>
+    } @else {
+      @if ((entitlements$ | async)?.length === 0) {
+        <app-alert
+          type="warning"
+          heading="Creating your first entitlement will restrict what all your customers see."
+          class="mb-4">
+          After you created your first entitlement your customers will only see artifacts which they have a valid
+          entitlement for. Without any entitlement your customers will see all artifacts and tags.
+        </app-alert>
+      }
+      <form [formGroup]="editForm" (ngSubmit)="saveEntitlement()">
+        <div class="flex flex-col gap-4">
+          @switch (entitlementForm()) {
+            @case ('standard') {
+              <app-edit-single-artifact-entitlement
+                formControlName="entitlement"
+                (draftChange)="draft.set($event)"
+                (tagsMissingChange)="tagsMissing.set($event)" />
+            }
+            @case ('legacy') {
+              <app-edit-artifact-entitlement formControlName="entitlement" (draftChange)="draft.set($event)" />
+            }
+          }
+          @if (auth.hasAnyRole('admin', 'read_write')) {
+            <div class="flex w-full justify-center space-x-4 pb-4 sm:mt-0">
+              <button
+                type="submit"
+                [disabled]="editFormLoading"
+                class="distr-btn-primary inline-flex w-full items-center justify-center text-white">
+                <fa-icon [icon]="faPen" class="me-2" />
+                Save
+              </button>
+            </div>
+          }
+        </div>
+      </form>
+    }
+  </div>
+</ng-template>

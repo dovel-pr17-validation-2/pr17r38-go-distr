@@ -1,0 +1,163 @@
+<app-page>
+  <div class="distr-table-panel">
+    <div class="distr-toolbar p-4">
+      <app-search-bar [control]="filterForm.controls.search" placeholder="Filter tokens" />
+      <div class="distr-toolbar-actions">
+        <button
+          (click)="openDrawer(manageApplicationDrawer)"
+          type="button"
+          id="createTokenButton"
+          class="distr-btn-secondary flex w-full items-center justify-center px-4 py-2 text-sm font-medium md:w-auto">
+          <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+          Create token
+        </button>
+      </div>
+    </div>
+
+    <div class="overflow-x-auto">
+      <table class="distr-table">
+        <thead class="distr-table-head">
+          <tr>
+            <th scope="col" class="p-4">Label</th>
+            <th scope="col" class="p-4">Role</th>
+            <th scope="col" class="p-4">Creation Date</th>
+            <th scope="col" class="p-4">Expires</th>
+            <th scope="col" class="p-4">Last used</th>
+            <th scope="col" class="p-4">Tokens</th>
+            <th scope="col" class="p-4"></th>
+          </tr>
+        </thead>
+        <tbody>
+          @for (row of filteredRows(); track row.token.id) {
+            <tr [appClickableRow]="['/', 'settings', 'access-tokens', row.token.id]" class="distr-table-row">
+              <td class="distr-table-cell max-w-48 truncate xl:max-w-64 2xl:max-w-96" [title]="row.token.label">
+                {{ row.token.label }}
+              </td>
+              <td class="truncate px-4 py-3">
+                @if (row.token.userRole; as r) {
+                  {{ r | userRoleLabel }}
+                } @else {
+                  <span class="text-gray-400 italic">{{ currentUserRole() | userRoleLabel }}</span>
+                }
+              </td>
+              <td class="px-4 py-3" [title]="row.token.createdAt | date: 'medium'">
+                {{ row.token.createdAt | date: 'shortDate' }}
+              </td>
+              <td class="truncate px-4 py-3">
+                @for (credential of row.credentials; track $index) {
+                  @if (credential.expiresAt; as d) {
+                    <span [title]="d | date: 'medium'">{{ d | date: 'shortDate' }}</span>
+                    @if (credential.expired) {
+                      <span class="distr-badge distr-badge-error ml-1">
+                        <fa-icon [icon]="faCircleExclamation" />
+                        Expired
+                      </span>
+                    }
+                  } @else {
+                    never
+                  }
+                  @if (!$last) {
+                    <span>,&nbsp;</span>
+                  }
+                }
+              </td>
+              <td class="truncate px-4 py-3">
+                @if (row.token.lastUsedAt; as d) {
+                  {{ d | relativeDate }}
+                } @else {
+                  never
+                }
+              </td>
+              <td class="truncate px-4 py-3">
+                {{ row.credentials.length }}
+                @if (row.legacy) {
+                  <span class="distr-badge distr-badge-warning ml-1">
+                    <fa-icon [icon]="faTriangleExclamation" />
+                    Legacy
+                  </span>
+                }
+              </td>
+              <td class="px-4 py-3 text-end">
+                <button
+                  type="button"
+                  aria-label="Delete"
+                  (click)="deleteAccessToken(row)"
+                  class="distr-btn-danger px-3 py-2">
+                  <fa-icon [icon]="faTrash" class="h-4 w-4" />
+                </button>
+              </td>
+            </tr>
+          }
+        </tbody>
+      </table>
+    </div>
+  </div>
+</app-page>
+
+<ng-template #manageApplicationDrawer>
+  <div
+    animate.enter="animate-fly-in-right"
+    animate.leave="animate-fly-out-right"
+    id="manage-application-drawer"
+    class="h-screen w-80 overflow-y-auto bg-white p-4 dark:bg-gray-800"
+    tabindex="-1"
+    aria-labelledby="drawer-right-label">
+    <h5
+      id="drawer-label"
+      class="mb-6 inline-flex items-center text-sm font-semibold text-gray-500 uppercase dark:text-gray-400">
+      Create a Personal Access Token
+    </h5>
+    <button
+      type="button"
+      (click)="hideDrawer()"
+      class="absolute top-2.5 right-2.5 inline-flex items-center rounded-lg bg-transparent p-1.5 text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white">
+      <fa-icon [icon]="faXmark" class="h-5 w-5" />
+      <span class="sr-only">Close menu</span>
+    </button>
+    <form [formGroup]="editForm" (ngSubmit)="createAccessToken()">
+      <div class="space-y-4">
+        <div>
+          <label for="label" class="distr-label mb-2">Label</label>
+          <input
+            formControlName="label"
+            autotrim
+            type="text"
+            id="label"
+            class="distr-input"
+            placeholder="Label your PAT" />
+        </div>
+        <div>
+          <label for="expiresAt" class="distr-label mb-2">Expires At</label>
+          <app-expires-at-picker formControlName="expiresAt" inputId="expiresAt" />
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            Fixed when the token is created and cannot be changed afterwards. To keep it alive, add a second token on
+            its page that expires later.
+          </p>
+        </div>
+        <div>
+          <label for="userRole" class="distr-label mb-2">Role</label>
+          <app-user-role-select
+            id="userRole"
+            formControlName="userRole"
+            [maxRole]="currentUserRole()"
+            [emptyOptionLabel]="inheritOptionLabel()"
+            selectClass="distr-input" />
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            Leave as "Inherit" to use your current role ({{ currentUserRole() | userRoleLabel }}). The token's effective
+            permissions are always capped by your own role.
+          </p>
+        </div>
+
+        <div class="flex w-full justify-center space-x-4 pb-4 sm:mt-0">
+          <button
+            type="submit"
+            [disabled]="editFormLoading() || editForm.invalid"
+            class="distr-btn-primary inline-flex w-full items-center justify-center text-white">
+            <fa-icon [icon]="faPlus" class="me-2" />
+            Create
+          </button>
+        </div>
+      </div>
+    </form>
+  </div>
+</ng-template>

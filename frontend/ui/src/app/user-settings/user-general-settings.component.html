@@ -1,0 +1,100 @@
+<div class="space-y-10">
+  <form [formGroup]="generalForm" (ngSubmit)="saveGeneral()">
+    <div class="space-y-4">
+      <h2 class="text-xl font-bold dark:text-white">General</h2>
+
+      <div>
+        <div class="flex items-start gap-4">
+          <div class="relative shrink-0">
+            @if (generalForm.value.imageId) {
+              <img [src]="generalForm.value.imageId | secureImage | async" class="size-24 rounded-full" />
+            } @else {
+              <div
+                class="flex size-24 items-center justify-center rounded-full border text-gray-400 dark:border-gray-600">
+                <fa-icon [icon]="faUser" size="3x" />
+              </div>
+            }
+            <button
+              type="button"
+              class="distr-btn-secondary absolute right-0.5 bottom-0.5 inline-flex size-6 items-center justify-center rounded-full text-xs dark:text-white"
+              (click)="showProfilePictureDialog()">
+              <span class="sr-only">Edit profile picture</span>
+              <fa-icon [icon]="faPen" />
+            </button>
+          </div>
+
+          <div class="grow space-y-2">
+            <label for="name" class="distr-label">Name</label>
+            <input
+              formControlName="name"
+              autotrim
+              type="text"
+              name="name"
+              id="name"
+              class="distr-input"
+              placeholder="Name" />
+            <div class="text-sm text-gray-500">
+              This name and picture are used to address you in E-Mail communications and are shown to other users.
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="mt-8 flex w-full justify-center space-x-4">
+        <button
+          type="submit"
+          [disabled]="formLoading() || generalForm.invalid || generalForm.pristine"
+          class="distr-btn-primary inline-flex w-full items-center justify-center px-5 py-2.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60">
+          Save
+        </button>
+      </div>
+    </div>
+  </form>
+
+  <form [formGroup]="emailForm" (ngSubmit)="saveEmail()">
+    <div class="space-y-4">
+      <h2 class="text-xl font-bold dark:text-white">E-Mail Address</h2>
+
+      <div class="text-sm text-gray-500">
+        Your E-Mail address is used for notifications and transactional communications. Additionally, it is used as your
+        login handle.
+      </div>
+
+      <div class="space-y-2">
+        <div class="distr-label">Current E-Mail address</div>
+
+        <div
+          class="flex items-baseline gap-2 rounded-lg border border-gray-300 p-4 text-sm text-gray-900 dark:border-gray-600 dark:text-white">
+          {{ user()?.email }}
+          <span class="distr-badge distr-badge-success me-2">Verified</span>
+        </div>
+      </div>
+
+      @if (!customOidcSession) {
+        <div class="space-y-2">
+          <label for="email" class="distr-label"> New E-Mail Address </label>
+          <div class="flex gap-2">
+            <input
+              formControlName="email"
+              autotrim
+              type="email"
+              name="email"
+              id="email"
+              class="distr-input"
+              placeholder="E-Mail Address" />
+            <button
+              type="submit"
+              [disabled]="formLoading() || emailForm.invalid || emailForm.pristine"
+              class="distr-btn-secondary inline-flex w-full flex-0 items-center justify-center px-5 py-2.5 text-sm font-medium disabled:cursor-not-allowed disabled:opacity-60">
+              Verify
+            </button>
+          </div>
+          @if (emailForm.controls.email.errors?.['email'] && emailForm.controls.email.touched) {
+            <div class="text-sm text-red-500">Invalid E-Mail Address</div>
+          }
+          <div class="text-sm text-gray-500">Your e-mail address will be updated after successful verification.</div>
+        </div>
+      }
+    </div>
+  </form>
+</div>

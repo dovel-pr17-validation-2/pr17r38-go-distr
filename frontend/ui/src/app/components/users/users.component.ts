@@ -1,0 +1,303 @@
+import {AsyncPipe, DatePipe} from '@angular/common';
+import {Component, computed, DestroyRef, inject, input, output, signal, TemplateRef, viewChild} from '@angular/core';
+import {takeUntilDestroyed, toObservable, toSignal} from '@angular/core/rxjs-interop';
+import {FormBuilder, ReactiveFormsModule, Validators} from '@angular/forms';
+import {UserAccountWithRole, UserRole} from '@distr-sh/distr-sdk';
+import {FaIconComponent} from '@fortawesome/angular-fontawesome';
+import {
+  faBox,
+  faCheck,
+  faClipboard,
+  faPen,
+  faPlus,
+  faRepeat,
+  faTrash,
+  faUser,
+  faXmark,
+} from '@fortawesome/free-solid-svg-icons';
+import {catchError, filter, firstValueFrom, NEVER, switchMap, tap} from 'rxjs';
+import {getFormDisplayedError} from '../../../util/errors';
+import {filteredByFormControl} from '../../../util/filter';
+import {UserRoleLabelPipe} from '../../../util/user-role';
+import {AutotrimDirective} from '../../directives/autotrim.directive';
+import {PlaceholderDirective} from '../../directives/placeholder.directive';
+import {AuthService} from '../../services/auth.service';
+import {ImageUploadService} from '../../services/image-upload.service';
+import {OrganizationService} from '../../services/organization.service';
+import {DialogRef, OverlayService} from '../../services/overlay.service';
+import {ToastService} from '../../services/toast.service';
+import {isInviteMailNotSentError, UsersService} from '../../services/users.service';
+import {isProSubscription} from '../../types/subscription';
+import {AlertComponent} from '../alert/alert.component';
+import {AvatarComponent} from '../avatar.component';
+import {InlineEditComponent} from '../inline-edit.component';
+import {QuotaLimitComponent} from '../quota-limit.component';
+import {SearchBarComponent} from '../search-bar.component';
+import {UserRoleSelectComponent} from '../user-role-select.component';
+
+@Component({
+  selector: 'app-users',
+  imports: [
+    FaIconComponent,
+    AsyncPipe,
+    DatePipe,
+    ReactiveFormsModule,
+    AutotrimDirective,
+    PlaceholderDirective,
+    AvatarComponent,
+    QuotaLimitComponent,
+    UserRoleSelectComponent,
+    UserRoleLabelPipe,
+    InlineEditComponent,
+    SearchBarComponent,
+    AlertComponent,
+  ],
+  templateUrl: './users.component.html',
+})
+export class UsersComponent {
+  public readonly users = input.required<UserAccountWithRole[]>();
+  public readonly customerOrganizationId = input<string>();
+  public readonly partnerOrganizationId = input<string>();
+  public readonly refresh = output<void>();
+
+  private readonly toast = inject(ToastService);
+  private readonly usersService = inject(UsersService);
+  private readonly destroyRef = inject(DestroyRef);
+  private readonly organizationService = inject(OrganizationService);
+  private readonly overlay = inject(OverlayService);
+  private readonly imageUploadService = inject(ImageUploadService);
+  protected readonly auth = inject(AuthService);
+  private readonly fb = inject(FormBuilder).nonNullable;
+
+  protected readonly faBox = faBox;
+  protected readonly faCheck = faCheck;
+  protected readonly faClipboard = faClipboard;
+  protected readonly faPen = faPen;
+  protected readonly faPlus = faPlus;
+  protected readonly faRepeat = faRepeat;
+  protected readonly faTrash = faTrash;
+  protected readonly faUser = faUser;
+  protected readonly faXmark = faXmark;
+
+  protected readonly inviteHeading = computed(() =>
+    this.auth.isVendor() && this.customerOrganizationId() !== undefined
+      ? 'Customer has been invited to the organization'
+      : 'User has been invited to the organization'
+  );
+
+  protected readonly filterForm = this.fb.group({
+    search: this.fb.control(''),
+  });
+
+  protected readonly users$ = filteredByFormControl(
+    toObservable(this.users),
+    this.filterForm.controls.search,
+    (it: UserAccountWithRole, search: string) =>
+      !search ||
+      (it.name || '').toLowerCase().includes(search.toLowerCase()) ||
+      (it.email || '').toLowerCase().includes(search.toLowerCase())
+  );
+
+  private readonly inviteUserDialog = viewChild.required<TemplateRef<unknown>>('inviteUserDialog');
+  private modalRef?: DialogRef;
+  protected readonly inviteFormLoading = signal(false);
+  protected readonly inviteForm = this.fb.group({
+    email: this.fb.control('', [Validators.required, Validators.email]),
+    name: this.fb.control<string | undefined>(undefined),
+    userRole: this.fb.control<UserRole>('admin', Validators.required),
+  });
+  protected readonly inviteUrl = signal<string | null>(null);
+  protected readonly inviteMailNotSentUser = signal<UserAccountWithRole | null>(null);
+  protected readonly inviteMailNotSentLabel = computed(() => {
+    const user = this.inviteMailNotSentUser();
+    return user ? this.userLabel(user) : null;
+  });
+
+  protected readonly organization = toSignal(this.organizationService.get());
+
+  protected readonly limit = computed(() => {
+    const org = this.organization();
+    if (!org) {
+      return undefined;
+    }
+    return this.customerOrganizationId() !== undefined || this.auth.isCustomer()
+      ? org.subscriptionLimits.maxUsersPerCustomerOrganization
+      : org.subscriptionUserAccountQuantity;
+  });
+
+  protected readonly effectiveUsage = computed(() => {
+    const org = this.organization();
+    if (!org || this.customerOrganizationId() !== undefined || this.auth.isCustomer()) {
+      return this.users().length;
+    }
+    return org.currentBillableUserAccountCount;
+  });
+
+  protected readonly isProSubscription = computed(() => isProSubscription(this.organization()?.subscriptionType));
+
+  protected readonly editRoleUserId = signal<string | null>(null);
+  protected readonly editRoleFormLoading = signal(false);
+  protected readonly editRoleForm = this.fb.group({
+    userRole: this.fb.control<UserRole>('admin', Validators.required),
+  });
+
+  public showInviteDialog(): void {
+    this.closeInviteDialog();
+    this.modalRef = this.overlay.showModal(this.inviteUserDialog());
+  }
+
+  protected readonly savingUserId = signal<string | undefined>(undefined);
+
+  protected updateUserName(user: UserAccountWithRole, name: string): void {
+    this.savingUserId.set(user.id);
+    this.usersService
+      .patchUserAccount(user.id!, {name})
+      .pipe(takeUntilDestroyed(this.destroyRef))
+      .subscribe({
+        next: () => this.toast.success('User has been updated'),
+        error: (e) => {
+          const msg = getFormDisplayedError(e);
+          if (msg) {
+            this.toast.error(msg);
+          }
+        },
+      })
+      .add(() => this.savingUserId.set(undefined));
+  }
+
+  protected editUserRole(user: UserAccountWithRole): void {
+    if (!user.id) {
+      return;
+    }
+    this.editRoleFormLoading.set(false);
+    this.editRoleUserId.set(user.id);
+    this.editRoleForm.reset(user);
+  }
+
+  protected async submitEditUserRoleForm(): Promise<void> {
+    this.editRoleForm.markAllAsTouched();
+
+    const userId = this.editRoleUserId();
+    const userRole = this.editRoleForm.value.userRole;
+    if (!userId || !userRole) {
+      return;
+    }
+
+    if (this.editRoleForm.valid) {
+      this.editRoleFormLoading.set(true);
+      try {
+        await firstValueFrom(this.usersService.patchUserAccount(userId, {userRole}));
+        this.editRoleUserId.set(null);
+        this.editRoleForm.reset();
+        this.toast.success('User role has been updated');
+      } catch (e) {
+        const msg = getFormDisplayedError(e);
+        if (msg) {
+          this.toast.error(msg);
+        }
+      } finally {
+        this.editRoleFormLoading.set(false);
+      }
+    }
+  }
+
+  public async submitInviteForm(): Promise<void> {
+    this.inviteForm.markAllAsTouched();
+    if (this.inviteForm.valid) {
+      this.inviteFormLoading.set(true);
+      try {
+        const result = await firstValueFrom(
+          this.usersService.addUser({
+            email: this.inviteForm.value.email!,
+            name: this.inviteForm.value.name || undefined,
+            userRole: this.inviteForm.value.userRole ?? 'admin',
+            customerOrganizationId: this.customerOrganizationId(),
+            partnerOrganizationId: this.partnerOrganizationId(),
+          })
+        );
+        this.inviteUrl.set(result.inviteUrl ?? null);
+        if (!result.inviteUrl) {
+          this.toast.success(`${this.userLabel(result.user)} has been added to the organization`);
+          this.closeInviteDialog();
+        }
+        this.refresh.emit();
+      } catch (e) {
+        if (isInviteMailNotSentError(e)) {
+          this.inviteUrl.set(e.error.inviteUrl ?? null);
+          this.inviteMailNotSentUser.set(e.error.user);
+          this.refresh.emit();
+        } else {
+          const msg = getFormDisplayedError(e);
+          if (msg) {
+            this.toast.error(msg);
+          }
+        }
+      } finally {
+        this.inviteFormLoading.set(false);
+      }
+    }
+  }
+
+  private userLabel(user: UserAccountWithRole): string {
+    return user.customerOrganizationId !== undefined
+      ? 'Customer'
+      : user.partnerOrganizationId !== undefined
+        ? 'Partner'
+        : 'User';
+  }
+
+  public async uploadImage(data: UserAccountWithRole) {
+    const fileId = await firstValueFrom(
+      this.imageUploadService.showDialog({imageUrl: data.imageUrl, scope: 'platform'})
+    );
+    if (!fileId || data.imageUrl?.includes(fileId)) {
+      return;
+    }
+    await firstValueFrom(this.usersService.patchImage(data.id!, fileId));
+  }
+
+  protected async resendInvitation(user: UserAccountWithRole) {
+    try {
+      await firstValueFrom(this.usersService.resendInvitation(user));
+      this.toast.success(`Invitation has been resent to ${user.email}`);
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    }
+  }
+
+  public async deleteUser(user: UserAccountWithRole): Promise<void> {
+    this.overlay
+      .confirm(`This will remove ${user.name ?? user.email} from your organization. Are you sure?`)
+      .pipe(
+        filter((result) => result === true),
+        switchMap(() => this.usersService.delete(user)),
+        catchError((e) => {
+          const msg = getFormDisplayedError(e);
+          if (msg) {
+            this.toast.error(msg);
+          }
+          return NEVER;
+        }),
+        tap(() => this.refresh.emit())
+      )
+      .subscribe();
+  }
+
+  public closeInviteDialog(): void {
+    this.modalRef?.close();
+    this.inviteUrl.set(null);
+    this.inviteMailNotSentUser.set(null);
+    this.inviteForm.reset();
+  }
+
+  public copyInviteUrl(): void {
+    const inviteUrl = this.inviteUrl();
+    if (inviteUrl) {
+      navigator.clipboard.writeText(inviteUrl);
+      this.toast.success('Invite URL has been copied');
+    }
+  }
+}

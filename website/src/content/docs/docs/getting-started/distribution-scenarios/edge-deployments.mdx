@@ -1,0 +1,23 @@
+---
+title: Edge Deployments
+description: Deploy Distr controllers to IoT devices and specialized hardware, once installed, each edge device can be centrally managed and monitored via the vendor portal.
+slug: docs/use-cases/edge-deployments
+sidebar:
+  label: Edge Deployments
+  order: 5
+---
+
+import ThemedImage from '~/components/util/ThemedImage.astro';
+import edgeDeploymentsLight from '~/assets/docs/getting-started/distribution-scenarios/edge-deployments/edge-deployments-light.webp';
+import edgeDeploymentsDark from '~/assets/docs/getting-started/distribution-scenarios/edge-deployments/edge-deployments-dark.webp';
+
+Edge Deployments enable vendors to manage software on decentralized, often resource-constrained environments that operate outside traditional data centers.
+In this model, vendors maintain control of both the software and the deployment target, whether IoT devices, custom hardware, or edge infrastructure.
+The lightweight nature of the Distr controllers introduces little to no overhead to IoT devices on edge that often have limited resources.
+
+<ThemedImage
+  lightSrc={edgeDeploymentsLight}
+  darkSrc={edgeDeploymentsDark}
+  alt="Edge deployments architecture diagram: Distr manages Docker Controllers on devices across edge sites"
+  dropShadow={false}
+/>

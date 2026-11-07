@@ -1,0 +1,314 @@
+<div class="distr-toolbar p-4">
+  <app-search-bar [control]="filterForm.controls.search" placeholder="Filter alert configurations" />
+  <div class="distr-toolbar-actions">
+    @if (auth.hasAnyRole('read_write', 'admin')) {
+      <button
+        type="button"
+        (click)="showDrawer()"
+        class="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 md:w-auto dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+        <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+        Alert Notification
+      </button>
+    }
+  </div>
+</div>
+<div class="overflow-x-auto">
+  <table class="distr-table">
+    <thead class="distr-table-head">
+      <tr>
+        <th scope="col" class="p-4">Name</th>
+        <th scope="col" class="p-4">Enabled</th>
+        <th scope="col" class="p-4">Created at</th>
+        <th scope="col" class="p-4">Triggers</th>
+        <th scope="col" class="p-4">Deployment Targets</th>
+        <th scope="col" class="p-4">Users</th>
+        <th scope="col" class="p-4"></th>
+      </tr>
+    </thead>
+    <tbody>
+      @for (config of filteredConfigs(); track config.id) {
+        <tr
+          appClickableRow
+          [appClickableRowDisabled]="!canEdit"
+          (rowActivate)="showDrawer(config)"
+          class="distr-table-row">
+          <td class="distr-table-cell">{{ config.name }}</td>
+          <td class="distr-table-cell align-middle">
+            <label class="my-1 inline-flex cursor-pointer items-center">
+              <input
+                #enabledToggle
+                type="checkbox"
+                class="peer sr-only"
+                aria-label="Enabled"
+                [disabled]="!canEdit"
+                [checked]="config.enabled"
+                (click)="toggleConfigEnabled(config, enabledToggle, $event)" />
+              <div class="distr-toggle peer-disabled:cursor-not-allowed peer-disabled:opacity-50"></div>
+            </label>
+          </td>
+          <td class="distr-table-cell">
+            {{ config.createdAt | date }}
+          </td>
+          <td class="distr-table-cell">{{ getTriggersCount(config) }} enabled</td>
+          <td
+            class="distr-table-cell max-w-48 overflow-hidden text-ellipsis xl:max-w-58 2xl:max-w-96"
+            [title]="getNames(config.deploymentTargets)">
+            @for (dt of config.deploymentTargets; track dt.id; let last = $last) {
+              <ng-container>{{ dt.name }}</ng-container>
+              @if (!last) {
+                <ng-container>, </ng-container>
+              }
+            }
+          </td>
+          <td
+            class="distr-table-cell max-w-48 overflow-hidden text-ellipsis xl:max-w-58 2xl:max-w-96"
+            [title]="getNames(config.userAccounts)">
+            @for (user of config.userAccounts; track user.id; let last = $last) {
+              <ng-container>{{ user.name || user.email }}</ng-container>
+              @if (!last) {
+                <ng-container>, </ng-container>
+              }
+            }
+          </td>
+          <td class="px-4 py-3 text-end">
+            @if (canEdit) {
+              <button
+                type="button"
+                aria-label="Delete"
+                (click)="deleteConfig(config)"
+                class="distr-btn-danger px-3 py-2">
+                <fa-icon [icon]="faTrash" class="h-4 w-4" />
+              </button>
+            }
+          </td>
+        </tr>
+      } @empty {
+        <tr class="border-t border-gray-200 dark:border-gray-600">
+          <td colspan="7" class="px-4 py-3 text-center font-medium whitespace-nowrap text-gray-600 dark:text-gray-400">
+            No configurations found
+          </td>
+        </tr>
+      }
+    </tbody>
+  </table>
+</div>
+
+<ng-template #editConfigDrawer>
+  <div
+    class="h-screen w-lg overflow-y-auto bg-white p-4 dark:bg-gray-800"
+    tabindex="-1"
+    aria-labelledby="drawer-right-label"
+    animate.enter="animate-fly-in-right"
+    animate.leave="animate-fly-out-right">
+    <h2
+      id="drawer-label"
+      class="mb-2 inline-flex items-center text-sm font-semibold text-gray-500 uppercase dark:text-gray-400">
+      Alert Notification
+    </h2>
+    <p class="mb-6 text-sm text-gray-600 dark:text-gray-400">
+      Receive notifications when deployments change status or when resource usage exceeds configured thresholds.
+    </p>
+    <button
+      type="button"
+      (click)="hideDrawer()"
+      aria-controls="manage-deployment-target-drawer"
+      class="absolute top-2.5 right-2.5 inline-flex items-center rounded-lg bg-transparent p-1.5 text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white">
+      <fa-icon [icon]="faXmark" class="h-5 w-5" />
+      <span class="sr-only">Close menu</span>
+    </button>
+
+    @if (drawerLoading()) {
+      <div class="flex items-center justify-center py-12">
+        <app-spinner class="size-8" />
+      </div>
+    } @else {
+      <form [formGroup]="editConfigForm" (ngSubmit)="saveConfig()">
+        <div class="mb-4 space-y-4">
+          <div>
+            <label for="name" class="distr-label mb-2">Name</label>
+            <input
+              formControlName="name"
+              autotrim
+              type="text"
+              name="title"
+              id="name"
+              class="distr-input"
+              value=""
+              placeholder="Name" />
+          </div>
+
+          <label class="flex cursor-pointer items-center">
+            <input type="checkbox" class="peer sr-only" formControlName="enabled" />
+            <div class="distr-toggle"></div>
+            <span class="ms-3 text-sm font-medium text-gray-900 dark:text-gray-300">Enabled</span>
+          </label>
+
+          <div class="space-y-1">
+            <h3 class="text-sm font-medium text-gray-900 dark:text-white">Triggers</h3>
+            <div class="space-y-3 rounded-lg border border-gray-300 p-3 dark:border-gray-600">
+              <label class="inline-flex cursor-pointer items-center">
+                <input type="checkbox" class="peer sr-only" formControlName="statusTriggerEnabled" />
+                <div class="distr-toggle"></div>
+                <span class="ms-3 text-sm font-medium text-gray-900 dark:text-gray-300">Deployment status changes</span>
+              </label>
+
+              <div class="space-y-1">
+                <label class="flex cursor-pointer items-center">
+                  <input type="checkbox" class="peer sr-only" formControlName="cpuTriggerEnabled" />
+                  <div class="distr-toggle"></div>
+                  <span class="ms-3 text-sm font-medium text-gray-900 dark:text-gray-300">CPU usage threshold</span>
+                </label>
+                @if (editConfigForm.controls.cpuTriggerThresholdPercent.enabled) {
+                  <div class="flex pl-14">
+                    <input
+                      type="number"
+                      formControlName="cpuTriggerThresholdPercent"
+                      aria-label="CPU usage threshold value"
+                      min="1"
+                      max="100"
+                      placeholder="e.g. 80"
+                      class="distr-input w-20 min-w-0 rounded-none rounded-s-lg" />
+                    <span
+                      class="inline-flex items-center rounded-e-md border border-e-0 border-gray-300 bg-gray-200 px-3 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-600 dark:text-gray-400"
+                      >%
+                    </span>
+                  </div>
+                  @if (
+                    editConfigForm.controls.cpuTriggerThresholdPercent.touched &&
+                    editConfigForm.controls.cpuTriggerThresholdPercent.errors
+                  ) {
+                    <div class="pl-14 text-sm text-red-500">Enter a value between 1 and 100.</div>
+                  }
+                }
+              </div>
+
+              <div class="space-y-1">
+                <label class="flex cursor-pointer items-center">
+                  <input type="checkbox" class="peer sr-only" formControlName="memoryTriggerEnabled" />
+                  <div class="distr-toggle"></div>
+                  <span class="ms-3 text-sm font-medium text-gray-900 dark:text-gray-300">Memory usage threshold</span>
+                </label>
+                @if (editConfigForm.controls.memoryTriggerThresholdPercent.enabled) {
+                  <div class="flex pl-14">
+                    <input
+                      type="number"
+                      formControlName="memoryTriggerThresholdPercent"
+                      aria-label="Memory usage threshold value"
+                      min="1"
+                      max="100"
+                      placeholder="e.g. 80"
+                      class="distr-input w-20 min-w-0 rounded-none rounded-s-lg" />
+                    <span
+                      class="inline-flex items-center rounded-e-md border border-e-0 border-gray-300 bg-gray-200 px-3 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-600 dark:text-gray-400"
+                      >%
+                    </span>
+                  </div>
+                  @if (
+                    editConfigForm.controls.memoryTriggerThresholdPercent.touched &&
+                    editConfigForm.controls.memoryTriggerThresholdPercent.errors
+                  ) {
+                    <div class="pl-14 text-sm text-red-500">Enter a value between 1 and 100.</div>
+                  }
+                }
+              </div>
+
+              <div class="space-y-1">
+                <label class="flex cursor-pointer items-center">
+                  <input type="checkbox" class="peer sr-only" formControlName="diskTriggerEnabled" />
+                  <div class="distr-toggle"></div>
+                  <span class="ms-3 text-sm font-medium text-gray-900 dark:text-gray-300">Disk usage threshold</span>
+                </label>
+                @if (editConfigForm.controls.diskTriggerThresholdPercent.enabled) {
+                  <div class="flex pl-14">
+                    <input
+                      type="number"
+                      formControlName="diskTriggerThresholdPercent"
+                      aria-label="Disk usage threshold value"
+                      min="1"
+                      max="100"
+                      placeholder="e.g. 80"
+                      class="distr-input w-20 min-w-0 rounded-none rounded-s-lg" />
+                    <span
+                      class="inline-flex items-center rounded-e-md border border-e-0 border-gray-300 bg-gray-200 px-3 text-sm text-gray-900 dark:border-gray-600 dark:bg-gray-600 dark:text-gray-400"
+                      >%
+                    </span>
+                  </div>
+                  @if (
+                    editConfigForm.controls.diskTriggerThresholdPercent.touched &&
+                    editConfigForm.controls.diskTriggerThresholdPercent.errors
+                  ) {
+                    <div class="pl-14 text-sm text-red-500">Enter a value between 1 and 100.</div>
+                  }
+                }
+              </div>
+
+              @if (editConfigForm.errors?.['anyTrigger']) {
+                <div class="text-sm text-red-500">Enable at least one trigger.</div>
+              }
+            </div>
+          </div>
+
+          <div class="space-y-1">
+            <h3 class="text-sm font-medium text-gray-900 dark:text-white">Deployments</h3>
+            <div class="space-y-2 rounded-lg border border-gray-300 p-3 dark:border-gray-600">
+              @for (customersEntry of deploymentTargetCustomers(); track customersEntry.customer?.id) {
+                <div class="space-y-1">
+                  @if (customersEntry.customer; as customer) {
+                    <h4 class="text-sm font-semibold dark:text-white">{{ customer.name }}</h4>
+                  }
+                  @for (deploymentTarget of customersEntry.deploymentTargets; track deploymentTarget.id) {
+                    <label class="flex w-full items-center">
+                      <input
+                        type="checkbox"
+                        class="distr-checkbox"
+                        [formControl]="editConfigForm.controls.deploymentTargetIds.controls[deploymentTarget.id!]" />
+                      <span
+                        class="ms-2 overflow-hidden text-sm font-medium text-ellipsis text-gray-900 dark:text-gray-300"
+                        >{{ deploymentTarget.name }}</span
+                      >
+                    </label>
+                  }
+                </div>
+              }
+            </div>
+            @if (
+              editConfigForm.controls.deploymentTargetIds.touched && editConfigForm.controls.deploymentTargetIds.errors
+            ) {
+              <div class="text-sm text-red-500">Check at least one deployment.</div>
+            }
+          </div>
+
+          <div class="space-y-1">
+            <h3 class="text-sm font-medium text-gray-900 dark:text-white">Users to notify</h3>
+            <div class="space-y-1 rounded-lg border border-gray-300 p-3 dark:border-gray-600">
+              @for (user of users(); track user.id) {
+                <label class="flex w-full items-center" [title]="user.email">
+                  <input
+                    type="checkbox"
+                    class="distr-checkbox"
+                    [formControl]="editConfigForm.controls.userAccountIds.controls[user.id!]" />
+                  <span
+                    class="ms-2 overflow-hidden text-sm font-medium text-ellipsis text-gray-900 dark:text-gray-300"
+                    >{{ user.name || user.email }}</span
+                  >
+                </label>
+              }
+            </div>
+            @if (editConfigForm.controls.userAccountIds.touched && editConfigForm.controls.userAccountIds.errors) {
+              <div class="text-sm text-red-500">Check at least one user.</div>
+            }
+          </div>
+        </div>
+        <div class="mt-8 flex w-full justify-center space-x-4 pb-4 sm:mt-0">
+          <button
+            type="submit"
+            [disabled]="editFormLoading() || editConfigForm.invalid"
+            class="distr-btn-primary inline-flex w-full items-center justify-center text-white disabled:opacity-50">
+            <fa-icon [icon]="faPen" class="mr-2" />
+            Save
+          </button>
+        </div>
+      </form>
+    }
+  </div>
+</ng-template>

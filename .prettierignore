@@ -1,0 +1,9 @@
+*.json
+**/pnpm-lock.yaml
+**/dist/*
+CHANGELOG.md
+deploy/charts/*/templates/*
+deploy/charts/**/*.gotmpl
+internal/resources/*
+website/
+sdk/js/docs/

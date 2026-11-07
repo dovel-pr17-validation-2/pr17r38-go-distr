@@ -1,0 +1,13 @@
+/* You can add global styles to this file, and also import other style files */
+@use 'styles/tailwind.css';
+@use 'styles/theme.scss';
+@use 'styles/markdown.scss';
+@use 'styles/customer-home.scss';
+@use 'styles/animations.scss';
+
+@import '@fontsource/inter/latin-300.css';
+@import '@fontsource/inter/latin-400.css';
+@import '@fontsource/inter/latin-600.css';
+@import '@fontsource/inter/latin-700.css';
+@import '@fontsource/poppins/latin-600.css';
+@import '@angular/cdk/overlay-prebuilt.css';

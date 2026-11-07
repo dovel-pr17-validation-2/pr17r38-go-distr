@@ -1,0 +1,810 @@
+import {GlobalPositionStrategy, OverlayModule} from '@angular/cdk/overlay';
+import {TextFieldModule} from '@angular/cdk/text-field';
+import {DatePipe, NgOptimizedImage} from '@angular/common';
+import {
+  ChangeDetectionStrategy,
+  Component,
+  computed,
+  inject,
+  input,
+  resource,
+  signal,
+  TemplateRef,
+  viewChild,
+  WritableSignal,
+} from '@angular/core';
+import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
+import {FormControl, FormGroup, ReactiveFormsModule, Validators} from '@angular/forms';
+import {Router, RouterLink} from '@angular/router';
+import {
+  ApplicationVersion,
+  DeploymentRevisionResponse,
+  DeploymentTarget,
+  DeploymentTargetScope,
+  DeploymentType,
+  DeploymentWithLatestRevision,
+  UpdateDeploymentTargetRequest,
+} from '@distr-sh/distr-sdk';
+import {FaIconComponent} from '@fortawesome/angular-fontawesome';
+import {
+  faArrowUpRightFromSquare,
+  faBinoculars,
+  faClockRotateLeft,
+  faComment,
+  faEllipsisVertical,
+  faGauge,
+  faGear,
+  faLink,
+  faLinkSlash,
+  faPen,
+  faPlus,
+  faPowerOff,
+  faRotate,
+  faTrash,
+  faTriangleExclamation,
+  faXmark,
+} from '@fortawesome/free-solid-svg-icons';
+import dayjs from 'dayjs';
+import {EMPTY, filter, firstValueFrom, lastValueFrom, switchMap} from 'rxjs';
+import {SemVer} from 'semver';
+import {GITHUB_URL, WEBSITE_URL} from '../../../constants';
+import {controllerChangelog} from '../../../data';
+import {dateTimeLocalToISO, isoToDateTimeLocal} from '../../../util/dates';
+import {getFormDisplayedError} from '../../../util/errors';
+import {DOCKER_ENDPOINT_REGEX, RESOURCE_QUANTITY_REGEX} from '../../../util/validation';
+import {deploymentIdsAllowingAutomaticUpdates, latestDeploymentVersion} from '../../../util/versions';
+import {AlertComponent} from '../../components/alert/alert.component';
+import {ConnectInstructionsComponent} from '../../components/connect-instructions/connect-instructions.component';
+import {SpinnerComponent} from '../../components/spinner/spinner.component';
+import {UuidComponent} from '../../components/uuid';
+import {AutotrimDirective} from '../../directives/autotrim.directive';
+import {ApplicationEntitlementsService} from '../../services/application-entitlements.service';
+import {ApplicationsService} from '../../services/applications.service';
+import {AuthService} from '../../services/auth.service';
+import {ControllerVersionService} from '../../services/controller-version.service';
+import {DeploymentLogsService} from '../../services/deployment-logs.service';
+import {DeploymentTargetsService} from '../../services/deployment-targets.service';
+import {FeatureFlagService} from '../../services/feature-flag.service';
+import {DialogRef, OverlayService} from '../../services/overlay.service';
+import {ToastService} from '../../services/toast.service';
+import {DeploymentTargetLatestMetrics} from '../../types/deployment-target-metrics';
+import {DeploymentModalComponent} from '../deployment-modal.component';
+import {DeploymentRevisionDetailsComponent} from '../deployment-revisions/deployment-revision-details.component';
+import {DeploymentRevisionsTimelineComponent} from '../deployment-revisions/deployment-revisions-timeline.component';
+import {DeploymentAppNameComponent} from './deployment-app-name.component';
+import {DeploymentResourceMetricsComponent} from './deployment-resource-metrics.component';
+import {DeploymentStatusTextComponent} from './deployment-status-text.component';
+import {DeploymentTargetMetricsComponent} from './deployment-target-metrics.component';
+
+@Component({
+  selector: 'app-deployment-target-card',
+  templateUrl: './deployment-target-card.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  imports: [
+    NgOptimizedImage,
+    UuidComponent,
+    DatePipe,
+    FaIconComponent,
+    OverlayModule,
+    ConnectInstructionsComponent,
+    ReactiveFormsModule,
+    DeploymentModalComponent,
+    DeploymentTargetMetricsComponent,
+    DeploymentResourceMetricsComponent,
+    TextFieldModule,
+    DeploymentAppNameComponent,
+    DeploymentStatusTextComponent,
+    DeploymentRevisionsTimelineComponent,
+    DeploymentRevisionDetailsComponent,
+    AutotrimDirective,
+    RouterLink,
+    SpinnerComponent,
+    AlertComponent,
+  ],
+})
+export class DeploymentTargetCardComponent {
+  public readonly deploymentTarget = input.required<DeploymentTarget>();
+  public readonly deploymentTargetMetrics = input<DeploymentTargetLatestMetrics | undefined>(undefined);
+
+  protected readonly overlay = inject(OverlayService);
+  protected readonly auth = inject(AuthService);
+  private readonly router = inject(Router);
+  private readonly deploymentLogs = inject(DeploymentLogsService);
+  private readonly deploymentTargets = inject(DeploymentTargetsService);
+  private readonly toast = inject(ToastService);
+  private readonly controllerVersionsSvc = inject(ControllerVersionService);
+  private readonly applicationEntitlementsService = inject(ApplicationEntitlementsService);
+  private readonly applicationsService = inject(ApplicationsService);
+  private readonly featureFlags = inject(FeatureFlagService);
+  protected readonly isDeploymentLogsAfterEnabled = this.featureFlags.isDeploymentLogsAfterEnabled;
+  protected readonly isAutoUpdatesEnabled = this.featureFlags.isAutoUpdatesEnabled;
+
+  protected readonly customerManagedNotice = `
+    You are about to make changes to a customer-managed deployment.
+    Ensure this is done in coordination with the customer.`;
+
+  protected readonly deploymentModal = viewChild.required<TemplateRef<unknown>>('deploymentModal');
+  protected readonly instructionsModal = viewChild.required<TemplateRef<unknown>>('instructionsModal');
+  protected readonly deleteConfirmModal = viewChild.required<TemplateRef<unknown>>('deleteConfirmModal');
+  protected readonly manageDeploymentTargetDrawer =
+    viewChild.required<TemplateRef<unknown>>('manageDeploymentTargetDrawer');
+  protected readonly deploymentTargetNotesDrawer =
+    viewChild.required<TemplateRef<unknown>>('deploymentTargetNotesDrawer');
+  protected readonly revisionsDrawer = viewChild.required<TemplateRef<unknown>>('revisionsDrawer');
+  protected readonly revisionDetailsModal = viewChild.required<TemplateRef<unknown>>('revisionDetailsModal');
+  protected readonly resourceMetricsModal = viewChild.required<TemplateRef<unknown>>('resourceMetricsModal');
+  protected readonly deleteDeploymentProgressModal = viewChild.required<TemplateRef<unknown>>(
+    'deleteDeploymentProgressModal'
+  );
+  protected readonly updateControllerConfirmTemplate = viewChild.required<TemplateRef<unknown>>(
+    'updateControllerConfirmTemplate'
+  );
+
+  protected readonly faArrowUpRightFromSquare = faArrowUpRightFromSquare;
+  protected readonly faComment = faComment;
+  protected readonly faBinoculars = faBinoculars;
+  protected readonly faClockRotateLeft = faClockRotateLeft;
+  protected readonly faEllipsisVertical = faEllipsisVertical;
+  protected readonly faGauge = faGauge;
+  protected readonly faGear = faGear;
+  protected readonly faLink = faLink;
+  protected readonly faLinkSlash = faLinkSlash;
+  protected readonly faPen = faPen;
+  protected readonly faPlus = faPlus;
+  protected readonly faPowerOff = faPowerOff;
+  protected readonly faRotate = faRotate;
+  protected readonly faTrash = faTrash;
+  protected readonly faTriangleExclamation = faTriangleExclamation;
+  protected readonly faXmark = faXmark;
+
+  protected readonly githubUrl = GITHUB_URL;
+  protected readonly websiteUrl = WEBSITE_URL;
+
+  protected readonly selectedDeploymentTarget = signal<DeploymentTarget | undefined>(undefined);
+  protected readonly selectedDeployment = signal<DeploymentWithLatestRevision | undefined>(undefined);
+  protected readonly selectedRevision = signal<DeploymentRevisionResponse | undefined>(undefined);
+
+  protected readonly showDeploymentTargetDropdown = signal(false);
+  protected readonly showDeploymentDropdownForId = signal<string | undefined>(undefined);
+  protected readonly metricsOpened = signal(false);
+
+  protected readonly editForm = new FormGroup({
+    name: new FormControl('', Validators.required),
+    type: new FormControl<DeploymentType | undefined>({value: undefined, disabled: true}, Validators.required),
+    namespace: new FormControl<string | undefined>({value: undefined, disabled: true}),
+    scope: new FormControl<DeploymentTargetScope>({value: 'namespace', disabled: true}),
+    metricsEnabled: new FormControl<boolean>(true),
+    imageCleanupEnabled: new FormControl<boolean>(false, {nonNullable: true}),
+    deploymentLogsEnabled: new FormControl<boolean>(true, {nonNullable: true}),
+    deploymentLogsAfter: new FormControl<string | null>(null),
+    automaticUpdatesEnabled: new FormControl<boolean>(false, {nonNullable: true}),
+    customDockerEndpoint: new FormControl<boolean>(false, {nonNullable: true}),
+    dockerEndpoint: new FormControl<string>('', {
+      nonNullable: true,
+      validators: [Validators.required, Validators.pattern(DOCKER_ENDPOINT_REGEX)],
+    }),
+    customResources: new FormControl<boolean>(false, {nonNullable: true}),
+    resources: new FormGroup({
+      cpuRequest: new FormControl<string>('100m', {
+        nonNullable: true,
+        validators: [Validators.required, Validators.pattern(RESOURCE_QUANTITY_REGEX)],
+      }),
+      memoryRequest: new FormControl<string>('256Mi', {
+        nonNullable: true,
+        validators: [Validators.required, Validators.pattern(RESOURCE_QUANTITY_REGEX)],
+      }),
+      cpuLimit: new FormControl<string>('1', {
+        nonNullable: true,
+        validators: [Validators.required, Validators.pattern(RESOURCE_QUANTITY_REGEX)],
+      }),
+      memoryLimit: new FormControl<string>('256Mi', {
+        nonNullable: true,
+        validators: [Validators.required, Validators.pattern(RESOURCE_QUANTITY_REGEX)],
+      }),
+    }),
+  });
+  protected editFormLoading = false;
+
+  protected readonly notesForm = new FormGroup({
+    notes: new FormControl<string>(
+      {value: '', disabled: !this.auth.hasAnyRole('admin', 'read_write')},
+      {nonNullable: true}
+    ),
+  });
+  protected notesFormLoading = false;
+
+  private modal?: DialogRef;
+  private drawerRef?: DialogRef;
+  private revisionDetailsRef?: DialogRef;
+
+  protected readonly controllerVersions = resource({
+    loader: () => firstValueFrom(this.controllerVersionsSvc.list()),
+  });
+
+  protected readonly controllerUpdateFromVersion = signal<string | undefined>(undefined);
+  protected readonly controllerUpdateToVersion = signal<string | undefined>(undefined);
+  protected readonly controllerUpdateChangelogReleases = signal<typeof controllerChangelog.releases>([]);
+  protected readonly controllerUpdateAutomaticUpdatesEnabled = new FormControl<boolean>(false, {nonNullable: true});
+
+  protected readonly isUndeploySupported = this.isControllerVersionAtLeast('1.3.0');
+  protected readonly isMultiDeploymentSupported = this.isControllerVersionAtLeast('1.6.0');
+  protected readonly isLoggingSupported = this.isControllerVersionAtLeast('1.9.0');
+  protected readonly isForceRestartSupported = this.isControllerVersionAtLeast('1.12.0');
+
+  protected readonly controllerUpdateAvailable = computed(() => {
+    const controllerVersions = this.controllerVersions.value() ?? [];
+    return (
+      controllerVersions.length > 0 &&
+      this.deploymentTarget().controllerVersion?.id !== controllerVersions[controllerVersions.length - 1].id
+    );
+  });
+
+  private readonly entitlements = toSignal(
+    this.featureFlags.isLicensingEnabled$.pipe(
+      switchMap((enabled) => (enabled ? this.applicationEntitlementsService.list() : EMPTY))
+    ),
+    {initialValue: []}
+  );
+
+  private readonly applications = toSignal(this.applicationsService.list(), {initialValue: []});
+
+  /** The newest version each deployment is entitled to, which is the one it runs when it is current. */
+  private readonly latestVersionByDeploymentId = computed(() => {
+    const deploymentTarget = this.deploymentTarget();
+    const applications = this.applications();
+    const entitlements = this.entitlements();
+
+    const latestVersions = new Map<string, ApplicationVersion>();
+    for (const deployment of deploymentTarget.deployments) {
+      const maxVersion = latestDeploymentVersion(deployment, applications, entitlements);
+      if (deployment.id && maxVersion) {
+        latestVersions.set(deployment.id, maxVersion);
+      }
+    }
+    return latestVersions;
+  });
+
+  protected readonly deploymentIdsWithUpdate = computed(() => {
+    const latestVersions = this.latestVersionByDeploymentId();
+    return new Set(
+      this.deploymentTarget()
+        .deployments.filter((deployment) => {
+          const latestVersion = deployment.id ? latestVersions.get(deployment.id) : undefined;
+          return latestVersion !== undefined && latestVersion.id !== deployment.applicationVersionId;
+        })
+        .map((deployment) => deployment.id!)
+    );
+  });
+
+  protected readonly deploymentIdsAllowingAutomaticUpdates = computed(() =>
+    deploymentIdsAllowingAutomaticUpdates(this.deploymentTarget().deployments, this.applications())
+  );
+
+  protected async toggleAutomaticUpdates(deployment: DeploymentWithLatestRevision): Promise<void> {
+    const enabled = !deployment.automaticApplicationUpdatesEnabled;
+    if (enabled) {
+      // The dialog names the version the deployment moves to, which a list from an earlier point
+      // in the session may no longer have.
+      await this.applicationsService.refresh();
+    }
+    const confirmed = await firstValueFrom(
+      this.overlay.confirm(
+        enabled
+          ? {
+              message: {
+                message: `Enable automatic updates for ${deployment.application.name} on ${this.deploymentTarget().name}?`,
+                alert: {
+                  type: 'warning',
+                  message: this.enableAutomaticUpdatesMessage(deployment),
+                },
+              },
+              confirmLabel: 'Enable automatic updates',
+            }
+          : {
+              message: {
+                message: `Disable automatic updates for ${deployment.application.name} on ${this.deploymentTarget().name}?`,
+                alert: {
+                  type: 'info',
+                  message: 'The deployment stays on its current version until someone updates it.',
+                },
+              },
+              confirmLabel: 'Disable automatic updates',
+            }
+      )
+    );
+    if (!confirmed) {
+      return;
+    }
+    try {
+      await firstValueFrom(
+        this.deploymentTargets.patchDeployment(deployment.id!, {automaticApplicationUpdatesEnabled: enabled})
+      );
+      this.toast.success(enabled ? 'Automatic updates have been enabled' : 'Automatic updates have been disabled');
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    }
+  }
+
+  private enableAutomaticUpdatesMessage(deployment: DeploymentWithLatestRevision): string {
+    const everyFutureVersion = 'to every version released from now on, without anyone confirming it.';
+    const latestVersion = deployment.id ? this.latestVersionByDeploymentId().get(deployment.id) : undefined;
+    if (latestVersion === undefined) {
+      return `The deployment is updated to the latest version right away and ${everyFutureVersion}`;
+    }
+    if (latestVersion.id === deployment.applicationVersionId) {
+      return `The deployment stays on ${latestVersion.name} for now and is updated ${everyFutureVersion}`;
+    }
+    return (
+      `The deployment is updated from ${deployment.applicationVersionName} to ${latestVersion.name} ` +
+      `right away and ${everyFutureVersion}`
+    );
+  }
+
+  protected readonly controllerUpdatePending = computed(
+    () =>
+      this.deploymentTarget().reportedControllerVersionId !== undefined &&
+      this.deploymentTarget().controllerVersion?.id !== this.deploymentTarget().reportedControllerVersionId
+  );
+
+  constructor() {
+    this.editForm.controls.customResources.valueChanges.pipe(takeUntilDestroyed()).subscribe((value) => {
+      if (value) {
+        this.editForm.controls.resources.enable();
+      } else {
+        this.editForm.controls.resources.disable();
+      }
+    });
+    this.editForm.controls.customDockerEndpoint.valueChanges.pipe(takeUntilDestroyed()).subscribe((value) => {
+      if (value) {
+        this.editForm.controls.dockerEndpoint.enable();
+      } else {
+        this.editForm.controls.dockerEndpoint.disable();
+      }
+    });
+  }
+
+  protected async showDeploymentModal(deployment?: DeploymentWithLatestRevision) {
+    this.selectedDeploymentTarget.set(this.deploymentTarget());
+    this.selectedDeployment.set(deployment);
+    this.showModal(this.deploymentModal());
+  }
+
+  protected showResourceMetricsModal(deployment: DeploymentWithLatestRevision) {
+    this.selectedDeployment.set(deployment);
+    this.showModal(this.resourceMetricsModal());
+  }
+
+  protected async saveDeploymentTarget() {
+    this.editForm.markAllAsTouched();
+    if (this.editForm.valid) {
+      this.editFormLoading = true;
+      const val = this.editForm.value;
+      const request: UpdateDeploymentTargetRequest = {
+        name: val.name!,
+        metricsEnabled: val.metricsEnabled ?? false,
+        imageCleanupEnabled: this.editForm.controls.imageCleanupEnabled.value,
+        deploymentLogsEnabled: this.editForm.controls.deploymentLogsEnabled.value,
+        deploymentLogsAfter: dateTimeLocalToISO(this.editForm.controls.deploymentLogsAfter.value) ?? undefined,
+        automaticUpdatesEnabled: this.editForm.controls.automaticUpdatesEnabled.value,
+        resources: val.resources && {
+          cpuRequest: val.resources.cpuRequest!,
+          cpuLimit: val.resources.cpuLimit!,
+          memoryRequest: val.resources.memoryRequest!,
+          memoryLimit: val.resources.memoryLimit!,
+        },
+        dockerEndpoint: val.dockerEndpoint,
+      };
+
+      try {
+        this.loadDeploymentTarget(
+          await lastValueFrom(this.deploymentTargets.update(this.deploymentTarget().id!, request))
+        );
+        this.toast.success(`${request.name} saved successfully`);
+        this.hideDrawer();
+      } catch (e) {
+        const msg = getFormDisplayedError(e);
+        if (msg) {
+          this.toast.error(msg);
+        }
+      } finally {
+        this.editFormLoading = false;
+      }
+    }
+  }
+
+  protected saveDeploymentTargetNotes() {
+    const id = this.deploymentTarget().id;
+    const notes = this.notesForm.value.notes ?? '';
+
+    if (!id) {
+      return;
+    }
+
+    this.notesFormLoading = true;
+    this.deploymentTargets.saveNotes(id, notes).subscribe({
+      next: () => {
+        this.toast.success('Notes saved successfully');
+        this.notesFormLoading = false;
+      },
+      error: () => {
+        this.toast.error('Failed to save notes');
+        this.notesFormLoading = false;
+      },
+    });
+  }
+
+  protected forceRestart(deployment: DeploymentWithLatestRevision) {
+    if (deployment.id) {
+      this.overlay
+        .confirm({
+          message: {
+            message: 'Are you sure you want to force restart this deployment?',
+            alert: {
+              type: 'warning',
+              message: 'Depending on the deployment, this may cause downtime.',
+            },
+          },
+        })
+        .pipe(
+          filter((result) => result === true),
+          switchMap(() =>
+            this.deploymentTargets.deploy({
+              deploymentId: deployment.id,
+              deploymentTargetId: deployment.deploymentTargetId,
+              applicationVersionId: deployment.applicationVersionId,
+              applicationEntitlementId: deployment.applicationEntitlementId,
+              releaseName: deployment.releaseName,
+              dockerType: deployment.dockerType,
+              valuesYaml: deployment.valuesYaml,
+              envFileData: deployment.envFileData,
+              forceRestart: true,
+            })
+          )
+        )
+        .subscribe({
+          next: () => this.toast.success('Deployment has been restarted.'),
+          error: (e) => {
+            const msg = getFormDisplayedError(e);
+            if (msg) {
+              this.toast.error(msg);
+            }
+          },
+        });
+    }
+  }
+
+  protected deleteDeploymentTarget() {
+    const dt = this.deploymentTarget();
+    const alert =
+      dt.customerOrganization !== undefined && this.auth.isVendor()
+        ? ({type: 'info', message: this.customerManagedNotice} as const)
+        : undefined;
+    this.overlay
+      .confirm({
+        customTemplate: this.deleteConfirmModal(),
+        requiredConfirmInputText: 'DELETE',
+        message: {
+          alert,
+          message: '',
+        },
+      })
+      .pipe(
+        filter((result) => result === true),
+        switchMap(() => this.deploymentTargets.delete(dt))
+      )
+      .subscribe({
+        error: (e) => {
+          const msg = getFormDisplayedError(e);
+          if (msg) {
+            this.toast.error(msg);
+          }
+        },
+      });
+  }
+
+  protected async deleteDeployment(d: DeploymentWithLatestRevision, confirmTemplate: TemplateRef<any>) {
+    const dt = this.deploymentTarget();
+    const alert =
+      dt.customerOrganization !== undefined && this.auth.isVendor()
+        ? ({type: 'info', message: this.customerManagedNotice} as const)
+        : undefined;
+    if (d.id) {
+      if (
+        await firstValueFrom(
+          this.overlay.confirm({
+            customTemplate: confirmTemplate,
+            requiredConfirmInputText: 'UNDEPLOY',
+            message: {
+              alert,
+              message: '',
+            },
+          })
+        )
+      ) {
+        const modalRef = this.overlay.showModal(this.deleteDeploymentProgressModal(), {
+          positionStrategy: new GlobalPositionStrategy().centerHorizontally().centerVertically(),
+          backdropStyleOnly: true,
+        });
+
+        try {
+          await firstValueFrom(this.deploymentTargets.undeploy(d.id));
+        } catch (e) {
+          const msg = getFormDisplayedError(e);
+          if (msg) {
+            this.toast.error(msg);
+          }
+        } finally {
+          modalRef?.dismiss();
+        }
+      }
+    }
+  }
+
+  public async updateDeploymentTargetController(): Promise<void> {
+    try {
+      const dt = this.deploymentTarget();
+      const controllerVersions = this.controllerVersions.value();
+      if (controllerVersions?.length) {
+        const targetVersion = controllerVersions[controllerVersions.length - 1];
+        const fromVersion = dt.controllerVersion?.name;
+        this.controllerUpdateFromVersion.set(fromVersion);
+        this.controllerUpdateToVersion.set(targetVersion.name);
+        this.controllerUpdateChangelogReleases.set(
+          this.loadChangelogReleases(fromVersion, targetVersion.name, dt.type)
+        );
+        this.controllerUpdateAutomaticUpdatesEnabled.setValue(dt.automaticUpdatesEnabled ?? false);
+
+        if (
+          await firstValueFrom(
+            this.overlay.confirm({
+              customTemplate: this.updateControllerConfirmTemplate(),
+              confirmLabel: 'Update Controller',
+            })
+          )
+        ) {
+          await firstValueFrom(
+            this.deploymentTargets.update(dt.id!, {
+              name: dt.name,
+              metricsEnabled: dt.metricsEnabled,
+              imageCleanupEnabled: dt.imageCleanupEnabled,
+              deploymentLogsEnabled: dt.deploymentLogsEnabled,
+              deploymentLogsAfter: dt.deploymentLogsAfter,
+              automaticUpdatesEnabled: this.controllerUpdateAutomaticUpdatesEnabled.value,
+              resources: dt.resources,
+              dockerEndpoint: dt.dockerEndpoint,
+              controllerVersionId: targetVersion.id,
+            })
+          );
+        }
+      }
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    }
+  }
+
+  private loadChangelogReleases(fromVersion: string | undefined, toVersion: string, type: DeploymentType) {
+    const allowedScopes = new Set(['controller', `${type}-controller`, 'agent', `${type}-agent`]);
+    return controllerChangelog.releases
+      .filter((release) => {
+        try {
+          const released = new SemVer(release.version);
+          return released.compare(toVersion) <= 0 && (!fromVersion || released.compare(fromVersion) > 0);
+        } catch {
+          return false;
+        }
+      })
+      .map((release) => ({
+        ...release,
+        sections: release.sections
+          .map((section) => ({
+            ...section,
+            changes: section.changes.filter((change) => allowedScopes.has(change.scope)),
+          }))
+          .filter((section) => section.changes.length > 0),
+      }))
+      .filter((release) => release.sections.length > 0);
+  }
+
+  protected toggle(signal: WritableSignal<boolean>) {
+    signal.update((val) => !val);
+  }
+
+  protected async openInstructionsModal() {
+    const dt = this.deploymentTarget();
+    if (dt.reportedControllerVersionId !== undefined) {
+      const message =
+        `If you continue, a new authentication secret for ${dt.name} is issued. ` +
+        'The current secret stays valid until a controller connects to Distr with the new one. Continue?';
+      const alert =
+        dt.customerOrganization !== undefined && this.auth.isVendor()
+          ? ({type: 'info', message: this.customerManagedNotice} as const)
+          : undefined;
+      if (!(await firstValueFrom(this.overlay.confirm({message: {message, alert}})))) {
+        return;
+      }
+    }
+    this.showModal(this.instructionsModal());
+  }
+
+  protected async cancelReconnect() {
+    const dt = this.deploymentTarget();
+    const message =
+      `If you continue, the pending secret for ${dt.name} is deleted and the connect command issued with it ` +
+      'stops working. The current secret stays valid, so the running controller keeps working. Continue?';
+    const alert =
+      dt.customerOrganization !== undefined && this.auth.isVendor()
+        ? ({type: 'info', message: this.customerManagedNotice} as const)
+        : undefined;
+    if (
+      !(await firstValueFrom(
+        this.overlay.confirm({
+          message: {message, alert},
+          confirmLabel: 'Cancel reconnect',
+          cancelLabel: 'Keep reconnect',
+        })
+      ))
+    ) {
+      return;
+    }
+    try {
+      await firstValueFrom(this.deploymentTargets.cancelReconnect(dt.id!));
+      this.toast.success(`The reconnect of ${dt.name} has been canceled`);
+    } catch (e) {
+      const msg = getFormDisplayedError(e);
+      if (msg) {
+        this.toast.error(msg);
+      }
+    }
+  }
+
+  protected showModal(templateRef: TemplateRef<unknown>) {
+    this.hideModal();
+    this.modal = this.overlay.showModal(templateRef, {
+      positionStrategy: new GlobalPositionStrategy().centerHorizontally().centerVertically(),
+    });
+  }
+
+  protected hideModal(): void {
+    this.modal?.close();
+  }
+
+  protected openEditDrawer() {
+    this.hideDrawer();
+    this.loadDeploymentTarget(this.deploymentTarget());
+    this.drawerRef = this.overlay.showDrawer(this.manageDeploymentTargetDrawer());
+  }
+
+  protected openNotesDrawer() {
+    const id = this.deploymentTarget().id;
+    if (!id) return;
+    this.hideDrawer();
+    this.drawerRef = this.overlay.showDrawer(this.deploymentTargetNotesDrawer());
+    this.notesFormLoading = true;
+    this.deploymentTargets.getNotes(id).subscribe({
+      next: (notes) => {
+        this.notesForm.patchValue(notes);
+        this.notesFormLoading = false;
+      },
+      error: () => {
+        this.toast.error('Failed to load notes');
+        this.notesFormLoading = false;
+      },
+    });
+  }
+
+  protected hideDrawer() {
+    this.drawerRef?.close();
+    this.resetEditForm();
+    this.notesForm.reset();
+  }
+
+  protected async openDeploymentLogs(deployment: DeploymentWithLatestRevision) {
+    if (!deployment.id) return;
+    const available = await firstValueFrom(this.deploymentLogs.getResources(deployment.id)).catch(() => undefined);
+    this.router.navigate(['/deployments', this.deploymentTarget().id], {
+      queryParams: {
+        deploymentId: deployment.id,
+        resource: available?.active?.length ? available.active : null,
+      },
+    });
+  }
+
+  protected onDeploymentRowClick(event: MouseEvent, deployment: DeploymentWithLatestRevision) {
+    if (event.target instanceof Element && event.target.closest('a, button')) {
+      return;
+    }
+    this.openRevisionsDrawer(deployment);
+  }
+
+  protected openRevisionsDrawer(deployment: DeploymentWithLatestRevision) {
+    if (!deployment.id) return;
+    this.hideDrawer();
+    this.selectedDeployment.set(deployment);
+    this.drawerRef = this.overlay.showDrawer(this.revisionsDrawer());
+  }
+
+  protected openRevisionDetails(revision: DeploymentRevisionResponse) {
+    this.revisionDetailsRef?.close();
+    this.selectedRevision.set(revision);
+    this.revisionDetailsRef = this.overlay.showModal(this.revisionDetailsModal(), {
+      positionStrategy: new GlobalPositionStrategy().centerHorizontally().centerVertically(),
+    });
+  }
+
+  protected hideRevisionDetails() {
+    this.revisionDetailsRef?.close();
+  }
+
+  protected setDeploymentLogsAfterNow() {
+    this.editForm.controls.deploymentLogsAfter.setValue(isoToDateTimeLocal(dayjs().toISOString()));
+  }
+
+  protected setDeploymentLogsAfterNowMinus1h() {
+    this.editForm.controls.deploymentLogsAfter.setValue(isoToDateTimeLocal(dayjs().subtract(1, 'hour').toISOString()));
+  }
+
+  protected clearDeploymentLogsAfter() {
+    this.editForm.controls.deploymentLogsAfter.setValue(null);
+  }
+
+  private loadDeploymentTarget(dt: DeploymentTarget) {
+    this.editForm.patchValue({
+      ...dt,
+      deploymentLogsEnabled: dt.deploymentLogsEnabled,
+      deploymentLogsAfter: isoToDateTimeLocal(dt.deploymentLogsAfter) || null,
+      automaticUpdatesEnabled: dt.automaticUpdatesEnabled ?? false,
+      customResources: !!dt.resources,
+      customDockerEndpoint: !!dt.dockerEndpoint,
+      dockerEndpoint: dt.dockerEndpoint ?? '',
+    });
+    if (dt.scope === 'namespace') {
+      this.editForm.controls.metricsEnabled.disable();
+    } else {
+      this.editForm.controls.metricsEnabled.enable();
+    }
+    if (dt.type === 'kubernetes') {
+      this.editForm.controls.imageCleanupEnabled.disable();
+      this.editForm.controls.customResources.enable();
+      this.editForm.controls.customDockerEndpoint.setValue(false);
+      this.editForm.controls.customDockerEndpoint.disable();
+    } else {
+      this.editForm.controls.imageCleanupEnabled.enable();
+      this.editForm.controls.customResources.setValue(false);
+      this.editForm.controls.customResources.disable();
+      this.editForm.controls.customDockerEndpoint.enable();
+    }
+  }
+
+  private resetEditForm() {
+    this.editForm.reset();
+    this.editForm.patchValue({type: 'docker'});
+  }
+
+  private isControllerVersionAtLeast(version: string, allowSnapshot = true) {
+    return computed(() => {
+      if (!this.deploymentTarget().reportedControllerVersionId) {
+        console.warn('reported controller version id is empty');
+        return true;
+      }
+      const reported = this.controllerVersions
+        .value()
+        ?.find((it) => it.id === this.deploymentTarget().reportedControllerVersionId);
+      if (!reported) {
+        console.warn('controller version with id not found', this.deploymentTarget().reportedControllerVersionId);
+        return false;
+      }
+      try {
+        return (allowSnapshot && reported.name === 'snapshot') || new SemVer(reported.name).compare(version) >= 0;
+      } catch (e) {
+        console.warn(e);
+        return allowSnapshot && reported.name === 'snapshot';
+      }
+    });
+  }
+}

@@ -1,0 +1,141 @@
+---
+import {getCollection} from 'astro:content';
+import {Image} from 'astro:assets';
+import LinkButton from '~/components/overwrites/LinkButton.astro';
+
+const customers = (await getCollection('customers', c => c.data.featured)).sort(
+  (a, b) => a.data.company.localeCompare(b.data.company),
+);
+
+const testimonials = customers.map(({id, data}) => ({
+  name: data.person.name,
+  role: data.person.role,
+  company: data.company,
+  image: data.person.image,
+  outcome: data.outcome,
+  text: data.quote,
+  caseStudyUrl: data.caseStudy ? `/case-studies/${id}/` : undefined,
+}));
+
+const rows = [
+  testimonials.filter((_, i) => i % 2 === 0),
+  testimonials.filter((_, i) => i % 2 === 1),
+];
+
+// Scale each row's animation duration by its card count so every row scrolls
+// at the same linear speed regardless of how many cards it holds.
+const SECONDS_PER_CARD = 20;
+
+// Minimum number of cards a row must render before being duplicated, so the
+// strip always overflows even very wide viewports. Without this, a row with
+// few cards is narrower than the screen and leaves a visible gap as it loops.
+const MIN_CARDS_PER_ROW = 10;
+---
+
+<section class="py-8 md:py-16 lg:py-24 bg-gray-50 dark:bg-gray-800">
+  <div class="container mx-auto px-4 max-w-7xl">
+    <h2 class="text-2xl md:text-3xl lg:text-4xl font-bold text-center mb-8 md:mb-12 lg:mb-16">
+      Proof from teams shipping self-hosted software
+    </h2>
+  </div>
+
+  <div class="space-y-6 md:space-y-8">
+    {rows.map((row, rowIndex) => {
+      if (row.length === 0) return null;
+      const copies = Math.max(2, Math.ceil(MIN_CARDS_PER_ROW / row.length));
+      return (
+        <div class="marquee overflow-hidden [mask-image:linear-gradient(to_right,transparent,black_6%,black_94%,transparent)]">
+          <div class="inline-flex whitespace-nowrap">
+            {Array.from({length: copies}).map((_, copyIndex) => (
+              <div
+                class:list={[
+                  'marquee-track flex',
+                  rowIndex === 1 && 'marquee-track--reverse',
+                ]}
+                style={`animation-duration:${row.length * SECONDS_PER_CARD}s`}
+                aria-hidden={copyIndex !== 0 ? 'true' : undefined}>
+                {row.map(testimonial => (
+                  <div class="shrink-0 w-[440px] md:w-[560px] ml-6 md:ml-8 bg-white dark:bg-gray-900 rounded-xl p-5 md:p-6 shadow-md flex flex-col h-full border border-gray-200 dark:border-gray-700 whitespace-normal">
+                    {testimonial.outcome && (
+                      <p class="text-sm font-semibold uppercase tracking-wide text-accent-600 dark:text-accent-200 mb-2">
+                        {testimonial.outcome}
+                      </p>
+                    )}
+                    <p class="text-base md:text-lg mb-4 italic leading-relaxed text-gray-700 dark:text-gray-300 flex-grow">
+                      "{testimonial.text}"
+                    </p>
+                    <div class="flex items-center gap-4 mt-auto">
+                      <Image
+                        src={testimonial.image}
+                        alt={testimonial.name}
+                        class="w-12 h-12 md:w-14 md:h-14 rounded-full object-cover flex-shrink-0"
+                        width={56}
+                        height={56}
+                      />
+                      <div class="flex-grow">
+                        <p class="font-bold text-gray-900 dark:text-white">
+                          {testimonial.name}
+                        </p>
+                        <p class="text-sm text-gray-600 dark:text-gray-400">
+                          {testimonial.role}, {testimonial.company}
+                        </p>
+                      </div>
+                      {testimonial.caseStudyUrl && (
+                        <LinkButton
+                          href={testimonial.caseStudyUrl}
+                          tabindex={copyIndex === 0 ? undefined : -1}
+                          icon="lucide:arrow-right"
+                          iconPlacement="end">
+                          Read case study
+                        </LinkButton>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </div>
+            ))}
+          </div>
+        </div>
+      );
+    })}
+  </div>
+</section>
+
+<style>
+  @keyframes slide {
+    from {
+      transform: translateX(0%);
+    }
+    to {
+      transform: translateX(-100%);
+    }
+  }
+
+  .marquee-track {
+    animation: slide linear infinite;
+  }
+
+  .marquee-track--reverse {
+    animation-direction: reverse;
+  }
+
+  .marquee:hover .marquee-track {
+    animation-play-state: paused;
+  }
+
+  @media (prefers-reduced-motion: reduce) {
+    /* Stop auto-scrolling and let users scroll the row manually instead. */
+    .marquee {
+      overflow-x: auto;
+    }
+
+    .marquee-track {
+      animation: none;
+    }
+
+    /* Drop the duplicated copies that only exist to make the loop seamless. */
+    .marquee-track[aria-hidden='true'] {
+      display: none;
+    }
+  }
+</style>

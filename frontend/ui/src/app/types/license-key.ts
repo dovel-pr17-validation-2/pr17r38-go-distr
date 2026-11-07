@@ -1,0 +1,36 @@
+import {BaseModel, Named} from '@distr-sh/distr-sdk';
+
+export interface LicenseKey extends BaseModel, Named {
+  description?: string;
+  payload?: Record<string, unknown>;
+  notBefore?: string;
+  expiresAt?: string;
+  lastRevisedAt?: string;
+  customerOrganizationId?: string;
+  licenseTemplateId?: string;
+}
+
+export interface CreateLicenseKeyRequest {
+  name: string;
+  description?: string;
+  payload?: Record<string, unknown>;
+  notBefore?: string;
+  expiresAt?: string;
+  customerOrganizationId?: string;
+  licenseTemplateId?: string;
+}
+
+export interface UpdateLicenseKeyRequest {
+  description?: string;
+  payload?: Record<string, unknown>;
+  notBefore?: string;
+  expiresAt?: string;
+  licenseTemplateId?: string;
+}
+
+export interface LicenseKeyRevision extends BaseModel {
+  notBefore: string;
+  expiresAt: string;
+  payload: Record<string, unknown>;
+  token: string;
+}

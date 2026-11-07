@@ -1,0 +1,82 @@
+---
+title: What is Distr?
+description: Distr is an open source software distribution platform. Software vendors use it to distribute, deploy and manage their software in self-managed, BYOC, air-gapped and edge environments, with visibility and control for both the vendor and the end customer.
+slug: docs
+banner:
+  content: '<a href="/blog/distr-v4-release/">Distr v4 is out: the Hub is now just Distr, with encryption at rest and a new access token format! Read the release post</a>'
+sidebar:
+  label: What is Distr?
+  order: 1
+tableOfContents: false
+prev: false
+next:
+  label: Core Concepts
+  link: /docs/core-concepts/
+---
+
+import {Aside} from '@astrojs/starlight/components';
+import distrDiagramLight from '~/assets/docs/getting-started/what-is-distr/distr-diagram-light.webp';
+import distrDiagramDark from '~/assets/docs/getting-started/what-is-distr/distr-diagram-dark.webp';
+import ThemedImage from '~/components/util/ThemedImage.astro';
+
+Distr is an open source software distribution platform. Software and AI companies use it to get their applications and artifacts into environments their customers control.
+
+It covers [self-managed](/docs/use-cases/fully-self-managed/), [BYOC](/docs/use-cases/byoc-bring-your-own-cloud/), [air-gapped](/docs/use-cases/air-gapped-deployments/)
+and [edge](/docs/use-cases/edge-deployments/) deployments. Throughout the application lifecycle, vendors can see which version runs where, whether it is healthy and who downloaded which artifact.
+
+## Why is Distr needed?
+
+Most software runs in a single cloud environment that the vendor controls, next to the vendor's own container registry, deployment pipelines and observability tools.
+The vendor can reach every part of that stack and troubleshoot a problem while it is happening.
+Once a customer wants to run the application in their own environment, that tooling no longer reaches it, and shipping updates, keeping the application stable and debugging it all get harder.
+Distr brings that tooling to self-managed environments, with a small footprint in the customer's infrastructure.
+
+## Architecture
+
+<ThemedImage
+  lightSrc={distrDiagramLight}
+  darkSrc={distrDiagramDark}
+  alt="Distr architecture diagram"
+  dropShadow={false}
+/>
+
+## Distr in short
+
+| Feature                       | Description                                                                                                                                                                        |
+| ----------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Distribution models           | Fully self-managed, assisted self-managed, BYOC, air-gapped and edge deployments.                                                                                                  |
+| Works with your tools         | Integrates with Docker, Helm, [OpenTofu and Terraform](/docs/controllers/infrastructure-controllers/), any OCI-compliant tool and [GitHub Actions](/docs/integrations/gh-action/). |
+| Built for enterprise security | Air-gapped installations and [token-based](/docs/integrations/personal-access-token/) access to the private registry.                                                              |
+| Package formats               | Docker Compose files, Helm charts and any other OCI artifact.                                                                                                                      |
+| Visibility across customers   | Deployment status, versions and health of every customer environment in one place.                                                                                                 |
+| Hosting options               | Use Distr as a managed SaaS or [host it yourself](/docs/self-hosting/).                                                                                                            |
+| Two portals                   | A Vendor Portal for your team and a [white-labeled](/docs/platform/branding/) Customer Portal for your customers.                                                                  |
+
+## Who is Distr for?
+
+- Software vendors that distribute applications and artifacts to environments their customers control
+- AI companies that deploy AI components in different deployment scenarios
+- Enterprise platform teams that distribute software internally
+- Operations teams that need to see what is deployed where
+
+Vendors such as [Ozgar AI](/case-studies/ozgar-ai/), [Weave](/case-studies/weave/) and [Basedash](/case-studies/basedash/) run their self-hosted offerings on Distr in production. More stories are collected in the [case studies](/case-studies/).
+
+## What can I do with Distr?
+
+With Distr you can:
+
+- Distribute software to any environment, from a customer's cloud account to an air-gapped network
+- Manage deployments, both those you operate and those your customers operate, and see all of them in one place
+- Restrict licenses to specific application versions and control access to individual artifacts by tag
+- Track the health of your deployments and the download counts of your applications and artifacts per customer
+- Brand the Customer Portal as your own and onboard customers quickly
+
+## Where do I start?
+
+The [quickstart guide](/docs/quickstart/) walks you through your first tutorials.
+
+If you are comparing Distr with another distribution platform, see [Distr vs Replicated](/compare/replicated/) and [Distr vs Nuon](/compare/nuon/).
+
+<Aside type="note">
+  Create your [Distr account](/onboarding/) and follow the onboarding steps.
+</Aside>

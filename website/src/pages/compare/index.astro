@@ -1,0 +1,38 @@
+---
+import {getCollection} from 'astro:content';
+import Layout from '~/layouts/StarlightLayout.astro';
+import SignUpCta from '~/components/cta/standalone/SignUpCta.astro';
+import CompareCard from '~/components/compare/CompareCard.astro';
+
+const comparisons = (await getCollection('compare')).sort((a, b) =>
+  a.data.competitor.localeCompare(b.data.competitor),
+);
+---
+
+<Layout
+  title="Compare Distr"
+  description="Compare Distr with other software distribution platforms">
+  <div class="mx-auto max-w-7xl px-1 sm:px-8 lg:px-10">
+    <section class="py-12 sm:py-20">
+      <div class="max-w-4xl mx-auto text-center">
+        <h1 class="text-3xl sm:text-4xl lg:text-5xl font-bold tracking-tight text-gray-900 dark:text-white mb-6">
+          Compare Distr
+        </h1>
+        <p class="text-lg sm:text-xl text-gray-600 dark:text-gray-400 mb-12 leading-relaxed">
+          See how Distr compares to other software distribution platforms
+        </p>
+
+        <div class="grid gap-6 sm:grid-cols-2 lg:grid-cols-3">
+          {comparisons.map(comparison => (
+            <CompareCard
+              competitor={comparison.data.competitor}
+              teaser={comparison.data.teaser}
+              slug={comparison.data.slug}
+            />
+          ))}
+        </div>
+      </div>
+    </section>
+  </div>
+  <SignUpCta bgClass="bg-[var(--sl-color-bg)]" />
+</Layout>

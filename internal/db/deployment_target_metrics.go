@@ -1,0 +1,191 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+)
+
+const (
+	deploymentTargetMetricsOutputExpr = `
+		dtm.id,
+		dtm.created_at,
+		dtm.deployment_target_id AS deployment_target_id,
+		dtm.cpu_cores_millis,
+		dtm.cpu_usage,
+		dtm.memory_bytes,
+		dtm.memory_usage,
+		dtm.controller_cpu_usage_millis,
+		dtm.controller_memory_bytes,
+		dtm.controller_log_bytes,
+		dtm.image_bytes,
+		array_agg(row(dtdm.device, dtdm.path, dtdm.fs_type, dtdm.bytes_total, dtdm.bytes_used) ORDER BY dtdm.device)
+			FILTER (WHERE dtdm.id IS NOT NULL)
+			AS disk_metrics
+	`
+)
+
+func GetLatestDeploymentTargetMetrics(
+	ctx context.Context,
+	orgID uuid.UUID,
+	customerOrganizationID *uuid.UUID,
+	partnerOrganizationID *uuid.UUID,
+) ([]types.DeploymentTargetMetrics, error) {
+	db := internalctx.GetDb(ctx)
+	isVendorUser := customerOrganizationID == nil && partnerOrganizationID == nil
+
+	rows, err := db.Query(ctx,
+		`SELECT `+deploymentTargetMetricsOutputExpr+` FROM DeploymentTarget dt
+		LEFT JOIN CustomerOrganization co
+			ON dt.customer_organization_id = co.id
+		INNER JOIN LATERAL (
+			SELECT id, created_at, deployment_target_id, cpu_cores_millis, cpu_usage, memory_bytes, memory_usage,
+				controller_cpu_usage_millis, controller_memory_bytes, controller_log_bytes, image_bytes
+			FROM DeploymentTargetMetrics
+			WHERE deployment_target_id = dt.id
+			ORDER BY created_at DESC, id
+			LIMIT 1
+		) dtm ON true
+		LEFT JOIN DeploymentTargetDiskMetrics dtdm
+			ON dtm.id = dtdm.deployment_target_metrics_id
+		WHERE dt.organization_id = @orgId
+		AND (@isVendorUser
+			OR dt.customer_organization_id = @customerOrganizationId
+			OR co.partner_organization_id = @partnerOrganizationId)
+		AND dt.metrics_enabled = true
+		GROUP BY dtm.id, dtm.created_at, dtm.deployment_target_id, dtm.cpu_cores_millis, dtm.cpu_usage, dtm.memory_bytes,
+			dtm.memory_usage, dtm.controller_cpu_usage_millis, dtm.controller_memory_bytes, dtm.controller_log_bytes,
+			dtm.image_bytes, co.name, dt.name
+		ORDER BY co.name, dt.name`,
+		pgx.NamedArgs{
+			"orgId":                  orgID,
+			"customerOrganizationId": customerOrganizationID,
+			"partnerOrganizationId":  partnerOrganizationID,
+			"isVendorUser":           isVendorUser,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	}
+
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.DeploymentTargetMetrics])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect DeploymentTargetMetrics: %w", err)
+	}
+
+	return result, nil
+}
+
+func GetLatestDeploymentTargetMetricsForID(ctx context.Context, id uuid.UUID) (*types.DeploymentTargetMetrics, error) {
+	db := internalctx.GetDb(ctx)
+
+	rows, err := db.Query(ctx,
+		`SELECT `+deploymentTargetMetricsOutputExpr+` FROM DeploymentTarget dt
+		INNER JOIN LATERAL (
+			SELECT id, created_at, deployment_target_id, cpu_cores_millis, cpu_usage, memory_bytes, memory_usage,
+				controller_cpu_usage_millis, controller_memory_bytes, controller_log_bytes, image_bytes
+			FROM DeploymentTargetMetrics
+			WHERE deployment_target_id = @deploymentTargetId
+			ORDER BY created_at DESC, id
+			LIMIT 1
+		) dtm ON true
+		LEFT JOIN DeploymentTargetDiskMetrics dtdm
+			ON dtm.id = dtdm.deployment_target_metrics_id
+		WHERE dt.id = @deploymentTargetId
+			AND dt.metrics_enabled = true
+		GROUP BY dtm.id, dtm.created_at, dtm.deployment_target_id, dtm.cpu_cores_millis, dtm.cpu_usage,
+			dtm.memory_bytes, dtm.memory_usage, dtm.controller_cpu_usage_millis, dtm.controller_memory_bytes,
+			dtm.controller_log_bytes, dtm.image_bytes`,
+		pgx.NamedArgs{"deploymentTargetId": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargetMetrics: %w", err)
+	}
+
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.DeploymentTargetMetrics])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, nil
+		}
+
+		return nil, fmt.Errorf("failed to collect DeploymentTargetMetrics: %w", err)
+	}
+
+	return &result, nil
+}
+
+func CreateDeploymentTargetMetrics(
+	ctx context.Context,
+	metrics *types.DeploymentTargetMetrics,
+) error {
+	db := internalctx.GetDb(ctx)
+
+	err := db.QueryRow(ctx,
+		"INSERT INTO DeploymentTargetMetrics "+
+			"(deployment_target_id, cpu_cores_millis, cpu_usage, memory_bytes, memory_usage, "+
+			"controller_cpu_usage_millis, controller_memory_bytes, controller_log_bytes, image_bytes) "+
+			"VALUES (@deploymentTargetId, @cpuCoresMillis, @cpuUsage, @memoryBytes, @memoryUsage, "+
+			"@controllerCpuUsageMillis, @controllerMemoryBytes, @controllerLogBytes, @imageBytes) "+
+			"RETURNING id, created_at",
+		pgx.NamedArgs{
+			"deploymentTargetId":       metrics.DeploymentTargetID,
+			"cpuCoresMillis":           metrics.CPUCoresMillis,
+			"cpuUsage":                 metrics.CPUUsage,
+			"memoryBytes":              metrics.MemoryBytes,
+			"memoryUsage":              metrics.MemoryUsage,
+			"controllerCpuUsageMillis": metrics.ControllerCPUUsageMillis,
+			"controllerMemoryBytes":    metrics.ControllerMemoryBytes,
+			"controllerLogBytes":       metrics.ControllerLogBytes,
+			"imageBytes":               metrics.ImageBytes,
+		}).Scan(&metrics.ID, &metrics.CreatedAt)
+	if err != nil {
+		return err
+	}
+
+	if len(metrics.DiskMetrics) == 0 {
+		return nil
+	}
+
+	_, err = db.CopyFrom(
+		ctx,
+		pgx.Identifier{"deploymenttargetdiskmetrics"},
+		[]string{"deployment_target_metrics_id", "device", "path", "fs_type", "bytes_total", "bytes_used"},
+		pgx.CopyFromSlice(len(metrics.DiskMetrics), func(i int) ([]any, error) {
+			d := metrics.DiskMetrics[i]
+			return []any{metrics.ID, d.Device, d.Path, d.FsType, d.BytesTotal, d.BytesUsed}, nil
+		}),
+	)
+	return err
+}
+
+func CleanupDeploymentTargetMetrics(ctx context.Context) (int64, error) {
+	if env.MetricsEntriesMaxAge() == nil {
+		return 0, nil
+	}
+	db := internalctx.GetDb(ctx)
+	if cmd, err := db.Exec(
+		ctx,
+		`DELETE FROM DeploymentTargetMetrics dtm
+		USING (
+			SELECT
+				dt.id AS deployment_target_id,
+				(SELECT max(created_at) FROM DeploymentTargetMetrics WHERE deployment_target_id = dt.id)
+					AS max_created_at
+			FROM DeploymentTarget dt
+		) max_created_at
+		WHERE dtm.deployment_target_id = max_created_at.deployment_target_id
+			AND dtm.created_at < max_created_at.max_created_at
+			AND now() - dtm.created_at > @metricsEntriesMaxAge`,
+		pgx.NamedArgs{"metricsEntriesMaxAge": env.MetricsEntriesMaxAge()},
+	); err != nil {
+		return 0, err
+	} else {
+		return cmd.RowsAffected(), nil
+	}
+}

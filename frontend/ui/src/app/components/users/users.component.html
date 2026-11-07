@@ -1,0 +1,246 @@
+<div class="distr-toolbar p-4">
+  <app-search-bar [control]="filterForm.controls.search" placeholder="Filter users" />
+  <div class="distr-toolbar-actions">
+    <app-quota-limit [usage]="effectiveUsage()" [limit]="limit()" label="seats" #quota />
+    @if ((auth.isVendor() && auth.hasRole('read_write')) || auth.hasRole('admin')) {
+      <button
+        (click)="showInviteDialog()"
+        [disabled]="quota.isLimitReached()"
+        [title]="quota.isLimitReached() ? 'Limit reached' : ''"
+        type="button"
+        id="addUserButton"
+        class="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none disabled:cursor-not-allowed disabled:opacity-50 md:w-auto dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+        <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+        Add User
+      </button>
+    }
+  </div>
+</div>
+<div class="overflow-x-auto">
+  <table class="distr-table">
+    <thead class="distr-table-head">
+      <tr>
+        <th scope="col" class="p-4"></th>
+        <th scope="col" class="p-4">Name</th>
+        <th scope="col" class="p-4">E-Mail</th>
+        <th scope="col" class="p-4">Join Date</th>
+        @if (isProSubscription()) {
+          <th scope="col" class="p-4">Role</th>
+        }
+        <th scope="col" class="p-4"></th>
+      </tr>
+    </thead>
+    <tbody>
+      @for (user of users$ | async; track user.id) {
+        <tr class="distr-table-row">
+          <td class="pl-4">
+            <button type="button" (click)="uploadImage(user)" aria-label="Upload user avatar" class="cursor-pointer">
+              <app-avatar [image]="user.imageUrl" [name]="user.name" [icon]="faUser" class="size-8 rounded-full" />
+            </button>
+          </td>
+          <td
+            class="max-w-32 overflow-hidden px-4 py-3 font-medium text-ellipsis whitespace-nowrap text-gray-900 lg:max-w-64 xl:max-w-128 dark:text-white">
+            <app-inline-edit
+              [value]="user.name ?? ''"
+              [editable]="auth.hasRole('admin') || (auth.isVendor() && auth.hasRole('read_write'))"
+              placeholder="Enter a name&hellip;"
+              emptyLabel="&ndash;"
+              [loading]="savingUserId() === user.id"
+              (save)="updateUserName(user, $event)" />
+          </td>
+          <td class="px-4 py-3 font-medium whitespace-nowrap text-gray-900 dark:text-white">
+            {{ user.email }}
+          </td>
+          <td class="px-4 py-3 font-medium whitespace-nowrap text-gray-900 dark:text-white">
+            {{ user.joinedOrgAt | date: 'short' }}
+          </td>
+          @if (isProSubscription()) {
+            <td class="px-4 py-3 font-medium whitespace-nowrap text-gray-900 dark:text-white">
+              @if (editRoleUserId() === user.id) {
+                <form [formGroup]="editRoleForm" class="flex" (ngSubmit)="submitEditUserRoleForm()">
+                  <app-user-role-select
+                    ariaLabel="User role"
+                    formControlName="userRole"
+                    selectClass="distr-input rounded-none rounded-s-lg w-32 px-2 py-2" />
+                  <button
+                    type="submit"
+                    [disabled]="editRoleFormLoading()"
+                    class="rounded-e-lg bg-blue-700 px-3 py-2 text-sm font-medium text-white hover:bg-blue-800 focus:ring-4 focus:ring-blue-300 focus:outline-none dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800">
+                    <fa-icon [icon]="faCheck" />
+                  </button>
+                </form>
+              } @else {
+                {{ user.userRole | userRoleLabel }}
+                @if (auth.hasRole('admin') || (auth.isVendor() && auth.hasRole('read_write'))) {
+                  <button
+                    type="button"
+                    aria-label="Edit User Role"
+                    (click)="editUserRole(user)"
+                    class="ms-1 text-gray-900 dark:text-gray-400">
+                    <fa-icon [icon]="faPen" />
+                  </button>
+                }
+              }
+            </td>
+          }
+          <td class="flex justify-end space-x-2 px-4 py-3 font-medium whitespace-nowrap text-gray-900 dark:text-white">
+            @if ((auth.isVendor() && auth.hasRole('read_write')) || auth.hasRole('admin')) {
+              @if (!user.activated) {
+                <button
+                  type="button"
+                  (click)="resendInvitation(user)"
+                  class="rounded-lg border border-gray-200 bg-white px-3 py-2 text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+                  <fa-icon [icon]="faRepeat" class="h-4 w-4 text-gray-500 dark:text-gray-400" />
+                  Resend invitation
+                </button>
+              }
+              <button type="button" aria-label="Delete" (click)="deleteUser(user)" class="distr-btn-danger px-3 py-2">
+                <fa-icon [icon]="faTrash" class="h-4 w-4" />
+              </button>
+            }
+          </td>
+        </tr>
+      }
+    </tbody>
+  </table>
+</div>
+
+<ng-template #inviteUserDialog>
+  <div
+    class="mt-12 max-h-full w-xl max-w-full rounded-lg bg-white p-4 shadow-sm dark:bg-gray-900"
+    animate.enter="animate-fly-in-top"
+    animate.leave="animate-fly-out-top">
+    <!-- Modal header -->
+    <div class="flex items-center justify-between rounded-t border-b border-gray-200 p-4 md:p-5 dark:border-gray-600">
+      <h2 class="text-xl font-semibold text-gray-900 dark:text-white">
+        @if (auth.isVendor() && customerOrganizationId() !== undefined) {
+          Add a user to this customer
+        } @else {
+          Add a user to your organization
+        }
+      </h2>
+      <button
+        type="button"
+        (click)="closeInviteDialog()"
+        class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white">
+        <fa-icon [icon]="faXmark" />
+        <span class="sr-only">Close modal</span>
+      </button>
+    </div>
+
+    <!-- Modal body -->
+    <div class="space-y-4 p-4 md:p-5">
+      <section class="antialiased">
+        <div class="mx-auto max-w-7xl px-4 2xl:px-0">
+          @if (!inviteUrl() && !inviteMailNotSentLabel()) {
+            <form class="mx-auto" (ngSubmit)="submitInviteForm()" [formGroup]="inviteForm">
+              <div class="flex flex-col space-y-5">
+                <div class="space-y-2">
+                  <label for="name" class="distr-label">
+                    Full Name <span class="text-gray-500">(optional)</span>
+                  </label>
+                  <input
+                    type="text"
+                    id="name"
+                    formControlName="name"
+                    autotrim
+                    autocomplete="off"
+                    appPlaceholder="name"
+                    class="distr-input" />
+                </div>
+
+                <div class="space-y-2">
+                  <label for="email" class="distr-label"> E-Mail Address <span class="text-red-500">*</span> </label>
+                  <input
+                    type="email"
+                    id="email"
+                    formControlName="email"
+                    autotrim
+                    autocomplete="off"
+                    class="distr-input"
+                    appPlaceholder="email"
+                    required />
+                  @if (inviteForm.controls.email.invalid && inviteForm.controls.email.touched) {
+                    <div class="text-sm text-red-600">
+                      @if (inviteForm.controls.email.errors?.['email']) {
+                        Please enter a valid e-mail address
+                      } @else {
+                        E-mail is required
+                      }
+                    </div>
+                  }
+                </div>
+                @if (isProSubscription()) {
+                  <div class="space-y-2">
+                    <label for="userRole" class="distr-label"> User role <span class="text-red-500">*</span> </label>
+                    <app-user-role-select id="userRole" formControlName="userRole" selectClass="distr-input" />
+
+                    @if (inviteForm.controls.userRole.invalid && inviteForm.controls.userRole.touched) {
+                      <div class="text-sm text-red-600">This field is required</div>
+                    }
+
+                    @switch (inviteForm.controls.userRole.value) {
+                      @case ('read_only') {
+                        <div class="text-sm text-gray-500">
+                          Read-only users can view applications, deployments, artifacts and licenses.
+                        </div>
+                      }
+                      @case ('read_write') {
+                        <div class="text-sm text-gray-500">
+                          Read/Write users can view and modify applications, deployments, artifacts and licenses.
+                        </div>
+                      }
+                      @case ('admin') {
+                        <div class="text-sm text-gray-500">
+                          Administrator users can view, modify, and manage all aspects of the platform, including user
+                          management, organization settings and billing.
+                        </div>
+                      }
+                    }
+                  </div>
+                }
+
+                <button
+                  type="submit"
+                  [disabled]="inviteFormLoading()"
+                  class="w-full self-end rounded-lg bg-blue-700 px-5 py-2.5 text-center text-sm font-medium text-white hover:bg-blue-800 focus:ring-4 focus:ring-blue-300 focus:outline-none sm:w-auto dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800">
+                  Submit
+                </button>
+              </div>
+            </form>
+          } @else {
+            <div class="flex flex-col">
+              @if (inviteMailNotSentLabel(); as label) {
+                <app-alert type="warning" heading="The invitation email could not be sent" class="mb-4">
+                  {{ label }} has been added to the organization, but the invitation email could not be delivered.
+                  @if (inviteMailNotSentUser()?.activated) {
+                    They can sign in with their existing account.
+                  } @else {
+                    You can resend the invitation from the user list.
+                  }
+                </app-alert>
+              }
+              @if (inviteUrl(); as inviteUrl) {
+                <app-alert type="success" [heading]="inviteHeading()" class="mb-4">
+                  They can finalize their account using this link:
+                  <div class="flex">
+                    <pre class="overflow-x-auto text-ellipsis">{{ inviteUrl }}</pre>
+                    <button type="button" class="text-gray-900 dark:text-white" (click)="copyInviteUrl()">
+                      <fa-icon [icon]="faClipboard" />
+                    </button>
+                  </div>
+                </app-alert>
+              }
+              <button
+                type="button"
+                class="w-full self-end rounded-lg bg-blue-700 px-5 py-2.5 text-center text-sm font-medium text-white hover:bg-blue-800 focus:ring-4 focus:ring-blue-300 focus:outline-none sm:w-auto dark:bg-blue-600 dark:hover:bg-blue-700 dark:focus:ring-blue-800"
+                (click)="closeInviteDialog()">
+                Close
+              </button>
+            </div>
+          }
+        </div>
+      </section>
+    </div>
+  </div>
+</ng-template>

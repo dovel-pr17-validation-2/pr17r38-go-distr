@@ -1,0 +1,436 @@
+package types
+
+import (
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"slices"
+	"time"
+
+	"github.com/distr-sh/distr/internal/util"
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/opencontainers/go-digest"
+)
+
+type UserRole string
+
+const (
+	UserRoleReadOnly  UserRole = "read_only"
+	UserRoleReadWrite UserRole = "read_write"
+	UserRoleAdmin     UserRole = "admin"
+)
+
+func ParseUserRole(value string) (UserRole, error) {
+	switch value {
+	case string(UserRoleReadOnly):
+		return UserRoleReadOnly, nil
+	case string(UserRoleReadWrite):
+		return UserRoleReadWrite, nil
+	case string(UserRoleAdmin):
+		return UserRoleAdmin, nil
+	default:
+		return "", errors.New("invalid user role")
+	}
+}
+
+// Rank orders the role hierarchy: admin > read_write > read_only. It panics
+// for unknown roles — every role entering the codebase is validated via
+// ParseUserRole / UnmarshalJSON, so an invalid value at this point is a bug.
+func (r UserRole) Rank() int {
+	switch r {
+	case UserRoleReadOnly:
+		return 0
+	case UserRoleReadWrite:
+		return 1
+	case UserRoleAdmin:
+		return 2
+	default:
+		panic(fmt.Sprintf("invalid user role: %q", string(r)))
+	}
+}
+
+// GreaterThan reports whether r is more privileged than other.
+func (r UserRole) GreaterThan(other UserRole) bool {
+	return r.Rank() > other.Rank()
+}
+
+func (ref *UserRole) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	} else if userRole, err := ParseUserRole(value); err != nil {
+		return err
+	} else {
+		*ref = userRole
+		return nil
+	}
+}
+
+type OrderDirection string
+
+const (
+	OrderDirectionAsc  OrderDirection = "ASC"
+	OrderDirectionDesc OrderDirection = "DESC"
+)
+
+// EffectiveOrderDirection determines the SQL ORDER BY direction for log queries.
+// In live mode or with only a "before" filter, we want the latest logs first (DESC).
+// ASC is only applied when an "after" filter is set, meaning the user wants to paginate forward from a specific point.
+func EffectiveOrderDirection(order OrderDirection, hasAfter bool) OrderDirection {
+	if order == OrderDirectionAsc && hasAfter {
+		return OrderDirectionAsc
+	}
+	return OrderDirectionDesc
+}
+
+type SubscriptionType string
+
+// IsPro reports whether the subscription type includes the paid feature set.
+// Gating is expressed by excluding NonProSubscriptionTypes rather than by listing the
+// paid types, so a newly introduced plan is treated as paid without having to be added
+// to every check.
+func (st SubscriptionType) IsPro() bool {
+	return !slices.Contains(NonProSubscriptionTypes, st)
+}
+
+const (
+	SubscriptionTypeCommunity  SubscriptionType = "community"
+	SubscriptionTypePro        SubscriptionType = "pro"
+	SubscriptionTypeBusiness   SubscriptionType = "business"
+	SubscriptionTypeEnterprise SubscriptionType = "enterprise"
+	SubscriptionTypeTrial      SubscriptionType = "trial"
+)
+
+// NonProSubscriptionTypes are the subscription types without access to paid features.
+var NonProSubscriptionTypes = []SubscriptionType{
+	SubscriptionTypeCommunity,
+}
+
+func AllSubscriptionTypes() []SubscriptionType {
+	return []SubscriptionType{
+		SubscriptionTypeCommunity,
+		SubscriptionTypePro,
+		SubscriptionTypeBusiness,
+		SubscriptionTypeEnterprise,
+		SubscriptionTypeTrial,
+	}
+}
+
+type Feature string
+
+const (
+	FeatureLicensing              Feature = "licensing"
+	FeaturePrePostScripts         Feature = "pre_post_scripts"
+	FeatureArtifactVersionMutable Feature = "artifact_version_mutable"
+	FeatureVendorBilling          Feature = "vendor_billing"
+	FeatureDeploymentLogsAfter    Feature = "deployment_logs_after"
+	FeaturePartnerManagement      Feature = "partner_management"
+	FeatureCustomDomains          Feature = "custom_domains"
+	// FeatureVulnerabilities gates the "Vulnerability Management" category. It is deliberately
+	// not named after the Advisory entity: the category covers security advisories today and
+	// will cover vulnerability scan logs as well.
+	FeatureVulnerabilities     Feature = "vulnerabilities"
+	FeatureCustomEmails        Feature = "custom_emails"
+	FeatureCustomOidcProviders Feature = "custom_oidc_providers"
+	FeatureAutoUpdates         Feature = "auto_updates"
+	FeatureCustomerSettings    Feature = "customer_settings"
+)
+
+// ProFeatures is the set of features granted to organizations with a paid (pro) subscription.
+var ProFeatures = []Feature{
+	FeatureLicensing,
+}
+
+// BusinessFeatures is the set granted on top of ProFeatures to the Business plan.
+var BusinessFeatures = []Feature{
+	FeaturePartnerManagement,
+	FeatureCustomDomains,
+	FeatureVulnerabilities,
+	FeatureCustomEmails,
+	FeatureCustomOidcProviders,
+	FeatureAutoUpdates,
+	FeatureCustomerSettings,
+}
+
+// FeaturesForSubscriptionType returns the features granted by a subscription type.
+// Enterprise is a superset of Business, so any feature added to Business must also be
+// available to Enterprise.
+// Subscription reconciliation only ever adds these features, it never removes any:
+// manually granted features (e.g. vendor_billing) must survive plan changes, and
+// organizations without a paid plan have their PlanManagedFeatures revoked by
+// ReconcileEditionFeatures instead.
+func FeaturesForSubscriptionType(st SubscriptionType) []Feature {
+	if !st.IsPro() {
+		return []Feature{}
+	}
+	features := slices.Clone(ProFeatures)
+	if st == SubscriptionTypeBusiness || st == SubscriptionTypeEnterprise {
+		features = append(features, BusinessFeatures...)
+	}
+	return features
+}
+
+// PlanManagedFeatures are all features that a subscription plan can grant, and therefore the
+// only ones that may be revoked when an organization has no paid plan. Every other feature is
+// granted out of band — vendor_billing by staff, pre_post_scripts and artifact_version_mutable
+// by an organization admin in the settings — and must survive plan changes and edition
+// reconciliation. It is derived from FeaturesForSubscriptionType so a feature added to a plan
+// cannot be forgotten here.
+var PlanManagedFeatures = planManagedFeatures()
+
+func planManagedFeatures() []Feature {
+	var features []Feature
+	for _, st := range AllSubscriptionTypes() {
+		for _, feature := range FeaturesForSubscriptionType(st) {
+			if !slices.Contains(features, feature) {
+				features = append(features, feature)
+			}
+		}
+	}
+	return features
+}
+
+type DeploymentStatusType string
+
+const (
+	DeploymentStatusTypeHealthy     DeploymentStatusType = "healthy"
+	DeploymentStatusTypeRunning     DeploymentStatusType = "running"
+	DeploymentStatusTypeProgressing DeploymentStatusType = "progressing"
+	DeploymentStatusTypeError       DeploymentStatusType = "error"
+)
+
+// IsApplied reports whether the status means the controller has the revision up and running, which is
+// everything a new status type should mean unless it explicitly does not.
+func (t DeploymentStatusType) IsApplied() bool {
+	return t != DeploymentStatusTypeProgressing && t != DeploymentStatusTypeError
+}
+
+func AllDeploymentStatusTypes() []DeploymentStatusType {
+	return []DeploymentStatusType{
+		DeploymentStatusTypeHealthy,
+		DeploymentStatusTypeRunning,
+		DeploymentStatusTypeProgressing,
+		DeploymentStatusTypeError,
+	}
+}
+
+var ErrInvalidDeploymentStatusType = errors.New("invalid deployment status type")
+
+func ParseDeploymentStatusType(status string) (DeploymentStatusType, error) {
+	switch status {
+	case string(DeploymentStatusTypeHealthy):
+		return DeploymentStatusTypeHealthy, nil
+	case string(DeploymentStatusTypeRunning), "ok":
+		return DeploymentStatusTypeRunning, nil
+	case string(DeploymentStatusTypeProgressing):
+		return DeploymentStatusTypeProgressing, nil
+	case string(DeploymentStatusTypeError):
+		return DeploymentStatusTypeError, nil
+	default:
+		return "", fmt.Errorf("%w: %v", ErrInvalidDeploymentStatusType, status)
+	}
+}
+
+func (ref *DeploymentStatusType) UnmarshalJSON(data []byte) error {
+	var statusStr string
+	if err := json.Unmarshal(data, &statusStr); err != nil {
+		return err
+	} else if status, err := ParseDeploymentStatusType(statusStr); err != nil {
+		return err
+	} else {
+		*ref = status
+		return nil
+	}
+}
+
+type DeploymentType string
+
+const (
+	DeploymentTypeDocker     DeploymentType = "docker"
+	DeploymentTypeKubernetes DeploymentType = "kubernetes"
+)
+
+var ErrInvalidDeploymentType = errors.New("invalid deployment type")
+
+func ParseDeploymentType(value string) (DeploymentType, error) {
+	switch value {
+	case string(DeploymentTypeDocker):
+		return DeploymentTypeDocker, nil
+	case string(DeploymentTypeKubernetes):
+		return DeploymentTypeKubernetes, nil
+	default:
+		return "", fmt.Errorf("%w: %v", ErrInvalidDeploymentType, value)
+	}
+}
+
+func (ref *DeploymentType) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	} else if deploymentType, err := ParseDeploymentType(value); err != nil {
+		return err
+	} else {
+		*ref = deploymentType
+		return nil
+	}
+}
+
+type HelmChartType string
+
+const (
+	HelmChartTypeRepository HelmChartType = "repository"
+	HelmChartTypeOCI        HelmChartType = "oci"
+)
+
+var ErrInvalidHelmChartType = errors.New("invalid helm chart type")
+
+func ParseHelmChartType(value string) (HelmChartType, error) {
+	switch value {
+	case string(HelmChartTypeRepository):
+		return HelmChartTypeRepository, nil
+	case string(HelmChartTypeOCI):
+		return HelmChartTypeOCI, nil
+	default:
+		return "", fmt.Errorf("%w: %v", ErrInvalidHelmChartType, value)
+	}
+}
+
+func (ref *HelmChartType) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	} else if chartType, err := ParseHelmChartType(value); err != nil {
+		return err
+	} else {
+		*ref = chartType
+		return nil
+	}
+}
+
+type (
+	DeploymentTargetScope string
+	DockerType            string
+	Tutorial              string
+	FileScope             string
+	SubscriptionPeriod    string
+)
+
+const (
+	DockerTypeCompose DockerType = "compose"
+	DockerTypeSwarm   DockerType = "swarm"
+
+	DeploymentTargetScopeCluster   DeploymentTargetScope = "cluster"
+	DeploymentTargetScopeNamespace DeploymentTargetScope = "namespace"
+
+	TutorialBranding      Tutorial  = "branding"
+	TutorialControllers   Tutorial  = "controllers"
+	TutorialRegistry      Tutorial  = "registry"
+	TutorialUsers         Tutorial  = "users"
+	FileScopePlatform     FileScope = "platform"
+	FileScopeOrganization FileScope = "organization"
+
+	SubscriptionPeriodMonthly SubscriptionPeriod = "monthly"
+	SubscriptionPeriodYearly  SubscriptionPeriod = "yearly"
+)
+
+var ErrInvalidDeploymentTargetScope = errors.New("invalid deployment target scope")
+
+func ParseDeploymentTargetScope(value string) (DeploymentTargetScope, error) {
+	switch value {
+	case string(DeploymentTargetScopeCluster):
+		return DeploymentTargetScopeCluster, nil
+	case string(DeploymentTargetScopeNamespace):
+		return DeploymentTargetScopeNamespace, nil
+	default:
+		return "", fmt.Errorf("%w: %v", ErrInvalidDeploymentTargetScope, value)
+	}
+}
+
+func (ref *DeploymentTargetScope) UnmarshalJSON(data []byte) error {
+	var value string
+	if err := json.Unmarshal(data, &value); err != nil {
+		return err
+	} else if scope, err := ParseDeploymentTargetScope(value); err != nil {
+		return err
+	} else {
+		*ref = scope
+		return nil
+	}
+}
+
+type Base struct {
+	ID        uuid.UUID `db:"id" json:"id"`
+	CreatedAt time.Time `db:"created_at" json:"createdAt"`
+}
+
+type Image struct {
+	Image            []byte  `db:"image" json:"image"`
+	ImageFileName    *string `db:"image_file_name" json:"imageFileName"`
+	ImageContentType *string `db:"image_content_type" json:"imageContentType"`
+}
+
+type Digest digest.Digest
+
+var (
+	_ sql.Scanner       = util.PtrTo(Digest(""))
+	_ pgtype.TextValuer = util.PtrTo(Digest(""))
+)
+
+func (target *Digest) Scan(src any) error {
+	if srcStr, ok := src.(string); !ok {
+		return errors.New("src must be a string")
+	} else if h, err := digest.Parse(srcStr); err != nil {
+		return err
+	} else {
+		*target = Digest(h)
+		return nil
+	}
+}
+
+// TextValue implements pgtype.TextValuer.
+func (src Digest) TextValue() (pgtype.Text, error) {
+	return pgtype.Text{String: string(src), Valid: true}, nil
+}
+
+func (h Digest) MarshalJSON() ([]byte, error) {
+	return json.Marshal(string(h))
+}
+
+type Duration time.Duration
+
+func (d Duration) String() string {
+	return time.Duration(d).String()
+}
+
+func (d Duration) TextValue() (pgtype.Text, error) {
+	return pgtype.Text{String: d.String(), Valid: true}, nil
+}
+
+func (d *Duration) Scan(src any) error {
+	if srcStr, ok := src.(string); !ok {
+		return errors.New("src must be a string")
+	} else if h, err := time.ParseDuration(srcStr); err != nil {
+		return err
+	} else {
+		*d = Duration(h)
+		return nil
+	}
+}
+
+func (d *Duration) UnmarshalJSON(data []byte) error {
+	var s string
+	if err := json.Unmarshal(data, &s); err != nil {
+		return err
+	} else if p, err := time.ParseDuration(s); err != nil {
+		return err
+	} else {
+		*d = Duration(p)
+		return nil
+	}
+}
+
+func (d Duration) MarshalJSON() ([]byte, error) {
+	return json.Marshal(d.String())
+}

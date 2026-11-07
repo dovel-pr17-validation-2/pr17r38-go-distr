@@ -1,0 +1,344 @@
+<app-page variant="full">
+  <div class="distr-panel">
+    <div class="sticky top-16 z-10 bg-white dark:bg-gray-800">
+      <nav class="mb-1">
+        <ol class="flex flex-wrap items-center gap-1" aria-label="Breadcrumb">
+          <li>
+            <a
+              [routerLink]="['/', 'deployments']"
+              class="inline-flex items-center p-2 text-sm font-medium text-gray-700 hover:text-blue-600 dark:text-gray-400 dark:hover:text-white">
+              <fa-icon class="mr-2" [icon]="faServer" />
+              Deployment Targets
+            </a>
+          </li>
+
+          <span class="text-gray-400">/</span>
+
+          <li>
+            <button
+              cdkOverlayOrigin
+              #targetDropdownOrigin="cdkOverlayOrigin"
+              #targetDropdownTrigger
+              (click)="toggleTargetDropdown()"
+              class="inline-flex items-center gap-1 rounded-lg p-2 text-center text-sm font-normal text-gray-700 hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 focus:outline-none dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white dark:focus:ring-gray-700">
+              {{ selectedDeploymentTarget()?.name ?? deploymentTargetId() }}
+              <fa-icon
+                class="transition duration-150 ease-in-out"
+                [class.rotate-x-180]="targetDropdown()"
+                [icon]="faChevronDown" />
+            </button>
+            <ng-template
+              cdkConnectedOverlay
+              [cdkConnectedOverlayHasBackdrop]="true"
+              (backdropClick)="targetDropdown.set(false)"
+              [cdkConnectedOverlayBackdropClass]="'transparent'"
+              [cdkConnectedOverlayOrigin]="targetDropdownOrigin"
+              [cdkConnectedOverlayMinWidth]="targetDropdownWidth + 'px'"
+              [cdkConnectedOverlayOpen]="targetDropdown()">
+              <div
+                class="distr-dropdown-panel w-full"
+                animate.enter="animate-flip-in-top"
+                animate.leave="animate-flip-out-top">
+                <ul>
+                  @for (target of deploymentTargets(); track target.id) {
+                    <li>
+                      <a
+                        class="distr-dropdown-item"
+                        [routerLink]="['/', 'deployments', target.id]"
+                        (click)="targetDropdown.set(false)">
+                        {{ target.name }}
+                      </a>
+                    </li>
+                  }
+                </ul>
+              </div>
+            </ng-template>
+          </li>
+
+          <span class="text-gray-400">/</span>
+
+          <li [attr.aria-current]="deploymentId() ? null : 'page'">
+            <button
+              cdkOverlayOrigin
+              #deploymentDropdownOrigin="cdkOverlayOrigin"
+              #deploymentDropdownTrigger
+              (click)="toggleDeploymentDropdown()"
+              class="inline-flex items-center gap-1 rounded-lg p-2 text-center text-sm font-normal text-gray-700 hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 focus:outline-none dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white dark:focus:ring-gray-700">
+              @if (selectedDeployment(); as deployment) {
+                {{ deployment.application.name }}@{{ deployment.applicationVersionName }}
+              } @else {
+                Controller Logs
+              }
+              <fa-icon
+                class="transition duration-150 ease-in-out"
+                [class.rotate-x-180]="deploymentDropdown()"
+                [icon]="faChevronDown" />
+            </button>
+            <ng-template
+              cdkConnectedOverlay
+              [cdkConnectedOverlayHasBackdrop]="true"
+              (backdropClick)="deploymentDropdown.set(false)"
+              [cdkConnectedOverlayBackdropClass]="'transparent'"
+              [cdkConnectedOverlayOrigin]="deploymentDropdownOrigin"
+              [cdkConnectedOverlayMinWidth]="deploymentDropdownWidth + 'px'"
+              [cdkConnectedOverlayOpen]="deploymentDropdown()">
+              <div
+                class="distr-dropdown-panel w-full"
+                animate.enter="animate-flip-in-top"
+                animate.leave="animate-flip-out-top">
+                <ul>
+                  <li>
+                    <button class="distr-dropdown-item" (click)="selectDeployment(undefined)">Controller Logs</button>
+                  </li>
+                  @for (deployment of selectedDeploymentTarget()?.deployments; track deployment.id) {
+                    <li>
+                      <button class="distr-dropdown-item" (click)="selectDeployment(deployment)">
+                        <app-deployment-app-name [deployment]="deployment" />
+                      </button>
+                    </li>
+                  }
+                </ul>
+              </div>
+            </ng-template>
+          </li>
+
+          @if (deploymentId()) {
+            <span class="text-gray-400">/</span>
+
+            <li aria-current="page">
+              <button
+                cdkOverlayOrigin
+                #resourceDropdownOrigin="cdkOverlayOrigin"
+                #resourceDropdownTrigger
+                (click)="toggleResourceDropdown()"
+                class="inline-flex items-center gap-1 rounded-lg p-2 text-center text-sm font-normal text-gray-700 hover:bg-gray-100 focus:ring-4 focus:ring-gray-100 focus:outline-none dark:text-gray-400 dark:hover:bg-gray-800 dark:hover:text-white dark:focus:ring-gray-700">
+                @if (selectedResources().length > 0) {
+                  {{ selectedResources().length }} services selected
+                } @else {
+                  No services selected
+                }
+                <fa-icon
+                  class="transition duration-150 ease-in-out"
+                  [class.rotate-x-180]="resourceDropdown()"
+                  [icon]="faChevronDown" />
+              </button>
+              <ng-template
+                cdkConnectedOverlay
+                [cdkConnectedOverlayHasBackdrop]="true"
+                (backdropClick)="resourceDropdown.set(false)"
+                [cdkConnectedOverlayBackdropClass]="'transparent'"
+                [cdkConnectedOverlayOrigin]="resourceDropdownOrigin"
+                [cdkConnectedOverlayMinWidth]="resourceDropdownWidth + 'px'"
+                [cdkConnectedOverlayOpen]="resourceDropdown()">
+                <div
+                  class="distr-dropdown-panel max-h-128 w-full overflow-y-auto"
+                  animate.enter="animate-flip-in-top"
+                  animate.leave="animate-flip-out-top">
+                  <ul>
+                    <li>
+                      <button class="distr-dropdown-item" (click)="selectDeployment(undefined)">Controller Logs</button>
+                    </li>
+                    @if (visibleResources().length > 1) {
+                      <li class="w-full border-t border-gray-100 dark:border-gray-600">
+                        <div class="distr-dropdown-checkbox-item">
+                          <input
+                            id="resource-check-all"
+                            type="checkbox"
+                            [checked]="allVisibleResourcesSelected()"
+                            [indeterminate]="someVisibleResourcesSelected()"
+                            (change)="toggleResources(visibleResources())"
+                            class="distr-checkbox" />
+                          <label
+                            for="resource-check-all"
+                            class="ms-2 w-full py-3 text-sm font-medium text-gray-900 dark:text-gray-300">
+                            @if (allVisibleResourcesSelected()) {
+                              Select none
+                            } @else {
+                              Select all
+                            }
+                          </label>
+                        </div>
+                      </li>
+                    }
+                    @for (r of availableResources()?.active; track r) {
+                      <li class="w-full border-t border-gray-100 dark:border-gray-600">
+                        <div class="distr-dropdown-checkbox-item">
+                          <input
+                            [id]="'resource-' + r"
+                            type="checkbox"
+                            [checked]="selectedResources().includes(r)"
+                            (change)="toggleResources([r])"
+                            class="distr-checkbox" />
+                          <label
+                            [for]="'resource-' + r"
+                            class="ms-2 w-full py-3 text-sm font-medium text-gray-900 dark:text-gray-300">
+                            {{ r }}
+                          </label>
+                        </div>
+                      </li>
+                    }
+                    @if (availableResources()?.archived?.length) {
+                      <li class="border-t border-gray-100 dark:border-gray-600">
+                        <button
+                          class="distr-dropdown-item text-xs text-gray-500 dark:text-gray-400"
+                          (click)="showArchivedResources.set(!showArchivedResources())">
+                          <fa-icon
+                            [icon]="faChevronDown"
+                            class="transition duration-150 ease-in-out"
+                            [class.rotate-x-180]="showArchivedResources()" />
+                          {{ showArchivedResources() ? 'Hide' : 'Show' }} archived
+                        </button>
+                      </li>
+                      @if (showArchivedResources()) {
+                        @for (r of availableResources()?.archived; track r) {
+                          <li class="w-full border-t border-gray-100 dark:border-gray-600">
+                            <div class="distr-dropdown-checkbox-item">
+                              <input
+                                [id]="'resource-archived-' + r"
+                                type="checkbox"
+                                [checked]="selectedResources().includes(r)"
+                                (change)="toggleResources([r])"
+                                class="distr-checkbox" />
+                              <label
+                                [for]="'resource-archived-' + r"
+                                class="ms-2 w-full py-3 text-sm font-medium text-gray-400 dark:text-gray-500">
+                                {{ r }}
+                              </label>
+                            </div>
+                          </li>
+                        }
+                      }
+                    }
+                  </ul>
+                </div>
+              </ng-template>
+            </li>
+          }
+        </ol>
+      </nav>
+
+      <form [formGroup]="form" class="flex flex-wrap items-start gap-4 pb-4">
+        <div>
+          <label for="range-start" class="distr-label-sm mb-1">From</label>
+          <input
+            type="datetime-local"
+            id="range-start"
+            formControlName="from"
+            [min]="logRangeMin()"
+            [max]="logRangeMax()"
+            class="distr-input distr-input-sm" />
+          @if (form.controls.from.hasError('invalidDate')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Invalid date</p>
+          } @else if (form.controls.from.hasError('beforeWindow')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Outside the available log window</p>
+          } @else if (form.controls.from.hasError('afterNow')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Cannot be in the future</p>
+          }
+        </div>
+
+        <div>
+          <label for="range-end" class="distr-label-sm mb-1">To</label>
+          <input
+            type="datetime-local"
+            id="range-end"
+            formControlName="to"
+            [min]="logRangeMin()"
+            [max]="logRangeMax()"
+            class="distr-input distr-input-sm" />
+          @if (form.controls.to.hasError('invalidDate')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Invalid date</p>
+          } @else if (form.controls.to.hasError('beforeWindow')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Outside the available log window</p>
+          } @else if (form.controls.to.hasError('afterNow')) {
+            <p class="mt-1 text-xs text-red-600 dark:text-red-500">Cannot be in the future</p>
+          }
+        </div>
+
+        <div>
+          <label for="filter" class="distr-label-sm mb-1">Filter</label>
+          <input
+            type="text"
+            id="filter"
+            formControlName="filter"
+            placeholder="Text or regexp"
+            class="distr-input distr-input-sm" />
+        </div>
+
+        <div class="ml-auto flex items-center gap-2 self-end">
+          @if (!live()) {
+            <button
+              type="button"
+              title="Live"
+              (click)="resetDateFilters()"
+              class="distr-btn-secondary flex items-center p-2 text-center text-xs leading-none font-medium">
+              <fa-icon [icon]="faPlay" class="text-gray-500 2xl:mr-2 dark:text-gray-400" />
+              <span class="hidden 2xl:inline">Live</span>
+            </button>
+          }
+          <button
+            type="button"
+            title="Reset"
+            (click)="resetAllFilters()"
+            class="distr-btn-secondary flex items-center p-2 text-center text-xs leading-none font-medium">
+            <fa-icon [icon]="faFilterCircleXmark" class="text-gray-500 2xl:mr-2 dark:text-gray-400" />
+            <span class="hidden 2xl:inline">Reset</span>
+          </button>
+          <button
+            type="button"
+            [title]="newestFirst() ? 'Newest first' : 'Oldest first'"
+            (click)="orderDirection.set(newestFirst() ? 'ASC' : 'DESC')"
+            class="distr-btn-secondary flex items-center p-2 text-center text-xs leading-none font-medium">
+            <fa-icon
+              [icon]="newestFirst() ? faArrowDownWideShort : faArrowUpShortWide"
+              class="text-gray-500 2xl:mr-2 dark:text-gray-400" />
+            <span class="hidden 2xl:inline">{{ newestFirst() ? 'Newest first' : 'Oldest first' }}</span>
+          </button>
+          <button
+            type="button"
+            title="Export all"
+            (click)="export()"
+            class="distr-btn-secondary flex items-center p-2 text-center text-xs leading-none font-medium disabled:cursor-not-allowed disabled:opacity-50">
+            <fa-icon [icon]="faDownload" class="text-gray-500 2xl:mr-2 dark:text-gray-400" />
+            <span class="hidden 2xl:inline">Export all</span>
+          </button>
+        </div>
+      </form>
+
+      @if (showBusinessLogBanner()) {
+        <app-alert type="info" class="mb-4" [dismissible]="true" (dismissed)="dismissBusinessLogBanner()">
+          Instantly unlock your last 30 days of logs with the
+          <a routerLink="/subscription" class="font-semibold underline">Distr Business plan</a>.
+        </app-alert>
+      }
+    </div>
+
+    @if (rangeBlocked()) {
+      <p class="text-sm text-gray-500 dark:text-gray-400">Adjust the date range to view logs.</p>
+    } @else if (deploymentId(); as deploymentId) {
+      @if (selectedResources().length > 0) {
+        <app-deployment-logs-table
+          [deploymentId]="deploymentId"
+          [resources]="selectedResources()"
+          [after]="after()"
+          [before]="before()"
+          [filter]="filter()"
+          [orderDirection]="orderDirection()" />
+      } @else if (availableResources()) {
+        <p class="text-sm text-gray-500 dark:text-gray-400">
+          @if (deploymentHasResources()) {
+            Select at least one service to view logs.
+          } @else {
+            This deployment has no services to show logs for.
+          }
+        </p>
+      }
+    } @else if (deploymentTargetId(); as targetId) {
+      <app-deployment-target-logs-table
+        [deploymentTargetId]="targetId"
+        [after]="after()"
+        [before]="before()"
+        [filter]="filter()"
+        [orderDirection]="orderDirection()" />
+    }
+  </div>
+</app-page>

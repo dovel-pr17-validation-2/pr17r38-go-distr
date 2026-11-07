@@ -1,0 +1,37 @@
+package types
+
+import (
+	"time"
+
+	"github.com/google/uuid"
+)
+
+type DeploymentTargetMetrics struct {
+	ID                       uuid.UUID                    `db:"id"`
+	CreatedAt                time.Time                    `db:"created_at"`
+	DeploymentTargetID       uuid.UUID                    `db:"deployment_target_id"`
+	CPUCoresMillis           int64                        `db:"cpu_cores_millis"`
+	CPUUsage                 float64                      `db:"cpu_usage"`
+	MemoryBytes              int64                        `db:"memory_bytes"`
+	MemoryUsage              float64                      `db:"memory_usage"`
+	ControllerCPUUsageMillis *int64                       `db:"controller_cpu_usage_millis"`
+	ControllerMemoryBytes    *int64                       `db:"controller_memory_bytes"`
+	ControllerLogBytes       *int64                       `db:"controller_log_bytes"`
+	ImageBytes               *int64                       `db:"image_bytes"`
+	DiskMetrics              []DeploymentTargetDiskMetric `db:"disk_metrics"`
+}
+
+type DeploymentTargetDiskMetric struct {
+	Device     string
+	Path       string
+	FsType     string
+	BytesTotal int64
+	BytesUsed  int64
+}
+
+func (m DeploymentTargetDiskMetric) Usage() float64 {
+	if m.BytesTotal <= 0 {
+		return 0
+	}
+	return float64(m.BytesUsed) / float64(m.BytesTotal)
+}

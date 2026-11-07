@@ -1,0 +1,166 @@
+import {
+  AdvisoryApplicationVersion,
+  Application,
+  ApplicationVersion,
+  DeploymentWithLatestRevision,
+  VersioningStrategy,
+} from '@distr-sh/distr-sdk';
+import {SemVer} from 'semver';
+import {ApplicationEntitlement} from '../app/types/application-entitlement';
+import {isArchived, isExpired} from './dates';
+
+export type VersionComparator = (a: ApplicationVersion, b: ApplicationVersion) => number;
+
+/** The strategies an application may be set to. The legacy one only ever applies to existing ones. */
+export type SelectableVersioningStrategy = Exclude<VersioningStrategy, 'legacy'>;
+
+/**
+ * Mirrors types.ApplicationVersionComparator in the backend, which decides which version an
+ * automatic update moves a deployment to. The ordering is derived from the whole set because the
+ * legacy strategy falls back to the creation date as soon as one name is not valid SemVer.
+ */
+export function applicationVersionComparator(
+  strategy: VersioningStrategy | undefined,
+  versions: ApplicationVersion[]
+): VersionComparator {
+  if (strategy === 'chronological') {
+    return compareByCreationDate;
+  }
+  const parsed = new Map<string, SemVer>();
+  for (const version of versions) {
+    try {
+      parsed.set(version.id!, new SemVer(version.name, {loose: true}));
+    } catch {
+      if (strategy !== 'semver') {
+        return compareByCreationDate;
+      }
+    }
+  }
+  return (a, b) => {
+    const parsedA = parsed.get(a.id!);
+    const parsedB = parsed.get(b.id!);
+    return parsedA && parsedB ? parsedA.compare(parsedB) : compareByCreationDate(a, b);
+  };
+}
+
+function compareByCreationDate(a: ApplicationVersion, b: ApplicationVersion): number {
+  return (a.createdAt ?? '').localeCompare(b.createdAt ?? '');
+}
+
+/**
+ * Returns a new array ordered by the application's versioning strategy. Pass the full version set
+ * as `allVersions` when sorting a subset so legacy/semver match the backend comparator. Defaults
+ * to descending (newest / highest first) for UI lists.
+ */
+export function sortApplicationVersions(
+  strategy: VersioningStrategy | undefined,
+  versions: ApplicationVersion[],
+  allVersions: ApplicationVersion[] = versions,
+  direction: 'asc' | 'desc' = 'desc'
+): ApplicationVersion[] {
+  const compare = applicationVersionComparator(strategy, allVersions);
+  return [...versions].sort((a, b) => (direction === 'desc' ? compare(b, a) : compare(a, b)));
+}
+
+/**
+ * Orders advisory version rows by application name, then by each application's versioning
+ * strategy (descending, like other UI lists). The comparator is built once per application.
+ */
+export function sortAdvisoryApplicationVersions(versions: AdvisoryApplicationVersion[]): AdvisoryApplicationVersion[] {
+  const grouped = new Map<string, AdvisoryApplicationVersion[]>();
+  for (const version of versions) {
+    // NUL sorts before any character of a name (Postgres text cannot contain it), so a name that
+    // is a prefix of another still sorts first.
+    const key = `${version.applicationName}\u0000${version.applicationId}`;
+    const group = grouped.get(key);
+    if (group) {
+      group.push(version);
+    } else {
+      grouped.set(key, [version]);
+    }
+  }
+  return [...grouped.keys()].sort().flatMap((key) => {
+    const group = grouped.get(key)!;
+    const compare = applicationVersionComparator(
+      group[0].applicationVersioningStrategy,
+      group.map((version) => version.applicationVersion)
+    );
+    return [...group].sort((a, b) => compare(b.applicationVersion, a.applicationVersion));
+  });
+}
+
+/**
+ * The newest version that is not archived, or undefined when none remains. The ordering comes from
+ * applicationVersionComparator, so that a subset (the versions an entitlement covers) is ordered by
+ * the ordering of the whole.
+ */
+export function latestApplicationVersion(
+  compare: VersionComparator,
+  versions: ApplicationVersion[]
+): ApplicationVersion | undefined {
+  return versions
+    .filter((version) => !isArchived(version))
+    .reduce<ApplicationVersion | undefined>(
+      (latest, version) => (latest === undefined || compare(version, latest) > 0 ? version : latest),
+      undefined
+    );
+}
+
+/**
+ * The newest version the deployment is entitled to. A deployment bound to an entitlement is limited to
+ * its versions, of which none means all of them, and every other deployment to the versions of its
+ * application in `applications`, which a customer receives only the entitled ones of. A deployment bound
+ * to an expired entitlement is entitled to none.
+ */
+export function latestDeploymentVersion(
+  deployment: DeploymentWithLatestRevision,
+  applications: Application[],
+  entitlements: ApplicationEntitlement[]
+): ApplicationVersion | undefined {
+  const application = applications.find((app) => app.id === deployment.application.id);
+  const entitlement = deployment.applicationEntitlementId
+    ? entitlements.find((it) => it.id === deployment.applicationEntitlementId)
+    : undefined;
+  if (entitlement && isExpired(entitlement)) {
+    return undefined;
+  }
+  const candidates = entitlement?.versions?.length ? entitlement.versions : (application?.versions ?? []);
+  return latestApplicationVersion(
+    applicationVersionComparator(application?.versioningStrategy, application?.versions ?? []),
+    candidates
+  );
+}
+
+export function allowsAutomaticUpdates(application: Application): boolean {
+  return (application.allowAutomaticUpdates ?? false) && application.versioningStrategy !== 'legacy';
+}
+
+/**
+ * The deployments whose application allows automatic updates. The deployment carries only a name
+ * and an id of its application, so whether it allows them has to come from the application list.
+ */
+export function deploymentIdsAllowingAutomaticUpdates(
+  deployments: DeploymentWithLatestRevision[],
+  applications: Application[]
+): Set<string> {
+  return new Set(
+    deployments
+      .filter((deployment) => {
+        const application = applications.find((app) => app.id === deployment.application.id);
+        return application !== undefined && allowsAutomaticUpdates(application);
+      })
+      .map((deployment) => deployment.id)
+      .filter((id) => id !== undefined)
+  );
+}
+
+export function versioningStrategyLabel(strategy: VersioningStrategy | undefined): string {
+  switch (strategy) {
+    case 'semver':
+      return 'Semantic versioning';
+    case 'chronological':
+      return 'Chronological versioning';
+    default:
+      return 'Legacy versioning';
+  }
+}

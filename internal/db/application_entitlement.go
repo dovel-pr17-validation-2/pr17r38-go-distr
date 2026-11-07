@@ -1,0 +1,496 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/dbcrypto"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var (
+	applicationEntitlementOutputExpr = `
+		al.id, al.created_at, al.name, al.expires_at, al.application_id, al.organization_id,
+		al.customer_organization_id, al.registry_url, al.auto_add_version_regex,
+		` + entitlementRegistryUsername.Output("al") + `,
+		` + entitlementRegistryPassword.Output("al") + `
+	`
+	applicationEntitlementWithVersionsOutputExpr = applicationEntitlementOutputExpr + `,
+		coalesce((
+		   	SELECT array_agg(
+				row(av.id, av.created_at, av.archived_at, av.name, av.link_template, av.application_id,
+					av.chart_type, av.chart_name, av.chart_url, av.chart_version)
+				ORDER BY av.created_at ASC
+			)
+		   	FROM ApplicationEntitlement_ApplicationVersion alav
+				LEFT JOIN applicationversion av ON alav.application_version_id = av.id
+		   	WHERE alav.application_entitlement_id = al.id
+		   ), array[]::record[]
+		) as versions
+	`
+	applicationEntitlementCompleteOutputExpr = applicationEntitlementWithVersionsOutputExpr + `,
+		(` + applicationOutputExpr + `) as application,
+		CASE WHEN al.customer_organization_id IS NOT NULL
+			THEN (` + customerOrganizationOutputExpr + `)
+		END as customer_organization
+	`
+)
+
+func HasAnyApplicationEntitlement(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var hasEntitlements bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM ApplicationEntitlement al
+			WHERE al.organization_id = @orgId
+		)`,
+		pgx.NamedArgs{"orgId": orgID},
+	).Scan(&hasEntitlements)
+	if err != nil {
+		return false, fmt.Errorf("could not check for entitlements: %w", err)
+	}
+	return hasEntitlements, nil
+}
+
+func applicationEntitlementArgs(e types.ApplicationEntitlementBase) (pgx.NamedArgs, error) {
+	scope := []uuid.UUID{dbcrypto.ScopeOf(e.CustomerOrganizationID), e.OrganizationID}
+	registryUsernameEnc, err := entitlementRegistryUsername.EncryptPtr(e.RegistryUsername, scope...)
+	if err != nil {
+		return nil, fmt.Errorf("could not encrypt registry username: %w", err)
+	}
+	registryPasswordEnc, err := entitlementRegistryPassword.EncryptPtr(e.RegistryPassword, scope...)
+	if err != nil {
+		return nil, fmt.Errorf("could not encrypt registry password: %w", err)
+	}
+	return pgx.NamedArgs{
+		"id":                     e.ID,
+		"name":                   e.Name,
+		"expiresAt":              e.ExpiresAt,
+		"applicationId":          e.ApplicationID,
+		"organizationId":         e.OrganizationID,
+		"customerOrganizationId": e.CustomerOrganizationID,
+		"registryUrl":            e.RegistryURL,
+		"registryUsernameEnc":    registryUsernameEnc,
+		"registryPasswordEnc":    registryPasswordEnc,
+		"autoAddVersionRegex":    e.AutoAddVersionRegex,
+	}, nil
+}
+
+func collectApplicationEntitlement(rows pgx.Rows, entitlement *types.ApplicationEntitlementBase) error {
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ApplicationEntitlementBase])
+	if err != nil {
+		if pgError, ok := errors.AsType[*pgconn.PgError](err); ok && pgError.Code == pgerrcode.UniqueViolation {
+			return fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return err
+	}
+	*entitlement = result
+	return nil
+}
+
+func CreateApplicationEntitlement(ctx context.Context, entitlement *types.ApplicationEntitlementBase) error {
+	args, err := applicationEntitlementArgs(*entitlement)
+	if err != nil {
+		return err
+	}
+	rows, err := internalctx.GetDb(ctx).Query(
+		ctx,
+		`INSERT INTO ApplicationEntitlement AS al (
+			name, expires_at, application_id, organization_id, customer_organization_id, registry_url,
+			registry_username_enc, registry_password_enc, auto_add_version_regex
+		) VALUES (
+			@name, @expiresAt, @applicationId, @organizationId, @customerOrganizationId, @registryUrl,
+			@registryUsernameEnc, @registryPasswordEnc, @autoAddVersionRegex
+		) RETURNING`+applicationEntitlementOutputExpr,
+		args,
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert ApplicationEntitlement: %w", err)
+	}
+	return collectApplicationEntitlement(rows, entitlement)
+}
+
+// UpdateApplicationEntitlement seals the credentials for the customer the same statement writes,
+// and requires the organization of the stored row to still hold, which it does not write.
+func UpdateApplicationEntitlement(ctx context.Context, entitlement *types.ApplicationEntitlementBase) error {
+	args, err := applicationEntitlementArgs(*entitlement)
+	if err != nil {
+		return err
+	}
+	rows, err := internalctx.GetDb(ctx).Query(
+		ctx,
+		`UPDATE ApplicationEntitlement AS al SET
+			name = @name,
+			expires_at = @expiresAt,
+			customer_organization_id = @customerOrganizationId,
+			registry_url = @registryUrl,
+			registry_username = NULL,
+			registry_username_enc = @registryUsernameEnc,
+			registry_password = NULL,
+			registry_password_enc = @registryPasswordEnc,
+			auto_add_version_regex = @autoAddVersionRegex
+		WHERE al.id = @id AND al.organization_id = @organizationId
+		RETURNING`+applicationEntitlementOutputExpr,
+		args,
+	)
+	if err != nil {
+		return fmt.Errorf("could not update ApplicationEntitlement: %w", err)
+	}
+	return collectApplicationEntitlement(rows, entitlement)
+}
+
+func RevokeApplicationEntitlementWithID(ctx context.Context, id uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(
+		ctx,
+		"UPDATE ApplicationEntitlement SET expires_at = now() WHERE id = @id",
+		pgx.NamedArgs{"id": id},
+	)
+	if err == nil && cmd.RowsAffected() < 1 {
+		err = distrerr.ErrNotFound
+	}
+	if err != nil {
+		return fmt.Errorf("could not update ApplicationEntitlement: %w", err)
+	} else {
+		return nil
+	}
+}
+
+func GetApplicationEntitlementsWithAutoAddVersionRegex(
+	ctx context.Context,
+	applicationID uuid.UUID,
+) ([]types.ApplicationEntitlementBase, error) {
+	rows, err := internalctx.GetDb(ctx).Query(
+		ctx,
+		`SELECT `+applicationEntitlementOutputExpr+`
+		FROM ApplicationEntitlement al
+		WHERE al.application_id = @applicationId
+			AND al.auto_add_version_regex IS NOT NULL
+			AND EXISTS (
+				SELECT FROM ApplicationEntitlement_ApplicationVersion aeav WHERE aeav.application_entitlement_id = al.id
+			)`,
+		pgx.NamedArgs{"applicationId": applicationID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ApplicationEntitlement: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ApplicationEntitlementBase])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect ApplicationEntitlement: %w", err)
+	}
+	return result, nil
+}
+
+// AddVersionToApplicationEntitlements reports whether the version was added to any entitlement that did not
+// contain it yet.
+func AddVersionToApplicationEntitlements(
+	ctx context.Context,
+	versionID uuid.UUID,
+	entitlementIDs []uuid.UUID,
+) (bool, error) {
+	cmd, err := internalctx.GetDb(ctx).Exec(
+		ctx,
+		`INSERT INTO ApplicationEntitlement_ApplicationVersion (application_entitlement_id, application_version_id)
+		SELECT unnest(@entitlementIds::UUID[]), @versionId::UUID
+		ON CONFLICT (application_entitlement_id, application_version_id) DO NOTHING`,
+		pgx.NamedArgs{"entitlementIds": entitlementIDs, "versionId": versionID},
+	)
+	if err != nil {
+		return false, fmt.Errorf("could not insert version relations: %w", err)
+	}
+	return cmd.RowsAffected() > 0, nil
+}
+
+func andApplicationIdMatchesOrEmpty(applicationID *uuid.UUID) string {
+	if applicationID != nil {
+		return " AND al.application_id = @applicationId "
+	}
+	return ""
+}
+
+func GetApplicationEntitlementsWithOrganizationID(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	applicationID *uuid.UUID,
+) ([]types.ApplicationEntitlement, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		"SELECT "+applicationEntitlementCompleteOutputExpr+
+			"FROM ApplicationEntitlement al "+
+			"LEFT JOIN Application a ON al.application_id = a.id "+
+			"LEFT JOIN CustomerOrganization co ON al.customer_organization_id = co.id "+
+			"WHERE al.organization_id = @organizationId "+
+			andApplicationIdMatchesOrEmpty(applicationID),
+		pgx.NamedArgs{
+			"organizationId": organizationID,
+			"applicationId":  applicationID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ApplicationEntitlement: %w", err)
+	}
+
+	if result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ApplicationEntitlement]); err != nil {
+		return nil, fmt.Errorf("could not collect ApplicationEntitlement: %w", err)
+	} else {
+		sortApplicationEntitlementsVersions(result)
+		return result, nil
+	}
+}
+
+func GetApplicationEntitlementsWithCustomerOrganizationID(
+	ctx context.Context,
+	customerOrganizationID, organizationID uuid.UUID,
+	applicationID *uuid.UUID,
+) ([]types.ApplicationEntitlement, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		"SELECT "+applicationEntitlementCompleteOutputExpr+
+			"FROM ApplicationEntitlement al "+
+			"LEFT JOIN Application a ON al.application_id = a.id "+
+			"LEFT JOIN CustomerOrganization co ON al.customer_organization_id = co.id "+
+			"WHERE al.customer_organization_id = @customerOrganizationId AND al.organization_id = @organizationId "+
+			andApplicationIdMatchesOrEmpty(applicationID),
+		pgx.NamedArgs{
+			"customerOrganizationId": customerOrganizationID,
+			"organizationId":         organizationID,
+			"applicationId":          applicationID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ApplicationEntitlement: %w", err)
+	}
+
+	if result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ApplicationEntitlement]); err != nil {
+		return nil, fmt.Errorf("could not collect ApplicationEntitlement: %w", err)
+	} else {
+		sortApplicationEntitlementsVersions(result)
+		return result, nil
+	}
+}
+
+func GetApplicationEntitlementsByPartnerOrgID(
+	ctx context.Context,
+	partnerOrgID, organizationID uuid.UUID,
+	applicationID *uuid.UUID,
+) ([]types.ApplicationEntitlement, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		"SELECT "+applicationEntitlementCompleteOutputExpr+
+			"FROM ApplicationEntitlement al "+
+			"LEFT JOIN Application a ON al.application_id = a.id "+
+			"JOIN CustomerOrganization co ON al.customer_organization_id = co.id "+
+			"WHERE al.organization_id = @organizationId AND co.partner_organization_id = @partnerOrgId "+
+			andApplicationIdMatchesOrEmpty(applicationID),
+		pgx.NamedArgs{
+			"organizationId": organizationID,
+			"partnerOrgId":   partnerOrgID,
+			"applicationId":  applicationID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ApplicationEntitlement: %w", err)
+	}
+	if result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ApplicationEntitlement]); err != nil {
+		return nil, fmt.Errorf("could not collect ApplicationEntitlement: %w", err)
+	} else {
+		sortApplicationEntitlementsVersions(result)
+		return result, nil
+	}
+}
+
+func GetApplicationEntitlementByID(ctx context.Context, id uuid.UUID) (*types.ApplicationEntitlement, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		"SELECT "+applicationEntitlementCompleteOutputExpr+
+			"FROM ApplicationEntitlement al "+
+			"LEFT JOIN Application a ON al.application_id = a.id "+
+			"LEFT JOIN CustomerOrganization co ON al.customer_organization_id = co.id "+
+			"WHERE al.id = @id ",
+		pgx.NamedArgs{"id": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ApplicationEntitlement: %w", err)
+	}
+
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ApplicationEntitlement]); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not collect ApplicationEntitlement: %w", err)
+	} else {
+		sortApplicationEntitlementVersions(&result)
+		return &result, nil
+	}
+}
+
+func sortApplicationEntitlementsVersions(entitlements []types.ApplicationEntitlement) {
+	for i := range entitlements {
+		sortApplicationEntitlementVersions(&entitlements[i])
+	}
+}
+
+func sortApplicationEntitlementVersions(entitlement *types.ApplicationEntitlement) {
+	types.SortApplicationVersions(entitlement.Application.VersioningStrategy, entitlement.Versions)
+}
+
+func ApplicationVersionsBelongToApplication(
+	ctx context.Context, applicationID uuid.UUID, versionIDs []uuid.UUID,
+) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var belong bool
+	if err := db.QueryRow(
+		ctx,
+		`SELECT NOT EXISTS (
+			SELECT FROM unnest(@versionIds::UUID[]) requested(id)
+			WHERE NOT EXISTS (
+				SELECT FROM ApplicationVersion av WHERE av.id = requested.id AND av.application_id = @applicationId
+			)
+		)`,
+		pgx.NamedArgs{"applicationId": applicationID, "versionIds": versionIDs},
+	).Scan(&belong); err != nil {
+		return false, fmt.Errorf("could not check application versions: %w", err)
+	}
+	return belong, nil
+}
+
+func SetApplicationEntitlementVersions(ctx context.Context, entitlementID uuid.UUID, versionIDs []uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(
+		ctx,
+		`INSERT INTO ApplicationEntitlement_ApplicationVersion (application_entitlement_id, application_version_id)
+		SELECT @entitlementId, id FROM ApplicationVersion WHERE id = any(@versionIds)
+		ON CONFLICT (application_entitlement_id, application_version_id) DO NOTHING`,
+		pgx.NamedArgs{
+			"entitlementId": entitlementID,
+			"versionIds":    versionIDs,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert version relations: %w", err)
+	}
+	_, err = db.Exec(
+		ctx,
+		`DELETE FROM ApplicationEntitlement_ApplicationVersion
+		WHERE application_entitlement_id = @entitlementId
+			AND NOT (application_version_id = any(@versionIds))`,
+		pgx.NamedArgs{
+			"entitlementId": entitlementID,
+			"versionIds":    versionIDs,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not delete version relations: %w", err)
+	}
+	return nil
+}
+
+func GetDeploymentsUsingVersionsNotInList(
+	ctx context.Context,
+	entitlementID uuid.UUID,
+	allowedVersionIDs []uuid.UUID,
+) ([]types.DeploymentVersionUsage, error) {
+	if len(allowedVersionIDs) == 0 {
+		return nil, nil
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT
+			d.id AS deployment_id,
+			dt.name AS deployment_target_name,
+			dr.application_version_id AS application_version_id,
+			av.name AS application_version_name
+		FROM Deployment d
+			JOIN DeploymentTarget dt ON d.deployment_target_id = dt.id
+			JOIN DeploymentRevision dr ON dr.id = d.latest_deployment_revision_id
+			JOIN ApplicationVersion av ON dr.application_version_id = av.id
+		WHERE d.application_entitlement_id = @entitlementId
+			AND dr.application_version_id != ALL(@allowedVersionIds)`,
+		pgx.NamedArgs{
+			"entitlementId":     entitlementID,
+			"allowedVersionIds": allowedVersionIDs,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query deployments using unlicensed versions: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.DeploymentVersionUsage])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect deployment version usage: %w", err)
+	}
+	return result, nil
+}
+
+func DeleteApplicationEntitlementWithID(ctx context.Context, id uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(ctx, `DELETE FROM ApplicationEntitlement WHERE id = @id`, pgx.NamedArgs{"id": id})
+	if err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == pgerrcode.ForeignKeyViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return err
+	} else if cmd.RowsAffected() == 0 {
+		err = distrerr.ErrNotFound
+	}
+
+	if err != nil {
+		return fmt.Errorf("could not delete ApplicationEntitlement: %w", err)
+	}
+
+	return nil
+}
+
+func DeleteApplicationEntitlementsWithOrganizationID(ctx context.Context, orgID uuid.UUID) (int64, error) {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(
+		ctx,
+		`DELETE FROM ApplicationEntitlement WHERE organization_id = @orgId`,
+		pgx.NamedArgs{"orgId": orgID},
+	)
+	if err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == pgerrcode.ForeignKeyViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return 0, fmt.Errorf("could not delete ApplicationEntitlements: %w", err)
+	}
+
+	return cmd.RowsAffected(), nil
+}
+
+func DeleteApplicationEntitlementsWithOrganizationSubscriptionType(
+	ctx context.Context,
+	subscriptionType []types.SubscriptionType,
+) (int64, error) {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(
+		ctx,
+		`DELETE FROM ApplicationEntitlement WHERE organization_id IN (
+			SELECT id FROM Organization WHERE subscription_type = ANY(@subscriptionType)
+		)`,
+		pgx.NamedArgs{"subscriptionType": subscriptionType},
+	)
+	if err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == pgerrcode.ForeignKeyViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return 0, fmt.Errorf("could not delete ApplicationEntitlements: %w", err)
+	}
+
+	return cmd.RowsAffected(), nil
+}

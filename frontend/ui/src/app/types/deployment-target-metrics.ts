@@ -1,0 +1,37 @@
+export interface DeploymentTargetLatestMetrics {
+  deploymentTargetId: string;
+  createdAt: string;
+  cpuCoresMillis: number;
+  cpuUsage: number;
+  memoryBytes: number;
+  memoryUsage: number;
+  controllerCpuUsageMillis?: number;
+  controllerMemoryBytes?: number;
+  controllerLogBytes?: number;
+  imageBytes?: number;
+  diskMetrics?: DeploymentTargetDiskMetric[];
+}
+
+export interface DeploymentResourceMetrics {
+  deploymentId: string;
+  createdAt: string;
+  resources: DeploymentResourceMetric[];
+}
+
+export interface DeploymentResourceMetric {
+  resource: string;
+  container: string;
+  cpuUsageMillis: number;
+  memoryBytes: number;
+  cpuLimitMillis?: number;
+  memoryLimitBytes?: number;
+  logBytes?: number;
+}
+
+interface DeploymentTargetDiskMetric {
+  device: string;
+  path: string;
+  fsType: string;
+  bytesTotal: number;
+  bytesUsed: number;
+}

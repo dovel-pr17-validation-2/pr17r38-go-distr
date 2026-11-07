@@ -1,0 +1,260 @@
+import {DatePipe} from '@angular/common';
+import {ChangeDetectionStrategy, Component, computed, DestroyRef, inject, signal} from '@angular/core';
+import {takeUntilDestroyed, toSignal} from '@angular/core/rxjs-interop';
+import {FormControl, FormGroup, ReactiveFormsModule} from '@angular/forms';
+import {ActivatedRoute, Params, Router} from '@angular/router';
+import {FaIconComponent} from '@fortawesome/angular-fontawesome';
+import {faDownload, faFilterCircleXmark} from '@fortawesome/free-solid-svg-icons';
+import dayjs from 'dayjs';
+import {
+  concatMap,
+  debounceTime,
+  filter,
+  finalize,
+  first,
+  map,
+  of,
+  scan,
+  shareReplay,
+  startWith,
+  Subject,
+  switchMap,
+  tap,
+} from 'rxjs';
+import {downloadBlob} from '../../../util/blob';
+import {shortDigest} from '../../../util/digest';
+import {PageComponent} from '../../components/page.component';
+import {SpinnerComponent} from '../../components/spinner/spinner.component';
+import {ArtifactPullFilters, ArtifactPullsService} from '../../services/artifact-pulls.service';
+import {ToastService} from '../../services/toast.service';
+
+// The User filter holds a user account id, plus this value for the pulls that have no user because
+// they came without credentials.
+const ANONYMOUS_USER = 'anonymous';
+
+@Component({
+  templateUrl: './artifact-pulls.component.html',
+  changeDetection: ChangeDetectionStrategy.Eager,
+  imports: [DatePipe, ReactiveFormsModule, FaIconComponent, PageComponent, SpinnerComponent],
+})
+export class ArtifactPullsComponent {
+  private readonly pullsService = inject(ArtifactPullsService);
+  private readonly toast = inject(ToastService);
+  private readonly route = inject(ActivatedRoute);
+  private readonly router = inject(Router);
+  private readonly destroyRef = inject(DestroyRef);
+
+  protected readonly faDownload = faDownload;
+  protected readonly faFilterCircleXmark = faFilterCircleXmark;
+  protected readonly anonymousUser = ANONYMOUS_USER;
+  protected readonly formatVersionName = shortDigest;
+  protected readonly today = dayjs().format('YYYY-MM-DD');
+  protected readonly hasMore = signal(true);
+  protected readonly loading = signal(true);
+  protected readonly isExporting = signal(false);
+  private currentOldestPull?: Date;
+  private readonly fetchCount = 50;
+  private readonly showMore$ = new Subject<void>();
+  private initializing = true;
+
+  protected readonly filterForm = new FormGroup({
+    customerOrganizationId: new FormControl(''),
+    userAccountId: new FormControl(''),
+    remoteAddress: new FormControl(''),
+    artifactId: new FormControl(''),
+    artifactVersionId: new FormControl(''),
+    deploymentTargetId: new FormControl(''),
+    from: new FormControl(''),
+    to: new FormControl(''),
+  });
+
+  protected readonly filterOptions = toSignal(this.pullsService.getFilterOptions());
+
+  protected readonly versionOptions = toSignal(
+    this.filterForm.controls.artifactId.valueChanges.pipe(
+      startWith(this.filterForm.controls.artifactId.value),
+      switchMap((artifactId) => {
+        if (!this.initializing) {
+          this.filterForm.controls.artifactVersionId.setValue('', {emitEvent: false});
+        }
+        if (artifactId) {
+          return this.pullsService.getVersionOptions(artifactId);
+        }
+        return of([]);
+      })
+    ),
+    {initialValue: []}
+  );
+
+  private readonly filters$ = this.filterForm.valueChanges.pipe(
+    startWith(this.filterForm.value),
+    debounceTime(300),
+    tap(() => (this.initializing = false)),
+    tap((values) => this.syncQueryParams(values)),
+    map((values) => this.buildFilters(values)),
+    shareReplay(1)
+  );
+
+  protected readonly pulls = toSignal(
+    this.filters$.pipe(
+      switchMap((filters) => {
+        this.currentOldestPull = undefined;
+        this.hasMore.set(true);
+        return this.showMore$.pipe(
+          startWith(undefined),
+          concatMap(() => {
+            this.loading.set(true);
+            return this.pullsService
+              .get({
+                ...filters,
+                before: this.currentOldestPull,
+                count: this.fetchCount,
+              })
+              .pipe(finalize(() => this.loading.set(false)));
+          }),
+          tap((it) => {
+            if (it.length > 0) {
+              this.currentOldestPull = new Date(it[it.length - 1].createdAt);
+            }
+            if (it.length < this.fetchCount) {
+              this.hasMore.set(false);
+            }
+          }),
+          scan((all, next) => [...all, ...next])
+        );
+      })
+    ),
+    {initialValue: []}
+  );
+
+  protected readonly initialLoading = computed(() => this.loading() && this.pulls().length === 0);
+
+  constructor() {
+    this.initFromQueryParams();
+    this.filterForm.controls.userAccountId.valueChanges
+      .pipe(
+        takeUntilDestroyed(),
+        filter((value) => value !== null && value !== '')
+      )
+      .subscribe((value) => {
+        this.filterForm.controls.deploymentTargetId.setValue('');
+        if (value === ANONYMOUS_USER) {
+          this.filterForm.controls.customerOrganizationId.setValue('');
+        }
+      });
+    this.filterForm.controls.deploymentTargetId.valueChanges
+      .pipe(
+        takeUntilDestroyed(),
+        filter((value) => value !== null && value !== '')
+      )
+      .subscribe(() => this.filterForm.controls.userAccountId.setValue(''));
+  }
+
+  protected showMore() {
+    this.showMore$.next();
+  }
+
+  protected resetFilters() {
+    this.filterForm.reset({
+      customerOrganizationId: '',
+      userAccountId: '',
+      remoteAddress: '',
+      artifactId: '',
+      artifactVersionId: '',
+      deploymentTargetId: '',
+      from: '',
+      to: '',
+    });
+  }
+
+  protected exportCsv() {
+    this.isExporting.set(true);
+    const toastRef = this.toast.info('Download started...');
+    const filters = this.buildFilters(this.filterForm.value);
+    this.pullsService.export(filters).subscribe({
+      next: (blob) => {
+        downloadBlob(blob, `${dayjs().format('YYYY-MM-DD')}_artifact_pulls.csv`);
+        this.isExporting.set(false);
+        toastRef.close();
+        this.toast.success('Download completed successfully');
+      },
+      error: () => {
+        this.isExporting.set(false);
+        toastRef.close();
+        this.toast.error('Export failed');
+      },
+    });
+  }
+
+  private initFromQueryParams() {
+    const params = this.route.snapshot.queryParams;
+    const hasParams = Object.keys(this.filterForm.controls).some((key) => params[key]);
+    if (!hasParams) {
+      return;
+    }
+
+    // Wait for filter options to load, then apply query params.
+    // This ensures <select> elements have their <option> children
+    // before we set a value, preventing Angular from resetting them.
+    this.pullsService
+      .getFilterOptions()
+      .pipe(first(), takeUntilDestroyed(this.destroyRef))
+      .subscribe(() => {
+        // Use setTimeout to let Angular complete the render cycle
+        // so that <option> elements from @for are in the DOM
+        setTimeout(() => {
+          const patch: Record<string, string> = {};
+          for (const key of Object.keys(this.filterForm.controls)) {
+            if (params[key]) {
+              patch[key] = params[key];
+            }
+          }
+          this.filterForm.patchValue(patch);
+        });
+      });
+  }
+
+  private syncQueryParams(values: typeof this.filterForm.value) {
+    const queryParams: Params = {};
+    for (const [key, value] of Object.entries(values)) {
+      queryParams[key] = value || null;
+    }
+    this.router.navigate([], {queryParams, replaceUrl: true});
+  }
+
+  private buildFilters(values: typeof this.filterForm.value): ArtifactPullFilters {
+    const filters: ArtifactPullFilters = {};
+    if (values.customerOrganizationId) {
+      filters.customerOrganizationId = values.customerOrganizationId;
+    }
+    if (values.userAccountId === ANONYMOUS_USER) {
+      filters.anonymous = true;
+    } else if (values.userAccountId) {
+      filters.userAccountId = values.userAccountId;
+    }
+    if (values.remoteAddress) {
+      filters.remoteAddress = values.remoteAddress;
+    }
+    if (values.artifactId) {
+      filters.artifactId = values.artifactId;
+    }
+    if (values.artifactVersionId) {
+      filters.artifactVersionId = values.artifactVersionId;
+    }
+    if (values.deploymentTargetId) {
+      filters.deploymentTargetId = values.deploymentTargetId;
+    }
+    const from = values.from;
+    const to = values.to;
+    if (from && to && dayjs(from).isAfter(dayjs(to))) {
+      return filters;
+    }
+    if (from) {
+      filters.after = dayjs(from).startOf('day').toDate();
+    }
+    if (to) {
+      filters.before = dayjs(to).endOf('day').toDate();
+    }
+    return filters;
+  }
+}

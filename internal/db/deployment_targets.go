@@ -1,0 +1,471 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	deploymentTargetOutputExprBase = `
+		dt.id,
+		dt.created_at,
+		dt.name,
+		dt.type,
+		dt.access_key_salt,
+		dt.access_key_hash,
+		dt.pending_access_key_salt,
+		dt.pending_access_key_hash,
+		dt.reported_controller_version_id IS NOT NULL AND dt.pending_access_key_hash IS NOT NULL,
+		dt.namespace,
+		dt.scope,
+		dt.organization_id,
+		dt.customer_organization_id,
+		dt.controller_version_id,
+		dt.reported_controller_version_id,
+		dt.legacy_controller_name,
+		dt.metrics_enabled,
+		dt.image_cleanup_enabled,
+		dt.autoheal_enabled,
+		dt.automatic_updates_enabled,
+		dt.deployment_logs_enabled,
+		dt.deployment_logs_after,
+		CASE WHEN dt.resources_cpu_request IS NOT NULL THEN (
+			dt.resources_cpu_request,
+			dt.resources_memory_request,
+			dt.resources_cpu_limit,
+			dt.resources_memory_limit
+		) END,
+		dt.docker_endpoint
+	`
+	deploymentTargetOutputExpr = deploymentTargetOutputExprBase +
+		", CASE WHEN co.id IS NOT NULL THEN (" + customerOrganizationOutputExpr + ") END AS customer_organization"
+	controllerVersionOutputExpr = `
+		CASE WHEN cv.id IS NOT NULL
+			THEN (cv.id, cv.created_at, cv.name, cv.manifest_file_revision, cv.compose_file_revision) END`
+	deploymentTargetFullOutputExpr = deploymentTargetOutputExpr + `,` +
+		controllerVersionOutputExpr + ` AS controller_version
+	`
+	deploymentTargetJoinExpr = `
+		LEFT JOIN ControllerVersion cv
+			ON dt.controller_version_id = cv.id
+		LEFT JOIN CustomerOrganization co
+			ON dt.customer_organization_id = co.id
+		JOIN Organization o
+			ON o.id = dt.organization_id AND o.deleted_at IS NULL
+	`
+	deploymentTargetFromExpr = `
+		DeploymentTarget dt
+	` + deploymentTargetJoinExpr
+)
+
+// DeploymentTargetFilter narrows the deployment targets a caller can see down to those of any of
+// CustomerOrganizationIDs and, with Internal, those of no customer. A zero filter matches all.
+type DeploymentTargetFilter struct {
+	CustomerOrganizationIDs []uuid.UUID
+	Internal                bool
+}
+
+func GetDeploymentTargets(
+	ctx context.Context,
+	orgID uuid.UUID,
+	customerOrgID *uuid.UUID,
+	partnerOrgID *uuid.UUID,
+	filter DeploymentTargetFilter,
+) ([]types.DeploymentTargetFull, error) {
+	db := internalctx.GetDb(ctx)
+	isVendor := customerOrgID == nil && partnerOrgID == nil
+	if rows, err := db.Query(ctx,
+		"SELECT"+deploymentTargetFullOutputExpr+"FROM"+deploymentTargetFromExpr+
+			"WHERE dt.organization_id = @orgId "+
+			"AND (@isVendor OR dt.customer_organization_id = @customerOrgId OR co.partner_organization_id = @partnerOrgId) "+
+			"AND (NOT @filterActive "+
+			"OR (@filterInternal AND dt.customer_organization_id IS NULL) "+
+			"OR dt.customer_organization_id = ANY(@filterCustomerOrgIds::uuid[])) "+
+			"ORDER BY co.name, dt.name",
+		pgx.NamedArgs{
+			"orgId":                orgID,
+			"customerOrgId":        customerOrgID,
+			"isVendor":             isVendor,
+			"partnerOrgId":         partnerOrgID,
+			"filterActive":         filter.Internal || len(filter.CustomerOrganizationIDs) > 0,
+			"filterInternal":       filter.Internal,
+			"filterCustomerOrgIds": filter.CustomerOrganizationIDs,
+		},
+	); err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	} else if result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.DeploymentTargetFull]); err != nil {
+		return nil, fmt.Errorf("failed to get DeploymentTargets: %w", err)
+	} else {
+		for i := range result {
+			if err := addDeploymentsToTarget(ctx, &result[i]); err != nil {
+				return nil, err
+			}
+		}
+		return result, nil
+	}
+}
+
+func GetDeploymentTargetsByScope(
+	ctx context.Context,
+	orgID uuid.UUID,
+	customerOrgID *uuid.UUID,
+) ([]types.DeploymentTarget, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT`+deploymentTargetOutputExprBase+`
+		FROM DeploymentTarget dt
+		JOIN Organization o ON o.id = dt.organization_id AND o.deleted_at IS NULL
+		WHERE (
+				@customerOrgID::uuid IS NOT NULL
+				AND dt.organization_id = @orgID
+				AND dt.customer_organization_id = @customerOrgID
+			) OR (
+				@customerOrgID::uuid IS NULL
+				AND dt.organization_id = @orgID
+				AND dt.customer_organization_id IS NULL
+			)
+		ORDER BY dt.name`,
+		pgx.NamedArgs{"orgID": orgID, "customerOrgID": customerOrgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.DeploymentTarget])
+	if err != nil {
+		return nil, fmt.Errorf("failed to get DeploymentTargets: %w", err)
+	}
+	return result, nil
+}
+
+func CountDeploymentTargets(ctx context.Context, orgID uuid.UUID, customerOrgID *uuid.UUID) (int64, error) {
+	db := internalctx.GetDb(ctx)
+
+	rows, err := db.Query(ctx,
+		`SELECT count(*)
+		FROM DeploymentTarget
+		WHERE organization_id = @orgId
+			AND (customer_organization_id = @customerOrgId
+		    OR (@vendorOwned AND customer_organization_id is null))`,
+		pgx.NamedArgs{
+			"orgId":         orgID,
+			"customerOrgId": customerOrgID,
+			"vendorOwned":   customerOrgID == nil,
+		},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("failed to count DeploymentTargets: %w", err)
+	}
+
+	if count, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64]); err != nil {
+		return 0, fmt.Errorf("failed to count DeploymentTargets: %w", err)
+	} else {
+		return count, nil
+	}
+}
+
+func GetDeploymentTarget(
+	ctx context.Context,
+	id uuid.UUID,
+	orgID *uuid.UUID,
+	partnerOrgID *uuid.UUID,
+) (*types.DeploymentTargetFull, error) {
+	db := internalctx.GetDb(ctx)
+	query := "SELECT" + deploymentTargetFullOutputExpr + "FROM" + deploymentTargetFromExpr +
+		" WHERE dt.id = @id "
+	args := pgx.NamedArgs{"id": id}
+	if orgID != nil {
+		query += " AND dt.organization_id = @orgId"
+		args["orgId"] = *orgID
+	}
+	if partnerOrgID != nil {
+		query += " AND co.partner_organization_id = @partnerOrgId"
+		args["partnerOrgId"] = *partnerOrgID
+	}
+	rows, err := db.Query(ctx, query, args)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	}
+	result, err := pgx.CollectOneRow(rows, pgx.RowToStructByPos[types.DeploymentTargetFull])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get DeploymentTarget: %w", err)
+	} else {
+		return &result, addDeploymentsToTarget(ctx, &result)
+	}
+}
+
+func GetDeploymentTargetForDeploymentID(
+	ctx context.Context,
+	id uuid.UUID,
+) (*types.DeploymentTargetFull, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		fmt.Sprintf("SELECT %v FROM %v JOIN Deployment d ON dt.id = d.deployment_target_id WHERE d.id = @id ",
+			deploymentTargetFullOutputExpr, deploymentTargetFromExpr),
+		pgx.NamedArgs{"id": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.DeploymentTargetFull])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("failed to get DeploymentTarget: %w", err)
+	} else {
+		return &result, addDeploymentsToTarget(ctx, &result)
+	}
+}
+
+func CreateDeploymentTarget(
+	ctx context.Context,
+	dt *types.DeploymentTargetFull,
+	orgID, createdByID uuid.UUID,
+	customerOrgID *uuid.UUID,
+) error {
+	dt.OrganizationID = orgID
+
+	db := internalctx.GetDb(ctx)
+	args := pgx.NamedArgs{
+		"name":                  dt.Name,
+		"type":                  dt.Type,
+		"orgId":                 dt.OrganizationID,
+		"namespace":             dt.Namespace,
+		"scope":                 dt.Scope,
+		"controllerVersionId":   dt.ControllerVersionID,
+		"metricsEnabled":        dt.MetricsEnabled,
+		"imageCleanupEnabled":   dt.ImageCleanupEnabled,
+		"deploymentLogsEnabled": dt.DeploymentLogsEnabled,
+		"deploymentLogsAfter":   dt.DeploymentLogsAfter,
+		"autohealEnabled":       dt.AutohealEnabled,
+		"automaticUpdates":      dt.AutomaticUpdatesEnabled,
+		"customerOrgId":         customerOrgID,
+		"dockerEndpoint":        dt.DockerEndpoint,
+	}
+
+	if dt.Resources != nil {
+		args["resourcesCpuRequest"] = dt.Resources.CPURequest
+		args["resourcesMemoryRequest"] = dt.Resources.MemoryRequest
+		args["resourcesCpuLimit"] = dt.Resources.CPULimit
+		args["resourcesMemoryLimit"] = dt.Resources.MemoryLimit
+	}
+
+	rows, err := db.Query(
+		ctx,
+		`WITH inserted AS (
+			INSERT INTO DeploymentTarget
+			(name, type, organization_id, namespace, scope, controller_version_id, metrics_enabled,
+				image_cleanup_enabled, deployment_logs_enabled, deployment_logs_after, autoheal_enabled,
+				automatic_updates_enabled, customer_organization_id, resources_cpu_request, resources_memory_request,
+				resources_cpu_limit, resources_memory_limit, docker_endpoint)
+			VALUES (@name, @type, @orgId, @namespace, @scope, @controllerVersionId, @metricsEnabled, @imageCleanupEnabled,
+				@deploymentLogsEnabled, @deploymentLogsAfter, @autohealEnabled, @automaticUpdates,
+				@customerOrgId, @resourcesCpuRequest, @resourcesMemoryRequest, @resourcesCpuLimit,
+				@resourcesMemoryLimit, @dockerEndpoint)
+			RETURNING *
+		)
+		SELECT `+deploymentTargetFullOutputExpr+` FROM inserted dt`+deploymentTargetJoinExpr,
+		args,
+	)
+	if err != nil {
+		return fmt.Errorf("failed to query DeploymentTargets: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.DeploymentTargetFull])
+	if err != nil {
+		return fmt.Errorf("could not save DeploymentTarget: %w", err)
+	} else {
+		*dt = result
+		return addDeploymentsToTarget(ctx, dt)
+	}
+}
+
+func UpdateDeploymentTarget(ctx context.Context, dt *types.DeploymentTargetFull, orgID uuid.UUID) error {
+	controllerUpdateStr := ""
+	db := internalctx.GetDb(ctx)
+	args := pgx.NamedArgs{
+		"id":                    dt.ID,
+		"name":                  dt.Name,
+		"orgId":                 orgID,
+		"metricsEnabled":        dt.MetricsEnabled,
+		"imageCleanupEnabled":   dt.ImageCleanupEnabled,
+		"deploymentLogsEnabled": dt.DeploymentLogsEnabled,
+		"deploymentLogsAfter":   dt.DeploymentLogsAfter,
+		"automaticUpdates":      dt.AutomaticUpdatesEnabled,
+		"dockerEndpoint":        dt.DockerEndpoint,
+	}
+	if dt.ControllerVersionID != nil {
+		args["controllerVersionId"] = dt.ControllerVersionID
+		controllerUpdateStr = ", controller_version_id = @controllerVersionId "
+	}
+	if dt.Resources != nil {
+		args["cpuRequest"] = dt.Resources.CPURequest
+		args["cpuLimit"] = dt.Resources.CPULimit
+		args["memoryRequest"] = dt.Resources.MemoryRequest
+		args["memoryLimit"] = dt.Resources.MemoryLimit
+	}
+	rows, err := db.Query(ctx,
+		`WITH updated AS (
+			UPDATE DeploymentTarget AS dt SET
+				name = @name,
+				metrics_enabled = @metricsEnabled,
+				image_cleanup_enabled = @imageCleanupEnabled,
+				deployment_logs_enabled = @deploymentLogsEnabled,
+				deployment_logs_after = @deploymentLogsAfter,
+				automatic_updates_enabled = @automaticUpdates,
+				resources_cpu_request = @cpuRequest,
+				resources_cpu_limit = @cpuLimit,
+				resources_memory_request = @memoryRequest,
+				resources_memory_limit = @memoryLimit,
+				docker_endpoint = @dockerEndpoint `+controllerUpdateStr+`
+			WHERE id = @id AND organization_id = @orgId RETURNING *
+		)
+		SELECT `+deploymentTargetFullOutputExpr+` FROM updated dt`+deploymentTargetJoinExpr,
+		args)
+	if err != nil {
+		return fmt.Errorf("could not update DeploymentTarget: %w", err)
+	} else if updated, err := pgx.CollectExactlyOneRow(
+		rows, pgx.RowToStructByPos[types.DeploymentTargetFull],
+	); err != nil {
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok &&
+			pgErr.Code == pgerrcode.ForeignKeyViolation &&
+			pgErr.ConstraintName == "deploymenttarget_agent_version_id_fkey" {
+			return distrerr.NewBadRequest("unknown agent version")
+		}
+		return fmt.Errorf("could not get updated DeploymentTarget: %w", err)
+	} else {
+		*dt = updated
+		return addDeploymentsToTarget(ctx, dt)
+	}
+}
+
+func DeleteDeploymentTargetWithID(ctx context.Context, id uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	if cmd, err := db.Exec(ctx, `DELETE FROM DeploymentTarget WHERE id = @id`, pgx.NamedArgs{"id": id}); err != nil {
+		return err
+	} else if cmd.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	} else {
+		return nil
+	}
+}
+
+// UpdateDeploymentTargetPendingAccess replaces the pending secret and leaves the active one untouched, so the
+// controller using it keeps working until the new secret is used to log in.
+func UpdateDeploymentTargetPendingAccess(ctx context.Context, dt *types.DeploymentTarget, orgID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"UPDATE DeploymentTarget AS dt "+
+			"SET pending_access_key_salt = @pendingAccessKeySalt, pending_access_key_hash = @pendingAccessKeyHash "+
+			"WHERE id = @id AND organization_id = @orgId RETURNING "+
+			deploymentTargetOutputExprBase,
+		pgx.NamedArgs{
+			"pendingAccessKeySalt": dt.PendingAccessKeySalt,
+			"pendingAccessKeyHash": dt.PendingAccessKeyHash,
+			"id":                   dt.ID,
+			"orgId":                orgID,
+		})
+	if err != nil {
+		return fmt.Errorf("could not update DeploymentTarget: %w", err)
+	} else if updated, err := pgx.CollectExactlyOneRow(
+		rows, pgx.RowToStructByPos[types.DeploymentTarget],
+	); err != nil {
+		return fmt.Errorf("could not get updated DeploymentTarget: %w", err)
+	} else {
+		*dt = updated
+		return nil
+	}
+}
+
+func DeleteDeploymentTargetPendingAccess(ctx context.Context, id uuid.UUID, orgID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	if cmd, err := db.Exec(ctx,
+		`UPDATE DeploymentTarget SET
+			pending_access_key_salt = NULL,
+			pending_access_key_hash = NULL
+		WHERE id = @id
+			AND organization_id = @orgId
+			AND pending_access_key_hash IS NOT NULL
+			AND access_key_hash IS NOT NULL`,
+		pgx.NamedArgs{"id": id, "orgId": orgID},
+	); err != nil {
+		return fmt.Errorf("could not delete pending access key: %w", err)
+	} else if cmd.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	} else {
+		return nil
+	}
+}
+
+// PromoteDeploymentTargetPendingAccessKey makes the pending secret the active one. It returns
+// [distrerr.ErrNotFound] if the pending secret no longer has the given hash, i.e. it was replaced after the caller
+// verified it.
+func PromoteDeploymentTargetPendingAccessKey(ctx context.Context, id uuid.UUID, pendingAccessKeyHash []byte) error {
+	db := internalctx.GetDb(ctx)
+	if cmd, err := db.Exec(ctx,
+		`UPDATE DeploymentTarget SET
+			access_key_salt = pending_access_key_salt,
+			access_key_hash = pending_access_key_hash,
+			pending_access_key_salt = NULL,
+			pending_access_key_hash = NULL
+		WHERE id = @id AND pending_access_key_hash = @pendingAccessKeyHash`,
+		pgx.NamedArgs{"id": id, "pendingAccessKeyHash": pendingAccessKeyHash},
+	); err != nil {
+		return fmt.Errorf("could not promote pending access key: %w", err)
+	} else if cmd.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	} else {
+		return nil
+	}
+}
+
+func UpdateDeploymentTargetReportedControllerVersionID(
+	ctx context.Context,
+	dt *types.DeploymentTargetFull,
+	controllerVersionID uuid.UUID,
+) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`WITH updated AS (
+			UPDATE DeploymentTarget AS dt
+			SET reported_controller_version_id = @controllerVersionId
+			WHERE id = @id
+			RETURNING *
+		)
+		SELECT`+deploymentTargetFullOutputExpr+`FROM updated dt`+deploymentTargetJoinExpr,
+		pgx.NamedArgs{"id": dt.ID, "controllerVersionId": controllerVersionID},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update DeploymentTarget: %w", err)
+	}
+
+	if updated, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.DeploymentTargetFull]); err != nil {
+		return fmt.Errorf("could not scan DeploymentTarget: %w", err)
+	} else {
+		*dt = updated
+		return nil
+	}
+}
+
+func addDeploymentsToTarget(ctx context.Context, dt *types.DeploymentTargetFull) error {
+	if d, err := GetDeploymentsForDeploymentTarget(ctx, dt.ID); errors.Is(err, distrerr.ErrNotFound) {
+		return nil
+	} else if err != nil {
+		return err
+	} else {
+		dt.Deployments = d
+		return nil
+	}
+}

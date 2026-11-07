@@ -1,0 +1,361 @@
+---
+title: Configuration Reference
+description: Complete reference of all environment variables used to configure a self-hosted Distr instance, grouped by area.
+slug: docs/self-hosting/configuration
+sidebar:
+  label: Configuration Reference
+  order: 4
+---
+
+import {Aside} from '@astrojs/starlight/components';
+
+This page lists all environment variables used to configure a self-hosted Distr instance.
+Variables marked as **required** must be set for Distr to start (some are only required when a related feature is enabled).
+Durations use Go's duration syntax (e.g. `5s`, `10m`, `24h`) and cron values use standard cron syntax (e.g. `0 * * * *`).
+
+<Aside type="tip">
+  When `DISTR_ENV` is set, Distr loads the referenced dotenv file and an
+  optional `<DISTR_ENV>.secret` file on startup, in addition to variables
+  already present in the environment.
+</Aside>
+
+## General
+
+| Variable                              | Required | Default   | Description                                                                                                                                                             |
+| ------------------------------------- | -------- | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `DATABASE_URL`                        | yes      | —         | PostgreSQL connection string (e.g. `postgres://user:pass@host:5432/distr`).                                                                                             |
+| `DATABASE_MAX_CONNS`                  | no       | —         | Overrides the maximum number of connections in the pgx pool.                                                                                                            |
+| `JWT_SECRET`                          | yes      | —         | Base64-encoded secret every token is signed with, see [Security & Encryption](/docs/self-hosting/security#jwt-signing-secret). Generate with `openssl rand -base64 32`. |
+| `DATABASE_ENCRYPTION_KEY`             | yes      | —         | Base64-encoded key that sensitive database columns are encrypted with, see [Security & Encryption](/docs/self-hosting/security#database-encryption).                    |
+| `DATABASE_ENCRYPTION_MIGRATE_ON_BOOT` | no       | `false`   | Encrypt values that are still stored in plaintext during startup. Single instance deployments only.                                                                     |
+| `DISTR_HOST`                          | yes      | —         | Base URL of your Distr instance. Its scheme is used for every link, callback URL and email.                                                                             |
+| `DISTR_ENV`                           | no       | —         | Path to a dotenv file to load on startup (a matching `.secret` file is also loaded if present).                                                                         |
+| `REGISTRATION`                        | no       | `enabled` | Sign-up mode, see below: `enabled`, `hidden` or `disabled`.                                                                                                             |
+| `BLOCKED_EMAIL_DOMAINS`               | no       | —         | Comma-separated email domains that cannot sign up, log in or reset a password, see [Blocklists](#blocklists).                                                           |
+| `BLOCKED_IPS`                         | no       | —         | Comma-separated IP addresses and CIDR ranges that cannot sign up, log in or reset a password, see [Blocklists](#blocklists).                                            |
+| `USER_EMAIL_VERIFICATION_REQUIRED`    | no       | `true`    | Whether new users must verify their email address before signing in.                                                                                                    |
+| `SERVER_SHUTDOWN_DELAY_DURATION`      | no       | —         | Delay between receiving a shutdown signal and stopping the server (useful for rolling deploys).                                                                         |
+| `ENABLE_QUERY_LOGGING`                | no       | `false`   | Logs all database queries. Intended for debugging only.                                                                                                                 |
+| `MAINTENANCE_MODE`                    | no       | `false`   | Answers every API and registry request with 503, see below. The frontend keeps being served.                                                                            |
+| `SUPPORT_EMAIL`                       | no       | —         | Address users can contact for help, offered as a `mailto:` link where the frontend mentions support. Unset means support is mentioned without a link.                   |
+| `REGISTRATION_LEGAL_TEXT`             | no       | —         | Markdown shown below the sign-up buttons on the registration page, e.g. links to your terms. Links open in a new tab.                                                   |
+
+### Sign-up modes
+
+`REGISTRATION` accepts three values:
+
+- `enabled`: the login page links to the registration page and anyone can sign up.
+- `hidden`: the link is removed from the login page, but the registration page stays reachable at `/register` and
+  sign-ups still succeed. Use it when you want to hand out the registration URL yourself instead of offering it to
+  every visitor.
+- `disabled`: sign-up is rejected, both on `/register` and for OIDC logins with an unknown email address. Existing
+  users can still sign in, and new users can still be added through an invitation.
+
+### Blocklists
+
+`BLOCKED_EMAIL_DOMAINS` (e.g. `example.com,spam.io`) refuses registration, password login, password resets,
+invitations, email changes and login through the built-in OIDC providers for addresses of a listed domain or any of its subdomains,
+so `example.com` also covers `mail.example.com`. Matching ignores case. Organizations' own OIDC providers are not
+affected.
+
+`BLOCKED_IPS` (e.g. `203.0.113.7,198.51.100.0/24,2001:db8::/32`) refuses every request to the sign-up, login and
+password reset endpoints whose client IP is a listed address or lies in a listed range. Behind a reverse proxy,
+the client IP is the rightmost entry of the `X-Forwarded-For` header.
+
+Both answer with `403 Forbidden`, except a blocked email domain on a built-in OIDC login, which redirects back to the
+login page and shows the reason there.
+
+### Maintenance mode
+
+`MAINTENANCE_MODE=true` announces planned downtime instead of stopping the instance. Distr keeps serving the
+frontend, but answers every API request, including the ones from controllers, and every request to the OCI registry with
+`503 Service Unavailable`, so that nothing reaches the database while you work on it. The frontend picks that up and
+shows a maintenance page that reconnects on its own once the instance is back.
+
+The Kubernetes probes target `/`, which keeps being served, so the pod stays in its service, while `/ready` reports
+`503` for the whole maintenance window.
+
+## Key Management Service
+
+Distr unwraps `JWT_SECRET`, `DATABASE_ENCRYPTION_KEY` and `LICENSE_KEY_PRIVATE_KEY` with AWS KMS or GCP Cloud KMS
+during startup, so that no key material is kept in your configuration.
+See [Security & Encryption](/docs/self-hosting/security#key-management-service) for details.
+
+| Variable           | Required | Default | Description                                                                                                               |
+| ------------------ | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------- |
+| `KMS_AWS_KEY_ID`   | for AWS  | —       | Key ARN, key id or `alias/<name>` of the AWS KMS key. Setting it selects AWS KMS.                                         |
+| `KMS_AWS_REGION`   | no       | —       | Region of that key. Defaults to the region of `KMS_AWS_KEY_ID` when it is an ARN, then to the AWS SDK's own resolution.   |
+| `KMS_AWS_ENDPOINT` | no       | —       | Overrides the AWS KMS endpoint. Intended for testing against a local stand-in.                                            |
+| `KMS_GCP_KEY_NAME` | for GCP  | —       | Full resource name of the Cloud KMS key (`projects/…/locations/…/keyRings/…/cryptoKeys/…`). Setting it selects Cloud KMS. |
+
+## Tokens & Sessions
+
+| Variable                              | Required | Default | Description                                                                                                                     |
+| ------------------------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------------------------------------- |
+| `INVITE_TOKEN_VALID_DURATION`         | no       | `24h`   | How long user invite links remain valid.                                                                                        |
+| `RESET_TOKEN_VALID_DURATION`          | no       | `1h`    | How long password reset links remain valid.                                                                                     |
+| `CONTROLLER_TOKEN_MAX_VALID_DURATION` | no       | `24h`   | Maximum validity of a controller access token before it is refreshed. Replaces the deprecated `AGENT_TOKEN_MAX_VALID_DURATION`. |
+
+## Bot Protection
+
+Registrations can optionally be protected with a [Cloudflare Turnstile](https://www.cloudflare.com/products/turnstile/)
+widget, which blocks automated sign-ups without asking users to solve a puzzle. It is disabled unless **both**
+variables below are set: the site key renders the widget in the browser and the secret verifies its token on the
+server, so a half-configured widget could only ever reject valid registrations. Distr logs a warning and stays
+unprotected when just one of them is present.
+
+Create a widget in the Cloudflare dashboard under **Turnstile**, add the hostname of your instance to it and copy
+both keys. Turnstile does not require your instance to be proxied through Cloudflare. Because a widget only accepts
+challenges from its configured hostnames, registrations made through an organization's custom app domain do not show
+the widget and are not verified; they remain subject to the rate limits of the authentication endpoints.
+
+| Variable             | Required                | Default | Description                                                                        |
+| -------------------- | ----------------------- | ------- | ---------------------------------------------------------------------------------- |
+| `TURNSTILE_SITE_KEY` | if `TURNSTILE_SECRET`   | —       | Public site key of the Turnstile widget, rendered on the registration form.        |
+| `TURNSTILE_SECRET`   | if `TURNSTILE_SITE_KEY` | —       | Secret key used to verify tokens with Cloudflare's siteverify API. Keep it secret. |
+
+## Controllers
+
+Distr still reads every controller variable under its deprecated `AGENT_*` name when the new one is unset, and logs a
+warning on startup for each one it found that way.
+
+| Variable                      | Required | Default                  | Description                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+| ----------------------------- | -------- | ------------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `CONTROLLER_HOST`             | no       | —                        | Host (and optional port, no scheme) controllers and connect commands reach this instance at, taking precedence over an organization's custom app domain. Its scheme is taken from `DISTR_HOST`. Unset, controllers use the organization's custom app domain if it has one and `DISTR_HOST` otherwise. Replaces the deprecated `AGENT_HOST`.                                                                                                                                                                                                                                                                     |
+| `CONTROLLER_INTERVAL`         | no       | `5s`                     | Interval at which controllers poll Distr for updates. Replaces the deprecated `AGENT_INTERVAL`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                 |
+| `CONTROLLER_DOCKER_CONFIG`    | no       | —                        | Base64-encoded Docker config JSON provided to Docker controllers for registry authentication. Replaces the deprecated `AGENT_DOCKER_CONFIG`.                                                                                                                                                                                                                                                                                                                                                                                                                                                                    |
+| `CONTROLLER_IMAGE_REPOSITORY` | no       | `ghcr.io/distr-sh/distr` | Registry host and optional path the controller images (`docker-controller`, `kubernetes-controller` and `docker-autoheal`) are pulled from, e.g. `registry.distr.example.com/distr` for the Distr registry. The image names and tags cannot be changed, so the registry has to host them under the same names, either publicly or with access set up on every deployment target. If the host is `REGISTRY_HOST`, organizations with a custom registry domain pull the images through that domain with the same path, e.g. `registry.vendor.com/distr`. An organization can override it in its general settings. |
+
+## Mailer
+
+Email sending is disabled unless `MAILER_TYPE` is set.
+`MAILER_SMTP_*` values only apply when `MAILER_TYPE=smtp`.
+
+| Variable                          | Required          | Default | Description                                                                                       |
+| --------------------------------- | ----------------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `MAILER_TYPE`                     | no                | —       | Mailer backend: `smtp`, `ses` or empty (disabled).                                                |
+| `MAILER_FROM_ADDRESS`             | if mailer enabled | —       | Sender address used for outgoing emails.                                                          |
+| `MAILER_SMTP_HOST`                | no                | —       | SMTP server hostname.                                                                             |
+| `MAILER_SMTP_PORT`                | if `smtp`         | —       | SMTP server port.                                                                                 |
+| `MAILER_SMTP_USERNAME`            | no                | —       | SMTP username.                                                                                    |
+| `MAILER_SMTP_PASSWORD`            | no                | —       | SMTP password.                                                                                    |
+| `MAILER_SMTP_IMPLICIT_TLS`        | no                | `false` | Use implicit TLS instead of STARTTLS (typically required on port 465).                            |
+| `NOTIFICATION_EMAIL_HOURLY_QUOTA` | no                | `120`   | Max status/metrics notification emails sent to a single address per hour. `0` disables the limit. |
+
+## OCI Registry
+
+Registry variables are only read when `REGISTRY_ENABLED=true`.
+See [Registry Configuration](/docs/registry/configuration/) for a feature overview.
+
+| Variable                                   | Required            | Default | Description                                                                                                                                                                                         |
+| ------------------------------------------ | ------------------- | ------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `REGISTRY_ENABLED`                         | no                  | `false` | Enables the built-in OCI-compatible artifact registry.                                                                                                                                              |
+| `REGISTRY_HOST`                            | if registry enabled | —       | Host (and optional port) clients use to reach the registry. Clients are sent to it with the scheme of `DISTR_HOST` to authenticate, so the registry has to be served with the same scheme as Distr. |
+| `REGISTRY_S3_BUCKET`                       | if registry enabled | —       | S3 bucket used to store registry blobs.                                                                                                                                                             |
+| `REGISTRY_S3_REGION`                       | if registry enabled | —       | S3 region of the bucket.                                                                                                                                                                            |
+| `REGISTRY_S3_CREATE_BUCKET`                | no                  | `false` | Creates the bucket on startup (requires `s3:CreateBucket`).                                                                                                                                         |
+| `REGISTRY_S3_ENDPOINT`                     | no                  | —       | Custom S3 endpoint (for MinIO or other S3-compatible storage).                                                                                                                                      |
+| `REGISTRY_S3_ACCESS_KEY_ID`                | no                  | —       | S3 access key ID (falls back to the default AWS credential chain if unset).                                                                                                                         |
+| `REGISTRY_S3_SECRET_ACCESS_KEY`            | no                  | —       | S3 secret access key.                                                                                                                                                                               |
+| `REGISTRY_S3_USE_PATH_STYLE`               | no                  | `false` | Use path-style bucket addressing (required by most non-AWS S3 implementations).                                                                                                                     |
+| `REGISTRY_S3_ALLOW_REDIRECT`               | no                  | `true`  | Allow redirecting blob downloads directly to S3.                                                                                                                                                    |
+| `REGISTRY_S3_REQUEST_CHECKSUM_CALCULATION` | no                  | `false` | Only calculate request checksums when required (compatibility with some backends).                                                                                                                  |
+| `REGISTRY_S3_RESPONSE_CHECKSUM_VALIDATION` | no                  | `false` | Only validate response checksums when required.                                                                                                                                                     |
+| `REGISTRY_RESIGN_FOR_GCP`                  | no                  | `false` | Re-sign requests for Google Cloud Storage compatibility.                                                                                                                                            |
+| `REGISTRY_SCRATCH_DIR`                     | no                  | —       | Directory used for temporary files during uploads.                                                                                                                                                  |
+| `ARTIFACT_TAGS_DEFAULT_LIMIT_PER_ORG`      | no                  | `0`     | Default maximum number of artifact tags per organization. `0` means unlimited.                                                                                                                      |
+| `REGISTRY_UPSTREAM_SYNC_CRON`              | no                  | —       | Cron schedule for syncing tags from upstream registries (pull-through cache).                                                                                                                       |
+| `REGISTRY_UPSTREAM_SYNC_TIMEOUT`           | no                  | `10m`   | Timeout for a single upstream sync run.                                                                                                                                                             |
+| `REGISTRY_UPSTREAM_BLOB_FETCH_TIMEOUT`     | no                  | `1h`    | Timeout for fetching and storing a single blob from an upstream registry on pull.                                                                                                                   |
+
+### Anonymous pull rate limits
+
+These limit what a single client IP address may pull from [public
+artifacts](/docs/registry/#public-artifacts) without credentials. Authenticated pulls are not rate
+limited. A value of `0` disables the limit it stands for. The limits are counted per Distr replica
+and in memory, so they reset on a rollout and a client spread across replicas may exceed them by up
+to a factor of the replica count.
+
+| Variable                                            | Required | Default | Description                                                  |
+| --------------------------------------------------- | -------- | ------- | ------------------------------------------------------------ |
+| `REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_MINUTE` | no       | `10`    | Anonymous manifest and tag list requests per IP, per minute. |
+| `REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_HOUR`   | no       | `30`    | Anonymous manifest and tag list requests per IP, per hour.   |
+| `REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_MINUTE`     | no       | `60`    | Anonymous blob requests per IP, per minute.                  |
+| `REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_HOUR`       | no       | `300`   | Anonymous blob requests per IP, per hour.                    |
+
+## Custom Domains
+
+Custom domain self-service lets vendor organizations serve Distr under their own domains.
+It requires an edge proxy with on-demand TLS (e.g. Caddy, included in the Helm chart) in front of Distr.
+The feature is only offered in the UI when `CUSTOM_DOMAIN_TARGET` is set.
+
+A domain is only used for links, mails, controller manifests and registry URLs once a CNAME check has
+found it to point at the CNAME target; until then the organization keeps the default host. The check runs
+when a domain is registered, can be triggered from the organization settings and needs to be
+[scheduled](/docs/self-hosting/maintenance#custom-domain-verification) so that domains recover on
+their own once a record is fixed. Serving requests on a domain does not depend on the check.
+
+| Variable                                   | Required | Default | Description                                                                                                                      |
+| ------------------------------------------ | -------- | ------- | -------------------------------------------------------------------------------------------------------------------------------- |
+| `CUSTOM_DOMAIN_TARGET`                     | no       | —       | Hostname customers point every custom domain's CNAME record at (e.g. `whitelabel.distr.sh`). Enables custom domain self-service. |
+| `CUSTOM_DOMAIN_VERIFICATION_CRON`          | no       | —       | Cron schedule of the built-in domain verification job. If unset, no verification is scheduled in Distr.                          |
+| `CUSTOM_DOMAIN_VERIFICATION_TIMEOUT`       | no       | `4m`    | Timeout for a single verification run. Must be greater than `0`.                                                                 |
+| `CUSTOM_DOMAIN_VERIFICATION_REFRESH_AFTER` | no       | `12h`   | How long a verified domain is left alone before it is checked again. Failing domains are checked on every run.                   |
+| `INTERNAL_SERVER_ADDR`                     | no       | `:8085` | Listen address of the internal server exposing the Caddy on-demand TLS ask endpoint. Never expose it outside the cluster.        |
+
+## Support Bundles
+
+| Variable                            | Required | Default   | Description                                                                                                                                                                                                                                                                                                            |
+| ----------------------------------- | -------- | --------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SUPPORT_BUNDLE_RESOURCE_MAX_BYTES` | no       | `1048576` | Maximum size of a single resource collected by the support bundle collect script, e.g. the logs of one container or the output of one script.                                                                                                                                                                          |
+| `SUPPORT_BUNDLE_LOG_TAIL_LINES`     | no       | `1000`    | Number of container log lines collected per container. The most recent lines are kept, and `SUPPORT_BUNDLE_RESOURCE_MAX_BYTES` still applies on top.                                                                                                                                                                   |
+| `SUPPORT_BUNDLE_SCRIPT_TIMEOUT`     | no       | `1m`      | How long a single custom script may run on the customer's host before the collect script stops it. Must be greater than `0`.                                                                                                                                                                                           |
+| `SUPPORT_COLLECTOR_DOWNLOAD_URL`    | no       | —         | URL the Kubernetes collect script downloads the support collector from, in place of the GitHub release of this Distr version. It has to serve the release assets `support-collector-<os>-<arch>.tar.gz` and `support-collector-checksums.txt` under their names, e.g. a mirror for customers that cannot reach GitHub. |
+
+## Log Processing (Loki)
+
+Deployment and deployment target log records are stored in [Grafana Loki](https://grafana.com/oss/loki/).
+All shipped deployment methods (Docker Compose and the Helm chart) include a preconfigured
+Loki instance with a time-based retention of 30 days. Log retention is managed entirely by
+the Loki configuration (`limits_config.retention_period`).
+
+| Variable                   | Required | Default | Description                                                                                       |
+| -------------------------- | -------- | ------- | ------------------------------------------------------------------------------------------------- |
+| `LOKI_URL`                 | yes      | —       | Base URL of the Loki instance, e.g. `http://loki:3100`.                                           |
+| `LOKI_BEARER_TOKEN`        | no       | —       | Bearer token for authenticating against Loki.                                                     |
+| `LOKI_BASIC_AUTH_USERNAME` | no       | —       | Username for basic authentication against Loki. Ignored when `LOKI_BEARER_TOKEN` is set.          |
+| `LOKI_BASIC_AUTH_PASSWORD` | no       | —       | Password for basic authentication against Loki. Only used when `LOKI_BASIC_AUTH_USERNAME` is set. |
+| `LOKI_REQUEST_TIMEOUT`     | no       | `30s`   | Timeout for a single Loki HTTP request.                                                           |
+
+## Scheduled Jobs & Retention
+
+These control the built-in job scheduler and retention limits.
+See [Maintenance Jobs](/docs/self-hosting/maintenance/) for details and Kubernetes CronJob alternatives.
+If a `*_CRON` variable is unset, the corresponding job is not scheduled. For the timeout variables listed below,
+`0` means no timeout.
+
+| Variable                                    | Required | Default | Description                                                                 |
+| ------------------------------------------- | -------- | ------- | --------------------------------------------------------------------------- |
+| `METRICS_ENTRIES_MAX_AGE`                   | no       | —       | Max age of deployment target metrics entries before cleanup removes them.   |
+| `CLEANUP_DEPLOYMENT_TARGET_METRICS_CRON`    | no       | —       | Cron schedule for pruning deployment target metrics.                        |
+| `CLEANUP_DEPLOYMENT_TARGET_METRICS_TIMEOUT` | no       | `0`     | Timeout for the metrics cleanup run.                                        |
+| `CLEANUP_OIDC_STATE_CRON`                   | no       | —       | Cron schedule for pruning expired OIDC state entries.                       |
+| `CLEANUP_OIDC_STATE_CRON_TIMEOUT`           | no       | `0`     | Timeout for the OIDC state cleanup run.                                     |
+| `CLEANUP_ARTIFACT_BLOB_CRON`                | no       | —       | Cron schedule for pruning unreferenced registry blobs from S3.              |
+| `CLEANUP_ARTIFACT_BLOB_TIMEOUT`             | no       | `0`     | Timeout for the artifact blob cleanup run.                                  |
+| `CLEANUP_ARTIFACT_BLOB_MIN_AGE`             | no       | `24h`   | Minimum age of an unreferenced blob before it is eligible for deletion.     |
+| `CLEANUP_ORGANIZATION_CRON`                 | no       | —       | Cron schedule for permanently deleting soft-deleted organizations.          |
+| `CLEANUP_ORGANIZATION_TIMEOUT`              | no       | `0`     | Timeout for the organization cleanup run.                                   |
+| `CLEANUP_ORGANIZATION_MIN_AGE`              | no       | `720h`  | Retention period before a soft-deleted organization is permanently deleted. |
+| `CLEANUP_USER_ACCOUNT_CRON`                 | no       | —       | Cron schedule for deleting user accounts that belong to no organization.    |
+| `CLEANUP_USER_ACCOUNT_TIMEOUT`              | no       | `0`     | Timeout for the user account cleanup run.                                   |
+| `CLEANUP_USER_ACCOUNT_MIN_AGE`              | no       | `720h`  | Time since the last login, or creation if never logged in, before deletion. |
+| `CLEANUP_FILE_CRON`                         | no       | —       | Cron schedule for deleting files that nothing references any more.          |
+| `CLEANUP_FILE_TIMEOUT`                      | no       | `0`     | Timeout for the file cleanup run.                                           |
+| `CLEANUP_FILE_MIN_AGE`                      | no       | `24h`   | Minimum age of an unreferenced file before it is deleted.                   |
+| `DEPLOYMENT_STATUS_NOTIFICATION_CRON`       | no       | —       | Cron schedule for sending deployment status notification emails.            |
+| `DEPLOYMENT_STATUS_NOTIFICATION_TIMEOUT`    | no       | `0`     | Timeout for the deployment status notification run.                         |
+
+## OIDC Authentication
+
+Each provider is enabled independently and its credentials are only required when it is enabled.
+
+| Variable                                        | Required           | Default | Description                                                                        |
+| ----------------------------------------------- | ------------------ | ------- | ---------------------------------------------------------------------------------- |
+| `OIDC_GITHUB_ENABLED`                           | no                 | `false` | Enables GitHub sign-in.                                                            |
+| `OIDC_GITHUB_CLIENT_ID`                         | if GitHub enabled  | —       | GitHub OAuth App client ID.                                                        |
+| `OIDC_GITHUB_CLIENT_SECRET`                     | if GitHub enabled  | —       | GitHub OAuth App client secret.                                                    |
+| `OIDC_GOOGLE_ENABLED`                           | no                 | `false` | Enables Google sign-in.                                                            |
+| `OIDC_GOOGLE_CLIENT_ID`                         | if Google enabled  | —       | Google OAuth 2.0 client ID.                                                        |
+| `OIDC_GOOGLE_CLIENT_SECRET`                     | if Google enabled  | —       | Google OAuth 2.0 client secret.                                                    |
+| `OIDC_MICROSOFT_ENABLED`                        | no                 | `false` | Enables Microsoft (Entra ID) sign-in.                                              |
+| `OIDC_MICROSOFT_CLIENT_ID`                      | if MS enabled      | —       | Entra ID application (client) ID.                                                  |
+| `OIDC_MICROSOFT_CLIENT_SECRET`                  | if MS enabled      | —       | Entra ID client secret.                                                            |
+| `OIDC_MICROSOFT_TENANT_ID`                      | if MS enabled      | —       | Directory (tenant) ID, or `common`/`organizations`/`consumers`.                    |
+| `OIDC_GENERIC_ENABLED`                          | no                 | `false` | Enables a generic OIDC provider.                                                   |
+| `OIDC_GENERIC_CLIENT_ID`                        | if generic enabled | —       | Client ID issued by the provider.                                                  |
+| `OIDC_GENERIC_CLIENT_SECRET`                    | if generic enabled | —       | Client secret issued by the provider.                                              |
+| `OIDC_GENERIC_ISSUER`                           | if generic enabled | —       | Issuer URL exposing `/.well-known/openid-configuration`.                           |
+| `OIDC_GENERIC_SCOPES`                           | if generic enabled | —       | Comma- or space-separated scopes (e.g. `email,profile`); `openid` is always added. |
+| `OIDC_GENERIC_PKCE_ENABLED`                     | no                 | `false` | Enables PKCE (`S256`) for the generic provider.                                    |
+| `WELLKNOWN_MICROSOFT_IDENTITY_ASSOCIATION_JSON` | no                 | —       | Base64-encoded JSON served at `/.well-known/microsoft-identity-association.json`.  |
+
+Every provider needs a callback URL registered at the identity provider. It is built from `DISTR_HOST` and must match
+exactly, including the scheme:
+
+| Provider             | Callback URL                                       | Where to register it                                                                                                                     |
+| -------------------- | -------------------------------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------- |
+| Google               | `{DISTR_HOST}/api/v1/auth/oidc/google/callback`    | [Google Cloud Console](https://console.cloud.google.com/apis/credentials), as an authorized redirect URI of a **Web application** client |
+| GitHub               | `{DISTR_HOST}/api/v1/auth/oidc/github/callback`    | [GitHub OAuth Apps](https://github.com/settings/developers), as the **Authorization callback URL**                                       |
+| Microsoft (Entra ID) | `{DISTR_HOST}/api/v1/auth/oidc/microsoft/callback` | [Microsoft Entra admin center](https://entra.microsoft.com/), as a **Web** redirect URI of an app registration                           |
+| Generic              | `{DISTR_HOST}/api/v1/auth/oidc/generic/callback`   | at your provider, which must expose a `/.well-known/openid-configuration` document                                                       |
+
+With GitHub, only the primary and verified email address is accepted, so a user whose primary address is unverified
+there cannot sign in.
+
+The first sign-in connects the identity the provider reports (its issuer and the `sub` claim, or the numeric user ID
+for GitHub) to the Distr account, and every later sign-in is matched on that identity rather than on the email address,
+so the account survives an email change at the provider. Users see and disconnect their connections under **User
+Settings → Connected identities**. A sign-in started on the sign-up page creates an account and an organization for an
+unknown email address; invite the user beforehand to place them in an existing organization instead, or set
+`REGISTRATION=disabled` (see [Sign-up modes](#sign-up-modes)) to reject unknown addresses.
+
+Vendor organizations on the Business plan can also configure their own providers in the UI, which requires no
+instance configuration. Those issuer URLs are entered by organization administrators and fetched by Distr, so they
+must be `https` and must not resolve to a private network address. Both restrictions are lifted when `DISTR_HOST` is an
+`http` URL, so that an instance running locally can be developed against an identity provider next to it. An operator
+whose identity provider only exists inside their own network configures it as the instance-wide generic provider above
+instead.
+
+## Observability
+
+Tracing and error reporting via Sentry and OpenTelemetry.
+Sampler variables accept `always_on`, `always_off`, `traceidratio`, `parentbased_always_on`, `parentbased_always_off` or `parentbased_traceidratio`.
+
+| Variable                       | Required | Default | Description                                                                                                            |
+| ------------------------------ | -------- | ------- | ---------------------------------------------------------------------------------------------------------------------- |
+| `SENTRY_DSN`                   | no       | —       | Sentry DSN for backend error reporting.                                                                                |
+| `SENTRY_DEBUG`                 | no       | `false` | Enables Sentry debug logging.                                                                                          |
+| `SENTRY_ENVIRONMENT`           | no       | —       | Environment name reported to Sentry (e.g. `production`).                                                               |
+| `OTEL_EXPORTER_SENTRY_ENABLED` | no       | `false` | Exports OpenTelemetry traces to Sentry.                                                                                |
+| `OTEL_EXPORTER_OTLP_ENABLED`   | no       | `false` | Exports OpenTelemetry traces via OTLP (configured with standard `OTEL_*` variables).                                   |
+| `OTEL_CONTROLLER_SAMPLER`      | no       | —       | Trace sampler used for controller requests. Replaces the deprecated `OTEL_AGENT_SAMPLER`.                              |
+| `OTEL_CONTROLLER_SAMPLER_ARG`  | no       | `1.0`   | Argument for the controller sampler (e.g. ratio for `traceidratio`). Replaces the deprecated `OTEL_AGENT_SAMPLER_ARG`. |
+| `OTEL_REGISTRY_SAMPLER`        | no       | —       | Trace sampler used for registry requests.                                                                              |
+| `OTEL_REGISTRY_SAMPLER_ARG`    | no       | `1.0`   | Argument for the registry sampler.                                                                                     |
+
+## Prometheus Metrics
+
+Exposes an internal Prometheus metrics endpoint.
+See [Prometheus Integration](/docs/self-hosting/prometheus/) for details.
+
+| Variable                | Required | Default | Description                                                                    |
+| ----------------------- | -------- | ------- | ------------------------------------------------------------------------------ |
+| `METRICS_ENABLED`       | no       | `false` | Enables the Prometheus metrics endpoint.                                       |
+| `METRICS_ADDR`          | no       | `:3000` | Address the metrics endpoint listens on.                                       |
+| `METRICS_BEARER_TOKEN`  | no       | —       | Bearer token required to scrape the metrics endpoint, if set.                  |
+| `METRICS_PPROF_ENABLED` | no       | `false` | Serves Go runtime profiles under `/debug/pprof/` next to the metrics endpoint. |
+
+## Frontend
+
+These values are injected into the compiled frontend at runtime.
+
+| Variable                            | Required | Default | Description                                       |
+| ----------------------------------- | -------- | ------- | ------------------------------------------------- |
+| `FRONTEND_SENTRY_DSN`               | no       | —       | Sentry DSN for frontend error reporting.          |
+| `FRONTEND_SENTRY_TRACE_SAMPLE_RATE` | no       | —       | Frontend trace sample rate (`0.0`–`1.0`).         |
+| `FRONTEND_POSTHOG_TOKEN`            | no       | —       | PostHog project API token for frontend analytics. |
+| `FRONTEND_POSTHOG_API_HOST`         | no       | —       | PostHog API host.                                 |
+| `FRONTEND_POSTHOG_UI_HOST`          | no       | —       | PostHog UI host.                                  |
+
+## Licensing & Billing
+
+Options relevant to Distr Pro and hosted billing.
+
+| Variable                                   | Required | Default | Description                                                                                                                               |
+| ------------------------------------------ | -------- | ------- | ----------------------------------------------------------------------------------------------------------------------------------------- |
+| `LICENSE_KEY`                              | no       | —       | Distr license key unlocking the plan it was issued for.                                                                                   |
+| `LICENSE_KEY_PRIVATE_KEY`                  | no       | —       | PEM-encoded private key used to sign customer license keys, see [Security & Encryption](/docs/self-hosting/security#license-signing-key). |
+| `STRIPE_API_KEY`                           | no       | —       | Stripe API key for billing integration.                                                                                                   |
+| `STRIPE_WEBHOOK_SECRET`                    | no       | —       | Secret used to verify incoming Stripe webhooks.                                                                                           |
+| `STRIPE_WEBHOOK_VERSION_MISMATCH_BEHAVIOR` | no       | `error` | Behavior on Stripe API version mismatch: `error` or `ignore`.                                                                             |

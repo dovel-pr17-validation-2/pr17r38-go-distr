@@ -1,0 +1,693 @@
+package db
+
+import (
+	"context"
+	"crypto/subtle"
+	"errors"
+	"fmt"
+	"time"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+// Configuration
+
+func GetSupportBundleConfigurationEnvVars(
+	ctx context.Context, orgID uuid.UUID,
+) ([]types.SupportBundleConfigurationEnvVar, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT organization_id, name, redacted
+		FROM SupportBundleConfigurationEnvVar
+		WHERE organization_id = @orgId
+		ORDER BY name`,
+		pgx.NamedArgs{"orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle config env vars: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleConfigurationEnvVar])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundle config env vars: %w", err)
+	}
+	return result, nil
+}
+
+func SaveSupportBundleConfigurationEnvVars(
+	ctx context.Context,
+	orgID uuid.UUID,
+	envVars []types.SupportBundleConfigurationEnvVar,
+) error {
+	return RunTxRR(ctx, func(ctx context.Context) error {
+		db := internalctx.GetDb(ctx)
+
+		if _, err := db.Exec(
+			ctx,
+			`DELETE FROM SupportBundleConfigurationEnvVar WHERE organization_id = @orgId`,
+			pgx.NamedArgs{"orgId": orgID},
+		); err != nil {
+			return fmt.Errorf("could not delete existing env vars: %w", err)
+		}
+
+		if len(envVars) > 0 {
+			_, err := db.CopyFrom(
+				ctx,
+				pgx.Identifier{"supportbundleconfigurationenvvar"},
+				[]string{"organization_id", "name", "redacted"},
+				pgx.CopyFromSlice(len(envVars), func(i int) ([]any, error) {
+					return []any{orgID, envVars[i].Name, envVars[i].Redacted}, nil
+				}),
+			)
+			if err != nil {
+				return fmt.Errorf("could not insert env vars: %w", err)
+			}
+		}
+
+		return nil
+	})
+}
+
+func ExistsSupportBundleConfigurationEnvVars(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var exists bool
+	err := db.QueryRow(
+		ctx,
+		`SELECT EXISTS(SELECT 1 FROM SupportBundleConfigurationEnvVar WHERE organization_id = @orgId)`,
+		pgx.NamedArgs{"orgId": orgID},
+	).Scan(&exists)
+	if err != nil {
+		return false, fmt.Errorf("could not check support bundle config env vars existence: %w", err)
+	}
+	return exists, nil
+}
+
+const supportBundleKubernetesConfigurationOutputExpr = `
+	c.organization_id, c.include_configmap_data, c.include_secret_data
+`
+
+func GetSupportBundleKubernetesConfiguration(
+	ctx context.Context, orgID uuid.UUID,
+) (*types.SupportBundleKubernetesConfiguration, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT `+supportBundleKubernetesConfigurationOutputExpr+`
+		FROM SupportBundleKubernetesConfiguration c
+		WHERE c.organization_id = @orgId`,
+		pgx.NamedArgs{"orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle Kubernetes configuration: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleKubernetesConfiguration])
+	if errors.Is(err, pgx.ErrNoRows) {
+		result = types.DefaultSupportBundleKubernetesConfiguration(orgID)
+	} else if err != nil {
+		return nil, fmt.Errorf("could not get support bundle Kubernetes configuration: %w", err)
+	}
+	return &result, nil
+}
+
+func UpsertSupportBundleKubernetesConfiguration(
+	ctx context.Context, config *types.SupportBundleKubernetesConfiguration,
+) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO SupportBundleKubernetesConfiguration AS c
+			(organization_id, include_configmap_data, include_secret_data)
+		VALUES (@orgId, @includeConfigMapData, @includeSecretData)
+		ON CONFLICT (organization_id) DO UPDATE SET
+			include_configmap_data = excluded.include_configmap_data,
+			include_secret_data = excluded.include_secret_data
+		RETURNING `+supportBundleKubernetesConfigurationOutputExpr,
+		pgx.NamedArgs{
+			"orgId":                config.OrganizationID,
+			"includeConfigMapData": config.IncludeConfigMapData,
+			"includeSecretData":    config.IncludeSecretData,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not upsert support bundle Kubernetes configuration: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleKubernetesConfiguration])
+	if err != nil {
+		return fmt.Errorf("could not upsert support bundle Kubernetes configuration: %w", err)
+	}
+	*config = result
+	return nil
+}
+
+const supportBundleConfigurationScriptOutputExpr = `
+	id, created_at, organization_id, deployment_type, name, description, content, enabled
+`
+
+func GetSupportBundleConfigurationScripts(
+	ctx context.Context, orgID uuid.UUID,
+) ([]types.SupportBundleConfigurationScript, error) {
+	return getSupportBundleConfigurationScripts(ctx, orgID, nil)
+}
+
+func GetEnabledSupportBundleConfigurationScripts(
+	ctx context.Context, orgID uuid.UUID, deploymentType types.DeploymentType,
+) ([]types.SupportBundleConfigurationScript, error) {
+	return getSupportBundleConfigurationScripts(ctx, orgID, &deploymentType)
+}
+
+// getSupportBundleConfigurationScripts returns every script of the organization, or only the enabled
+// scripts of enabledOfType when it is set.
+func getSupportBundleConfigurationScripts(
+	ctx context.Context, orgID uuid.UUID, enabledOfType *types.DeploymentType,
+) ([]types.SupportBundleConfigurationScript, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		fmt.Sprintf(`SELECT %v
+		FROM SupportBundleConfigurationScript
+		WHERE organization_id = @orgId
+			AND (@enabledOfType::DEPLOYMENT_TYPE IS NULL OR (enabled AND deployment_type = @enabledOfType))
+		ORDER BY name`, supportBundleConfigurationScriptOutputExpr),
+		pgx.NamedArgs{"orgId": orgID, "enabledOfType": enabledOfType},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle config scripts: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleConfigurationScript])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundle config scripts: %w", err)
+	}
+	return result, nil
+}
+
+func CreateSupportBundleConfigurationScript(
+	ctx context.Context, script *types.SupportBundleConfigurationScript,
+) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		fmt.Sprintf(`INSERT INTO SupportBundleConfigurationScript
+			(organization_id, deployment_type, name, description, content, enabled)
+		VALUES (@orgId, @deploymentType, @name, @description, @content, @enabled)
+		RETURNING %v`, supportBundleConfigurationScriptOutputExpr),
+		pgx.NamedArgs{
+			"orgId":          script.OrganizationID,
+			"deploymentType": script.DeploymentType,
+			"name":           script.Name,
+			"description":    script.Description,
+			"content":        script.Content,
+			"enabled":        script.Enabled,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not create support bundle config script: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleConfigurationScript])
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.UniqueViolation {
+		return fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+	} else if err != nil {
+		return fmt.Errorf("could not create support bundle config script: %w", err)
+	}
+	*script = result
+	return nil
+}
+
+func UpdateSupportBundleConfigurationScript(
+	ctx context.Context, script *types.SupportBundleConfigurationScript,
+) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		fmt.Sprintf(`UPDATE SupportBundleConfigurationScript
+		SET deployment_type = @deploymentType, name = @name, description = @description, content = @content,
+			enabled = @enabled
+		WHERE id = @id AND organization_id = @orgId
+		RETURNING %v`, supportBundleConfigurationScriptOutputExpr),
+		pgx.NamedArgs{
+			"id":             script.ID,
+			"orgId":          script.OrganizationID,
+			"deploymentType": script.DeploymentType,
+			"name":           script.Name,
+			"description":    script.Description,
+			"content":        script.Content,
+			"enabled":        script.Enabled,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update support bundle config script: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleConfigurationScript])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return distrerr.ErrNotFound
+	} else if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.UniqueViolation {
+		return fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+	} else if err != nil {
+		return fmt.Errorf("could not update support bundle config script: %w", err)
+	}
+	*script = result
+	return nil
+}
+
+func DeleteSupportBundleConfigurationScript(ctx context.Context, id, orgID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	result, err := db.Exec(
+		ctx,
+		`DELETE FROM SupportBundleConfigurationScript WHERE id = @id AND organization_id = @orgId`,
+		pgx.NamedArgs{"id": id, "orgId": orgID},
+	)
+	if err != nil {
+		return fmt.Errorf("could not delete support bundle config script: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	}
+	return nil
+}
+
+// Bundles
+
+var supportBundleWithDetailsOutputExpr = `
+	sb.id,
+	sb.created_at,
+	sb.organization_id,
+	sb.customer_organization_id,
+	sb.created_by_user_account_id,
+	sb.deployment_type,
+	sb.title,
+	sb.description,
+	sb.status,
+	` + supportBundleSecret.Output("sb") + `,
+	sb.bundle_secret_expires_at,
+	sb.status_changed_by_user_account_id,
+	sb.status_changed_at,
+	u.name AS created_by_user_name,
+	u.image_id AS created_by_image_id,
+	co.name AS customer_organization_name,
+	(SELECT count(*) FROM SupportBundleResource WHERE support_bundle_id = sb.id) AS resource_count,
+	(SELECT count(*) FROM SupportBundleComment WHERE support_bundle_id = sb.id) AS comment_count,
+	(SELECT max(created_at) FROM SupportBundleComment WHERE support_bundle_id = sb.id) AS last_comment_at,
+	scu.name AS status_changed_by_user_name,
+	scu.image_id AS status_changed_by_image_id
+`
+
+// GetCustomerSupportBundleEvents returns the newest creations and status changes of the support bundles of the
+// customer organization since, at most limit of them.
+func GetCustomerSupportBundleEvents(
+	ctx context.Context,
+	orgID, customerOrgID uuid.UUID,
+	since time.Time,
+	limit int,
+) ([]types.CustomerSupportBundleEvent, error) {
+	const customerMember = `
+		LEFT JOIN Organization_UserAccount j
+			ON j.user_account_id = u.id
+				AND j.organization_id = sb.organization_id
+				AND j.customer_organization_id = sb.customer_organization_id`
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`SELECT * FROM (
+			SELECT sb.id AS support_bundle_id, sb.created_at, sb.title, NULL::TEXT AS status,
+				CASE WHEN j.user_account_id IS NOT NULL THEN u.name END AS user_name,
+				CASE WHEN j.user_account_id IS NOT NULL THEN u.image_id END AS user_image_id
+			FROM SupportBundle sb
+				LEFT JOIN UserAccount u ON u.id = sb.created_by_user_account_id
+				`+customerMember+`
+			WHERE sb.organization_id = @orgId
+				AND sb.customer_organization_id = @customerOrgId
+				AND sb.created_at > @since
+			UNION ALL
+			SELECT sb.id, sb.status_changed_at, sb.title, sb.status::TEXT,
+				CASE WHEN j.user_account_id IS NOT NULL THEN u.name END,
+				CASE WHEN j.user_account_id IS NOT NULL THEN u.image_id END
+			FROM SupportBundle sb
+				LEFT JOIN UserAccount u ON u.id = sb.status_changed_by_user_account_id
+				`+customerMember+`
+			WHERE sb.organization_id = @orgId
+				AND sb.customer_organization_id = @customerOrgId
+				AND sb.status_changed_at > @since
+		) events
+		ORDER BY created_at DESC
+		LIMIT @limit`,
+		pgx.NamedArgs{"orgId": orgID, "customerOrgId": customerOrgID, "since": since, "limit": limit},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query customer support bundle events: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.CustomerSupportBundleEvent])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect customer support bundle events: %w", err)
+	}
+	return result, nil
+}
+
+func GetSupportBundles(
+	ctx context.Context, orgID uuid.UUID, customerOrgID *uuid.UUID, partnerOrgID *uuid.UUID,
+) ([]types.SupportBundleWithDetails, error) {
+	db := internalctx.GetDb(ctx)
+	isVendor := customerOrgID == nil && partnerOrgID == nil
+	query := fmt.Sprintf(`
+		SELECT %v
+		FROM SupportBundle sb
+		LEFT JOIN UserAccount u ON sb.created_by_user_account_id = u.id
+		INNER JOIN CustomerOrganization co ON sb.customer_organization_id = co.id
+		LEFT JOIN UserAccount scu ON sb.status_changed_by_user_account_id = scu.id
+		WHERE sb.organization_id = @orgId
+		AND (@isVendor OR sb.customer_organization_id = @customerOrgId OR co.partner_organization_id = @partnerOrgId)`,
+		supportBundleWithDetailsOutputExpr)
+
+	args := pgx.NamedArgs{
+		"orgId":         orgID,
+		"isVendor":      isVendor,
+		"customerOrgId": customerOrgID,
+		"partnerOrgId":  partnerOrgID,
+	}
+	query += ` ORDER BY sb.created_at DESC`
+
+	rows, err := db.Query(ctx, query, args)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundles: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleWithDetails])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundles: %w", err)
+	}
+	return result, nil
+}
+
+func GetSupportBundleByID(ctx context.Context, id, orgID uuid.UUID) (*types.SupportBundleWithDetails, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		fmt.Sprintf(`
+			SELECT %v
+			FROM SupportBundle sb
+			LEFT JOIN UserAccount u ON sb.created_by_user_account_id = u.id
+			INNER JOIN CustomerOrganization co ON sb.customer_organization_id = co.id
+			LEFT JOIN UserAccount scu ON sb.status_changed_by_user_account_id = scu.id
+			WHERE sb.id = @id AND sb.organization_id = @orgId`,
+			supportBundleWithDetailsOutputExpr),
+		pgx.NamedArgs{"id": id, "orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleWithDetails])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not get support bundle: %w", err)
+	}
+	return &result, nil
+}
+
+// GetSupportBundleByBundleSecret matches the secret in Go rather than in the WHERE clause, because
+// the stored secret is encrypted with a fresh nonce per write and therefore never equal to a second
+// encryption of the same value. The row is narrowed down by its id first, which the caller has.
+func GetSupportBundleByBundleSecret(
+	ctx context.Context, id uuid.UUID, bundleSecret string,
+) (*types.SupportBundle, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT id, created_at, organization_id, customer_organization_id,
+			created_by_user_account_id, deployment_type, title, description, status,
+			`+supportBundleSecret.Output("sb")+`, bundle_secret_expires_at,
+			status_changed_by_user_account_id, status_changed_at
+		FROM SupportBundle sb
+		WHERE id = @id
+			AND bundle_secret_expires_at > now()`,
+		pgx.NamedArgs{"id": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundle])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not get support bundle: %w", err)
+	}
+	if subtle.ConstantTimeCompare([]byte(result.BundleSecret), []byte(bundleSecret)) != 1 {
+		return nil, distrerr.ErrNotFound
+	}
+	return &result, nil
+}
+
+func CreateSupportBundle(ctx context.Context, bundle *types.SupportBundle) error {
+	bundleSecretEnc, err := supportBundleSecret.Encrypt(
+		bundle.BundleSecret, bundle.CustomerOrganizationID, bundle.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt support bundle secret: %w", err)
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO SupportBundle AS sb
+			(organization_id, customer_organization_id, created_by_user_account_id, deployment_type,
+			title, description, bundle_secret_enc, bundle_secret_expires_at)
+		VALUES (@orgId, @customerOrgId, @userId, @deploymentType, @title, @description,
+			@bundleSecretEnc, @bundleSecretExpiresAt)
+		RETURNING id, created_at, organization_id, customer_organization_id,
+			created_by_user_account_id, deployment_type, title, description, status,
+			`+supportBundleSecret.Output("sb")+`, bundle_secret_expires_at,
+			status_changed_by_user_account_id, status_changed_at`,
+		pgx.NamedArgs{
+			"orgId":                 bundle.OrganizationID,
+			"customerOrgId":         bundle.CustomerOrganizationID,
+			"userId":                bundle.CreatedByUserAccountID,
+			"deploymentType":        bundle.DeploymentType,
+			"title":                 bundle.Title,
+			"description":           bundle.Description,
+			"bundleSecretEnc":       bundleSecretEnc,
+			"bundleSecretExpiresAt": bundle.BundleSecretExpiresAt,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not create support bundle: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundle])
+	if err != nil {
+		return fmt.Errorf("could not create support bundle: %w", err)
+	}
+	*bundle = result
+	return nil
+}
+
+func UpdateSupportBundleStatus(
+	ctx context.Context,
+	id, orgID uuid.UUID,
+	status types.SupportBundleStatus,
+	changedByUserID *uuid.UUID,
+) error {
+	db := internalctx.GetDb(ctx)
+	result, err := db.Exec(
+		ctx,
+		`UPDATE SupportBundle
+		SET status = @status,
+			status_changed_by_user_account_id = @changedBy,
+			status_changed_at = now()
+		WHERE id = @id AND organization_id = @orgId`,
+		pgx.NamedArgs{"id": id, "orgId": orgID, "status": status, "changedBy": changedByUserID},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update support bundle status: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	}
+	return nil
+}
+
+func DeleteSupportBundle(ctx context.Context, id, orgID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	result, err := db.Exec(
+		ctx,
+		`DELETE FROM SupportBundle WHERE id = @id AND organization_id = @orgId`,
+		pgx.NamedArgs{"id": id, "orgId": orgID},
+	)
+	if err != nil {
+		return fmt.Errorf("could not delete support bundle: %w", err)
+	}
+	if result.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	}
+	return nil
+}
+
+func ClearSupportBundleBundleSecret(ctx context.Context, bundleID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	if _, err := db.Exec(
+		ctx,
+		`UPDATE SupportBundle
+		SET bundle_secret_expires_at = NULL
+		WHERE id = @id`,
+		pgx.NamedArgs{"id": bundleID},
+	); err != nil {
+		return fmt.Errorf("could not clear support bundle secret: %w", err)
+	}
+	return nil
+}
+
+// Resources
+
+const supportBundleResourceSummaryOutputExpr = `r.id, r.created_at, r.support_bundle_id, r.name, r.content_type, r.size`
+
+func GetSupportBundleResourceSummaries(
+	ctx context.Context,
+	bundleID uuid.UUID,
+) ([]types.SupportBundleResourceSummary, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT `+supportBundleResourceSummaryOutputExpr+`
+		FROM SupportBundleResource r
+		WHERE r.support_bundle_id = @bundleId
+		ORDER BY r.created_at`,
+		pgx.NamedArgs{"bundleId": bundleID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle resources: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleResourceSummary])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundle resources: %w", err)
+	}
+	return result, nil
+}
+
+func GetSupportBundleResources(ctx context.Context, bundleID uuid.UUID) ([]types.SupportBundleResource, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT `+supportBundleResourceSummaryOutputExpr+`, `+supportBundleResourceContent.Output("r")+`
+		FROM SupportBundleResource r
+		WHERE r.support_bundle_id = @bundleId
+		ORDER BY r.created_at`,
+		pgx.NamedArgs{"bundleId": bundleID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle resources: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleResource])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundle resources: %w", err)
+	}
+	return result, nil
+}
+
+func GetSupportBundleResource(
+	ctx context.Context,
+	bundleID, resourceID uuid.UUID,
+) (*types.SupportBundleResource, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT `+supportBundleResourceSummaryOutputExpr+`, `+supportBundleResourceContent.Output("r")+`
+		FROM SupportBundleResource r
+		WHERE r.support_bundle_id = @bundleId AND r.id = @resourceId`,
+		pgx.NamedArgs{"bundleId": bundleID, "resourceId": resourceID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle resource: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToAddrOfStructByName[types.SupportBundleResource])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("could not get support bundle resource: %w", err)
+	}
+	return result, nil
+}
+
+func CreateSupportBundleResource(ctx context.Context, resource *types.SupportBundleResource) error {
+	contentEnc, err := supportBundleResourceContent.Encrypt(resource.Content, resource.SupportBundleID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt support bundle resource: %w", err)
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO SupportBundleResource AS r (support_bundle_id, name, content_type, size, content_enc)
+		VALUES (@bundleId, @name, @contentType, @size, @contentEnc)
+		RETURNING `+supportBundleResourceSummaryOutputExpr+`, `+supportBundleResourceContent.Output("r"),
+		pgx.NamedArgs{
+			"bundleId":    resource.SupportBundleID,
+			"name":        resource.Name,
+			"contentType": resource.ContentType,
+			"size":        int64(len(resource.Content)),
+			"contentEnc":  contentEnc,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not create support bundle resource: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleResource])
+	if err != nil {
+		return fmt.Errorf("could not create support bundle resource: %w", err)
+	}
+	*resource = result
+	return nil
+}
+
+// Comments
+
+func GetSupportBundleComments(ctx context.Context, bundleID uuid.UUID) ([]types.SupportBundleCommentWithUser, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT c.id, c.created_at, c.support_bundle_id, c.user_account_id, c.content,
+			u.name AS user_name, u.image_id AS user_image_id
+		FROM SupportBundleComment c
+		LEFT JOIN UserAccount u ON c.user_account_id = u.id
+		WHERE c.support_bundle_id = @bundleId
+		ORDER BY c.created_at`,
+		pgx.NamedArgs{"bundleId": bundleID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query support bundle comments: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.SupportBundleCommentWithUser])
+	if err != nil {
+		return nil, fmt.Errorf("could not get support bundle comments: %w", err)
+	}
+	return result, nil
+}
+
+func CreateSupportBundleComment(
+	ctx context.Context, bundleID, userID uuid.UUID, content string,
+) (*types.SupportBundleCommentWithUser, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`WITH inserted AS (
+			INSERT INTO SupportBundleComment (support_bundle_id, user_account_id, content)
+			VALUES (@bundleId, @userId, @content)
+			RETURNING *
+		)
+		SELECT i.id, i.created_at, i.support_bundle_id, i.user_account_id, i.content,
+			u.name AS user_name, u.image_id AS user_image_id
+		FROM inserted i
+		LEFT JOIN UserAccount u ON i.user_account_id = u.id`,
+		pgx.NamedArgs{
+			"bundleId": bundleID,
+			"userId":   userID,
+			"content":  content,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not create support bundle comment: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.SupportBundleCommentWithUser])
+	if err != nil {
+		return nil, fmt.Errorf("could not create support bundle comment: %w", err)
+	}
+	return &result, nil
+}

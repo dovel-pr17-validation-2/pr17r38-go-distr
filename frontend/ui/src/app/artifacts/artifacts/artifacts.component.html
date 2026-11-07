@@ -1,0 +1,268 @@
+<app-page>
+  @if (showRegistryHint()) {
+    <app-alert type="info" class="mb-4">
+      <div>
+        @if (registrySlug$ | async; as slug) {
+          @if (registryHost$ | async; as host) {
+            <div class="font-medium">
+              To use the OCI Registry, make sure to create a
+              <a class="text-gray-600 underline dark:text-gray-400" routerLink="/settings/access-tokens"
+                >personal access token</a
+              >
+              and log in to the registry from your machine:
+              <code class="mt-1 block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+                echo "YOUR-ACCESS-TOKEN" | docker login {{ host }} --password-stdin -u -
+              </code>
+            </div>
+            <div class="mt-1 font-medium" *appRequireVendor>
+              Then you can start tagging and pushing your images. For example, you can try the following commands to
+              push your own
+              <a
+                href="https://hub.docker.com/_/hello-world"
+                target="_blank"
+                class="text-gray-600 underline dark:text-gray-400"
+                >hello-world</a
+              >
+              image:
+              <code class="mt-1 block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+                docker pull hello-world
+              </code>
+              <code class="block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+                docker tag hello-world {{ host }}/{{ slug }}/hello-world:v1.0.0
+              </code>
+              <code class="block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+                docker push {{ host }}/{{ slug }}/hello-world:v1.0.0
+              </code>
+            </div>
+            <div *appRequireCustomer>
+              <div class="mt-1 font-medium">
+                After the login you can start pulling images from the registry. For example, you can try the following
+                command:
+              </div>
+              <code class="mt-1 block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+                docker pull {{ host }}/{{ slug }}/IMAGE:VERSION
+              </code>
+            </div>
+          } @else {
+            Your Distr instance does not have the registry enabled.
+            <ng-container *appRequireVendor
+              >You can enable it by setting the corresponding environment variables of Distr.
+              <!-- TODO link to docs -->
+            </ng-container>
+          }
+        } @else {
+          It seems your organization does not have a slug set yet.
+          <ng-container *appRequireVendor
+            >To use the registry, please set a slug in
+            <a class="text-gray-600 underline dark:text-gray-400" routerLink="/settings">Settings</a>.
+          </ng-container>
+        }
+      </div>
+    </app-alert>
+  }
+
+  <div class="distr-toolbar mb-4">
+    <app-search-bar [control]="filterForm.controls.search" placeholder="Filter artifacts" />
+
+    @if (auth.isVendor() && auth.hasAnyRole('read_write', 'admin')) {
+      <div class="distr-toolbar-actions">
+        <button
+          (click)="openCreateModal(newArtifactModal)"
+          type="button"
+          class="flex w-full items-center justify-center rounded-lg border border-gray-200 bg-white px-4 py-2 text-sm font-medium text-gray-900 hover:bg-gray-100 hover:text-primary-700 focus:z-10 focus:ring-4 focus:ring-gray-200 focus:outline-none md:w-auto dark:border-gray-600 dark:bg-gray-800 dark:text-white dark:hover:bg-gray-700 dark:hover:text-white dark:focus:ring-gray-700">
+          <fa-icon [icon]="faPlus" class="mr-2 text-gray-500 dark:text-gray-400" />
+          Add artifact
+        </button>
+      </div>
+    }
+  </div>
+
+  @if (filteredArtifacts(); as artifacts) {
+    <div class="overflow-x-auto">
+      <ul role="list" class="distr-card-grid">
+        @for (artifact of artifacts; track artifact.id) {
+          <li [routerLink]="artifact.id" class="distr-card distr-card-clickable px-6 py-3 sm:py-4">
+            <div class="flex flex-1 items-center">
+              <app-artifact-logo class="size-8 shrink-0" [imageUrl]="artifact.imageUrl" />
+              <div class="ms-4 min-w-0 flex-1">
+                <div class="flex flex-wrap items-center gap-2">
+                  <span class="truncate font-semibold text-gray-900 dark:text-white">{{ artifact.name }}</span>
+                </div>
+                @if ((auth.isVendor() && artifact.upstreamUrl) || artifact.public) {
+                  <p class="mt-1 flex items-center gap-1 truncate text-sm text-gray-500 dark:text-gray-400">
+                    @if (auth.isVendor() && artifact.upstreamUrl) {
+                      <span class="distr-badge distr-badge-neutral">pull-through</span>
+                    }
+                    @if (artifact.public) {
+                      <app-artifact-public-badge />
+                    }
+                  </p>
+                }
+              </div>
+              <div class="ms-4 flex h-14 shrink-0 flex-col items-end gap-1" *appRequireVendor>
+                <app-artifacts-download-count [source]="artifact" />
+                <app-artifacts-downloaded-by [source]="artifact" [maxShownAvatars]="3" />
+              </div>
+            </div>
+          </li>
+        }
+      </ul>
+    </div>
+  } @else {
+    <div class="flex items-center justify-center py-8 text-gray-500 dark:text-gray-400">
+      <app-spinner class="me-2 size-6" />
+      <span>Loading&hellip;</span>
+    </div>
+  }
+</app-page>
+
+<ng-template #newArtifactModal>
+  @let formGroup = createForm;
+
+  <div
+    animate.enter="animate-fly-in-top"
+    animate.leave="animate-fly-out-top"
+    class="my-auto max-h-full w-200 overflow-y-auto rounded-lg bg-white p-4 shadow-sm dark:bg-gray-900">
+    <div class="relative max-h-full w-full">
+      <div class="relative rounded-lg">
+        <div
+          class="flex items-center justify-between rounded-t border-b border-gray-200 p-4 md:p-5 dark:border-gray-600">
+          <h3 class="text-lg font-semibold text-gray-900 dark:text-white">Add Artifact</h3>
+          <button
+            type="button"
+            class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white"
+            (click)="hideCreateModal()">
+            <fa-icon [icon]="faXmark" />
+            <span class="sr-only">Close modal</span>
+          </button>
+        </div>
+
+        <div class="p-4 md:p-5">
+          <h4 class="text-base font-semibold text-gray-900 dark:text-white">Direct upload</h4>
+          <div class="text-sm text-gray-500 dark:text-gray-400">
+            Push artifacts to your registry using a personal access token and the Docker CLI or any other OCI-compliant
+            tool. Just make sure to tag your images with the correct registry URL and artifact name. For example:
+          </div>
+          <pre class="mt-1 block text-sm whitespace-pre-line text-gray-900 select-all dark:text-gray-200">
+            docker tag SOURCE-IMAGE:TAG {{ registryHost$ | async }}/{{ registrySlug$ | async }}/ARTIFACT-NAME:TAG
+            docker push {{ registryHost$ | async }}/{{ registrySlug$ | async }}/ARTIFACT-NAME:TAG
+          </pre>
+
+          <hr class="my-4 border-gray-200 dark:border-gray-600" />
+
+          <form [formGroup]="formGroup" (ngSubmit)="createArtifact()">
+            <h4 class="text-base font-semibold text-gray-900 dark:text-white">Pull-through cache</h4>
+            <div class="mb-1 text-sm text-gray-500 dark:text-gray-400">
+              Configure this artifact with an upstream OCI registry URL to automatically sync tags from.
+            </div>
+            <div class="space-y-4">
+              <div>
+                <label for="artifact-name" class="distr-label mb-2">
+                  Artifact Name
+                  <span class="text-red-500">*</span>
+                </label>
+                <input
+                  formControlName="name"
+                  autotrim
+                  autocomplete="off"
+                  type="text"
+                  id="artifact-name"
+                  class="distr-input" />
+                @if (formGroup.controls.name.invalid && formGroup.controls.name.touched) {
+                  <p class="mt-1 text-xs text-red-600 dark:text-red-500">Field is required.</p>
+                }
+              </div>
+
+              <div>
+                <label for="artifact-upstream-url" class="distr-label mb-2">
+                  Upstream URL
+                  <span class="text-red-500">*</span>
+                </label>
+                <input
+                  formControlName="upstreamUrl"
+                  autotrim
+                  autocomplete="off"
+                  type="text"
+                  id="artifact-upstream-url"
+                  placeholder="e.g. registry-1.docker.io/library/nginx"
+                  class="distr-input" />
+                <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+                  Tags are automatically synced from the upstream OCI repository.
+                </p>
+                @if (formGroup.controls.upstreamUrl.invalid && formGroup.controls.upstreamUrl.touched) {
+                  <p class="mt-1 text-xs text-red-600 dark:text-red-500">Field is required.</p>
+                }
+              </div>
+
+              <div>
+                <label for="artifact-upstream-auth-type" class="distr-label mb-2">Upstream Authentication</label>
+                <select formControlName="upstreamAuthType" id="artifact-upstream-auth-type" class="distr-input">
+                  <option value="none">No authentication</option>
+                  <option value="basic">Basic (Username/Password)</option>
+                  <option value="aws_ecr">AWS ECR (IAM Access Key)</option>
+                </select>
+              </div>
+
+              @if (formGroup.controls.upstreamAuthType.value !== 'none') {
+                <div>
+                  <label for="artifact-upstream-username" class="distr-label mb-2">
+                    @switch (formGroup.controls.upstreamAuthType.value) {
+                      @case ('basic') {
+                        Username
+                      }
+                      @case ('aws_ecr') {
+                        AWS Access Key ID
+                      }
+                    }
+                    <span class="text-red-500">*</span>
+                  </label>
+                  <input
+                    formControlName="upstreamUsername"
+                    autotrim
+                    autocomplete="off"
+                    type="text"
+                    id="artifact-upstream-username"
+                    class="distr-input" />
+                  @if (formGroup.controls.upstreamUsername.invalid && formGroup.controls.upstreamUsername.touched) {
+                    <p class="mt-1 text-xs text-red-600 dark:text-red-500">Field is required.</p>
+                  }
+                </div>
+                <div>
+                  <label for="artifact-upstream-password" class="distr-label mb-2">
+                    @switch (formGroup.controls.upstreamAuthType.value) {
+                      @case ('basic') {
+                        Password
+                      }
+                      @case ('aws_ecr') {
+                        AWS Secret Access Key
+                      }
+                    }
+                    <span class="text-red-500">*</span>
+                  </label>
+                  <input
+                    formControlName="upstreamPassword"
+                    autocomplete="new-password"
+                    type="password"
+                    id="artifact-upstream-password"
+                    class="distr-input" />
+                  @if (formGroup.controls.upstreamPassword.invalid && formGroup.controls.upstreamPassword.touched) {
+                    <p class="mt-1 text-xs text-red-600 dark:text-red-500">Field is required.</p>
+                  }
+                </div>
+              }
+
+              <div class="flex justify-stretch space-x-2.5 sm:justify-end">
+                <button
+                  type="submit"
+                  [disabled]="createFormLoading"
+                  class="distr-btn-primary inline-flex flex-1 items-center justify-center text-white disabled:cursor-not-allowed disabled:opacity-60 sm:flex-none">
+                  Add Artifact
+                </button>
+              </div>
+            </div>
+          </form>
+        </div>
+      </div>
+    </div>
+  </div>
+</ng-template>

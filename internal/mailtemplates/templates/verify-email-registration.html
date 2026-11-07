@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    {{ template "fragments/style.html" }}
+  </head>
+  <body>
+    <div class="message-container">
+      {{ template "fragments/header.html" . }}
+      <main>
+        {{ template "fragments/greeting.html" . }}
+        <p>
+          Welcome to {{ .Signature }}! Please verify that this is your email address at
+          <a href="{{ .Host }}/verify?jwt={{ .Token | QueryEscape }}">{{ .Host }}</a>.
+        </p>
+
+        <p>Alternatively, you can copy and paste the following URL into your browser:</p>
+
+        <div style="overflow-wrap: break-word; word-break: break-all">
+          <code>{{ .Host }}/verify?jwt={{ .Token | QueryEscape }}</code>
+        </div>
+
+        <p>{{ template "fragments/signature.html" . }}</p>
+      </main>
+      {{ template "fragments/footer.html" . }}
+    </div>
+  </body>
+</html>

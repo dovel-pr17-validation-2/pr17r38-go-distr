@@ -1,0 +1,90 @@
+package types
+
+import (
+	"errors"
+	"fmt"
+	"net/url"
+	"path"
+	"strings"
+	"time"
+	"unicode"
+
+	"github.com/google/uuid"
+)
+
+type DeploymentTarget struct {
+	ID                          uuid.UUID              `db:"id" json:"id"`
+	CreatedAt                   time.Time              `db:"created_at" json:"createdAt"`
+	Name                        string                 `db:"name" json:"name"`
+	Type                        DeploymentType         `db:"type" json:"type"`
+	AccessKeySalt               *[]byte                `db:"access_key_salt" json:"-"`
+	AccessKeyHash               *[]byte                `db:"access_key_hash" json:"-"`
+	PendingAccessKeySalt        *[]byte                `db:"pending_access_key_salt" json:"-"`
+	PendingAccessKeyHash        *[]byte                `db:"pending_access_key_hash" json:"-"`
+	ReconnectPending            bool                   `db:"reconnect_pending" json:"reconnectPending"`
+	Namespace                   *string                `db:"namespace" json:"namespace,omitempty"`
+	Scope                       *DeploymentTargetScope `db:"scope" json:"scope,omitempty"`
+	OrganizationID              uuid.UUID              `db:"organization_id" json:"-"`
+	CustomerOrganizationID      *uuid.UUID             `db:"customer_organization_id" json:"customerOrganizationId,omitempty"` //nolint:lll
+	ControllerVersionID         *uuid.UUID             `db:"controller_version_id" json:"-"`
+	ReportedControllerVersionID *uuid.UUID             `db:"reported_controller_version_id" json:"reportedControllerVersionId,omitempty"` //nolint:lll
+	// LegacyControllerName is set on targets created before the rename to controller, whose manifests keep naming
+	// the controller's resources and compose service after the agent.
+	LegacyControllerName    bool                       `db:"legacy_controller_name" json:"-"`
+	MetricsEnabled          bool                       `db:"metrics_enabled" json:"metricsEnabled"`
+	ImageCleanupEnabled     bool                       `db:"image_cleanup_enabled" json:"imageCleanupEnabled"`
+	AutohealEnabled         bool                       `db:"autoheal_enabled" json:"autohealEnabled"`
+	AutomaticUpdatesEnabled bool                       `db:"automatic_updates_enabled" json:"automaticUpdatesEnabled"`
+	DeploymentLogsEnabled   bool                       `db:"deployment_logs_enabled" json:"deploymentLogsEnabled"`
+	DeploymentLogsAfter     *time.Time                 `db:"deployment_logs_after" json:"deploymentLogsAfter,omitempty"`
+	Resources               *DeploymentTargetResources `db:"resources" json:"resources,omitempty"`
+	DockerEndpoint          *string                    `db:"docker_endpoint" json:"dockerEndpoint,omitempty"`
+}
+
+type DeploymentTargetResources struct {
+	CPURequest    string `json:"cpuRequest"`
+	MemoryRequest string `json:"memoryRequest"`
+	CPULimit      string `json:"cpuLimit"`
+	MemoryLimit   string `json:"memoryLimit"`
+}
+
+const DefaultDockerSocketPath = "/var/run/docker.sock"
+
+// ParseDockerEndpoint only supports unix sockets because the endpoint is applied by bind-mounting
+// the socket into the controller container.
+func ParseDockerEndpoint(endpoint string) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("invalid docker endpoint: %w", err)
+	}
+	if u.Scheme != "unix" {
+		return "", errors.New("docker endpoint must have scheme \"unix\"")
+	}
+	if u.Host != "" {
+		return "", errors.New("docker endpoint must not have a host")
+	}
+	if !path.IsAbs(u.Path) {
+		return "", errors.New("docker endpoint must have an absolute socket path")
+	}
+	// The path is rendered into Compose's short "SOURCE:TARGET" volume syntax.
+	if strings.Contains(u.Path, ":") || strings.ContainsFunc(u.Path, unicode.IsSpace) {
+		return "", errors.New("docker endpoint socket path must not contain a colon or whitespace")
+	}
+	return u.Path, nil
+}
+
+func (dt *DeploymentTarget) DockerSocketPath() string {
+	if dt.DockerEndpoint != nil {
+		if socketPath, err := ParseDockerEndpoint(*dt.DockerEndpoint); err == nil {
+			return socketPath
+		}
+	}
+	return DefaultDockerSocketPath
+}
+
+type DeploymentTargetFull struct {
+	DeploymentTarget
+	CustomerOrganization *CustomerOrganization          `db:"customer_organization" json:"customerOrganization,omitempty"`
+	Deployments          []DeploymentWithLatestRevision `db:"-" json:"deployments"`
+	ControllerVersion    ControllerVersion              `db:"controller_version" json:"controllerVersion"`
+}

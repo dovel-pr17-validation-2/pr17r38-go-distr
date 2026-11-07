@@ -1,0 +1,305 @@
+package license
+
+import (
+	"crypto/ed25519"
+	"crypto/x509"
+	"encoding/pem"
+	"errors"
+	"testing"
+	"time"
+
+	"github.com/distr-sh/distr/internal/limit"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwt"
+	. "github.com/onsi/gomega"
+)
+
+// Fixed 32-byte seed for deterministic Ed25519 key generation in tests.
+var testSeed = [32]byte{
+	0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08,
+	0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10,
+	0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18,
+	0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+}
+
+func testKeyPair(t *testing.T) (jwk.Key, ed25519.PrivateKey) {
+	t.Helper()
+	privKey := ed25519.NewKeyFromSeed(testSeed[:])
+	pubKey := privKey.Public().(ed25519.PublicKey)
+
+	der, err := x509.MarshalPKIXPublicKey(pubKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pemBlock := pem.EncodeToMemory(&pem.Block{Type: "PUBLIC KEY", Bytes: der})
+
+	jwkPubKey, err := jwk.ParseKey(pemBlock, jwk.WithX509(true))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return jwkPubKey, privKey
+}
+
+func signToken(t *testing.T, privKey ed25519.PrivateKey, expiration time.Time, claims map[string]any) string {
+	t.Helper()
+	b := jwt.NewBuilder().Expiration(expiration)
+	for k, v := range claims {
+		b = b.Claim(k, v)
+	}
+	tok, err := b.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	privJWK, err := jwk.Import[jwk.Key](privKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	signed, err := jwt.Sign(tok, jwt.WithKey(jwa.EdDSA(), privJWK))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(signed)
+}
+
+func pubKeyFunc(key jwk.Key) func() (jwk.Key, error) {
+	return func() (jwk.Key, error) { return key, nil }
+}
+
+func nilPubKeyFunc() (jwk.Key, error) { return nil, nil }
+
+func errPubKeyFunc() (jwk.Key, error) { return nil, errors.New("key load error") }
+
+func TestParseAndValidate_NoPubKey_ReturnsDefault(t *testing.T) {
+	g := NewWithT(t)
+	got, err := parseAndValidate(nilPubKeyFunc, "")
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(*got).To(Equal(defaultLicenseData))
+}
+
+func TestParseAndValidate_PubKeyLoadError(t *testing.T) {
+	g := NewWithT(t)
+	_, err := parseAndValidate(errPubKeyFunc, "")
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestParseAndValidate_PubKeySet_EmptyLicenseKey(t *testing.T) {
+	g := NewWithT(t)
+	pub, _ := testKeyPair(t)
+	_, err := parseAndValidate(pubKeyFunc(pub), "")
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestParseAndValidate_InvalidToken(t *testing.T) {
+	g := NewWithT(t)
+	pub, _ := testKeyPair(t)
+	_, err := parseAndValidate(pubKeyFunc(pub), "not.a.jwt")
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestParseAndValidate_WrongKey(t *testing.T) {
+	g := NewWithT(t)
+	pub, _ := testKeyPair(t)
+
+	otherSeed := [32]byte{0xff, 0xfe, 0xfd}
+	otherPriv := ed25519.NewKeyFromSeed(otherSeed[:])
+	token := signToken(t, otherPriv, time.Now().Add(time.Hour), map[string]any{"enf": true})
+
+	_, err := parseAndValidate(pubKeyFunc(pub), token)
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestParseAndValidate_AllFields(t *testing.T) {
+	g := NewWithT(t)
+	pub, priv := testKeyPair(t)
+	expiration := time.Now().Add(24 * time.Hour).Truncate(time.Second)
+	token := signToken(t, priv, expiration, map[string]any{
+		"ld": map[string]any{
+			"enf": true,
+			"p":   "yearly",
+			"t":   "business",
+			"mo":  10,
+			"mou": 20,
+			"moc": 30,
+			"mcu": 40,
+			"mcd": 50,
+			"mrs": 70,
+		},
+	})
+
+	got, err := parseAndValidate(pubKeyFunc(pub), token)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(got.ExpirationDate).To(BeTemporally("~", expiration, time.Second))
+	got.ExpirationDate = time.Time{}
+	g.Expect(*got).To(Equal(LicenseData{
+		EnforceLimitsOnStartup:                      true,
+		Period:                                      types.SubscriptionPeriodYearly,
+		SubscriptionType:                            types.SubscriptionTypeBusiness,
+		MaxOrganizations:                            limit.New(10),
+		MaxUsersPerOrganization:                     limit.New(20),
+		MaxCustomersPerOrganization:                 limit.New(30),
+		MaxUsersPerCustomerOrganization:             limit.New(40),
+		MaxDeploymentTargetsPerCustomerOrganization: limit.New(50),
+		MaxRegistryStorageBytes:                     limit.New(70),
+	}))
+}
+
+func TestParseAndValidate_PartialClaims_DefaultsForUnspecifiedFields(t *testing.T) {
+	g := NewWithT(t)
+	pub, priv := testKeyPair(t)
+	token := signToken(t, priv, time.Now().Add(time.Hour), map[string]any{
+		"ld": map[string]any{
+			"enf": false,
+			"mo":  5,
+		},
+	})
+
+	got, err := parseAndValidate(pubKeyFunc(pub), token)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(got.ExpirationDate).ToNot(BeZero())
+	got.ExpirationDate = time.Time{}
+	g.Expect(*got).To(Equal(LicenseData{
+		EnforceLimitsOnStartup:                      false,
+		Period:                                      defaultLicenseData.Period,
+		SubscriptionType:                            types.SubscriptionTypeEnterprise,
+		MaxOrganizations:                            limit.New(5),
+		MaxUsersPerOrganization:                     defaultLicenseData.MaxUsersPerOrganization,
+		MaxCustomersPerOrganization:                 defaultLicenseData.MaxCustomersPerOrganization,
+		MaxUsersPerCustomerOrganization:             defaultLicenseData.MaxUsersPerCustomerOrganization,
+		MaxDeploymentTargetsPerCustomerOrganization: defaultLicenseData.MaxDeploymentTargetsPerCustomerOrganization,
+		MaxRegistryStorageBytes:                     defaultLicenseData.MaxRegistryStorageBytes,
+	}))
+}
+
+func TestParseAndValidate_ZeroLimits(t *testing.T) {
+	g := NewWithT(t)
+	pub, priv := testKeyPair(t)
+	token := signToken(t, priv, time.Now().Add(time.Hour), map[string]any{
+		"ld": map[string]any{
+			"enf": false,
+			"mo":  0,
+			"mou": 0,
+			"moc": 0,
+			"mcu": 0,
+			"mcd": 0,
+			"mrs": 0,
+		},
+	})
+
+	got, err := parseAndValidate(pubKeyFunc(pub), token)
+	g.Expect(err).ToNot(HaveOccurred())
+	got.ExpirationDate = time.Time{}
+	g.Expect(*got).To(Equal(LicenseData{
+		EnforceLimitsOnStartup:                      false,
+		Period:                                      types.SubscriptionPeriodYearly,
+		SubscriptionType:                            types.SubscriptionTypeEnterprise,
+		MaxOrganizations:                            limit.New(0),
+		MaxUsersPerOrganization:                     limit.New(0),
+		MaxCustomersPerOrganization:                 limit.New(0),
+		MaxUsersPerCustomerOrganization:             limit.New(0),
+		MaxDeploymentTargetsPerCustomerOrganization: limit.New(0),
+		MaxRegistryStorageBytes:                     limit.New(0),
+	}))
+}
+
+func TestParseAndValidate_SubscriptionType(t *testing.T) {
+	pub, priv := testKeyPair(t)
+
+	for _, st := range types.AllSubscriptionTypes() {
+		t.Run(string(st), func(t *testing.T) {
+			g := NewWithT(t)
+			token := signToken(t, priv, time.Now().Add(time.Hour), map[string]any{
+				"ld": map[string]any{"t": string(st)},
+			})
+
+			got, err := parseAndValidate(pubKeyFunc(pub), token)
+			g.Expect(err).ToNot(HaveOccurred())
+			g.Expect(got.SubscriptionType).To(Equal(st))
+		})
+	}
+
+	t.Run("rejects unknown subscription type", func(t *testing.T) {
+		g := NewWithT(t)
+		token := signToken(t, priv, time.Now().Add(time.Hour), map[string]any{
+			"ld": map[string]any{"t": "ultimate"},
+		})
+
+		_, err := parseAndValidate(pubKeyFunc(pub), token)
+		g.Expect(err).To(HaveOccurred())
+	})
+}
+
+func TestParseAndValidate_ExpirationDate(t *testing.T) {
+	g := NewWithT(t)
+	pub, priv := testKeyPair(t)
+	expiration := time.Now().Add(7 * 24 * time.Hour).Truncate(time.Second)
+	token := signToken(t, priv, expiration, map[string]any{
+		"ld": map[string]any{
+			"enf": false,
+		},
+	})
+
+	got, err := parseAndValidate(pubKeyFunc(pub), token)
+	g.Expect(err).ToNot(HaveOccurred())
+	g.Expect(got.ExpirationDate).To(BeTemporally("~", expiration, time.Second))
+}
+
+func buildToken(t *testing.T, issuedAt time.Time, claims map[string]any) jwt.Token {
+	t.Helper()
+	b := jwt.NewBuilder()
+	if !issuedAt.IsZero() {
+		b = b.IssuedAt(issuedAt)
+	}
+	for k, v := range claims {
+		b = b.Claim(k, v)
+	}
+	tok, err := b.Build()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return tok
+}
+
+func TestValidateOrganizationScope(t *testing.T) {
+	const orgID = "11111111-1111-1111-1111-111111111111"
+	const otherOrgID = "22222222-2222-2222-2222-222222222222"
+
+	t.Run("disabled when no organization configured", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Now(), map[string]any{"org": otherOrgID})
+		g.Expect(validateOrganizationScope(tok, "")).To(Succeed())
+	})
+
+	t.Run("accepts matching organization", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Now(), map[string]any{"org": orgID})
+		g.Expect(validateOrganizationScope(tok, orgID)).To(Succeed())
+	})
+
+	t.Run("accepts matching organization without issued-at claim", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Time{}, map[string]any{"org": orgID})
+		g.Expect(validateOrganizationScope(tok, orgID)).To(Succeed())
+	})
+
+	t.Run("rejects mismatched organization", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Now(), map[string]any{"org": otherOrgID})
+		g.Expect(validateOrganizationScope(tok, orgID)).To(HaveOccurred())
+	})
+
+	t.Run("rejects missing organization claim", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Now(), nil)
+		g.Expect(validateOrganizationScope(tok, orgID)).To(HaveOccurred())
+	})
+
+	t.Run("rejects missing organization claim without issued-at claim", func(t *testing.T) {
+		g := NewWithT(t)
+		tok := buildToken(t, time.Time{}, nil)
+		g.Expect(validateOrganizationScope(tok, orgID)).To(HaveOccurred())
+	})
+}

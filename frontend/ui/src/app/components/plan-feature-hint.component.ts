@@ -1,0 +1,31 @@
+import {Component, input} from '@angular/core';
+import {WEBSITE_URL} from '../../constants';
+import {SubscriptionType} from '../types/subscription';
+import {PlanBadgeComponent} from './plan-badge.component';
+
+@Component({
+  selector: 'app-plan-feature-hint',
+  imports: [PlanBadgeComponent],
+  template: `
+    <div role="tooltip" class="distr-tooltip max-w-64">
+      <div class="mb-1">
+        This feature is available to organizations with a
+        <app-plan-badge [plan]="plan()" />
+        subscription.
+      </div>
+      Our Pro and Business plans are also available for self-hosted customers. See our
+      <a
+        [href]="websiteUrl + '/pricing/'"
+        target="_blank"
+        rel="noopener noreferrer"
+        class="text-gray-600 hover:underline dark:text-gray-400"
+        >pricing page</a
+      >.
+    </div>
+  `,
+})
+export class PlanFeatureHintComponent {
+  public readonly plan = input.required<SubscriptionType>();
+
+  protected readonly websiteUrl = WEBSITE_URL;
+}

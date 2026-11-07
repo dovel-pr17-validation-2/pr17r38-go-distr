@@ -1,0 +1,48 @@
+<div class="z-50 max-h-full w-256 max-w-full overflow-x-hidden overflow-y-auto">
+  <div class="relative max-h-full w-full">
+    <!-- Modal content -->
+    <div class="relative rounded-lg bg-white shadow-sm dark:bg-gray-700">
+      <!-- Modal header -->
+      <div class="flex items-center justify-between rounded-t border-b border-gray-200 p-5 dark:border-gray-600">
+        <h3 class="text-lg font-semibold text-gray-900 dark:text-white">
+          @if (deployment()?.id) {
+            Update Deployment
+          } @else {
+            Deploy new application version
+          }
+        </h3>
+        <button
+          type="button"
+          class="ms-auto inline-flex h-8 w-8 items-center justify-center rounded-lg bg-transparent text-sm text-gray-400 hover:bg-gray-200 hover:text-gray-900 dark:hover:bg-gray-600 dark:hover:text-white"
+          (click)="closed.emit()">
+          <fa-icon [icon]="faXmark" />
+          <span class="sr-only">Close modal</span>
+        </button>
+      </div>
+      <!-- Modal body -->
+      <form class="p-5" [formGroup]="deployFormWrapper" (ngSubmit)="saveDeployment()">
+        @if (customerManagedNoticeVisible()) {
+          <app-alert type="info" class="mb-4">
+            You are about to overwrite a customer-managed deployment. Ensure this is done in coordination with the
+            customer.
+          </app-alert>
+        }
+        @if (dataLoaded()) {
+          <app-deployment-form
+            [formControl]="deployForm"
+            [deploymentType]="deploymentTarget().type"
+            [customerOrganizationId]="deploymentTarget().customerOrganization?.id"
+            [deploymentTargetName]="deploymentTarget().name" />
+          <button type="submit" [disabled]="loading()" class="distr-btn-primary inline-flex items-center text-white">
+            <fa-icon [icon]="faShip" class="mr-2 -ml-0.5 h-5 w-5 dark:text-gray-400" />
+            Deploy
+          </button>
+        } @else {
+          <div class="flex items-center justify-center py-12">
+            <app-spinner class="size-8" />
+          </div>
+        }
+      </form>
+    </div>
+  </div>
+</div>

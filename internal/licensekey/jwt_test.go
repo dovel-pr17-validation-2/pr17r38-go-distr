@@ -1,0 +1,149 @@
+package licensekey
+
+import (
+	"encoding/json"
+	"testing"
+	"time"
+
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/lestrrat-go/jwx/v4/jwa"
+	"github.com/lestrrat-go/jwx/v4/jwk"
+	"github.com/lestrrat-go/jwx/v4/jwt"
+	. "github.com/onsi/gomega"
+)
+
+// Test key in raw PEM format, generated with: openssl genpkey -algorithm ed25519
+const testPrivateKeyPEM = `
+-----BEGIN PRIVATE KEY-----
+MC4CAQAwBQYDK2VwBCIEID0kZeYRX/KmYFMZNfHly8KODNz8dDKQfPn33W0gkori
+-----END PRIVATE KEY-----
+`
+
+func testKey(t *testing.T) jwk.Key {
+	t.Helper()
+	key, err := jwk.ParseKey([]byte(testPrivateKeyPEM), jwk.WithX509(true))
+	NewWithT(t).Expect(err).ToNot(HaveOccurred())
+	return key
+}
+
+func TestGenerateToken(t *testing.T) {
+	g := NewWithT(t)
+	key := testKey(t)
+	now := time.Now().Truncate(time.Second)
+	expiresAt := now.Add(24 * time.Hour)
+	licenseKey := types.LicenseKey{
+		ID:            uuid.New(),
+		CreatedAt:     now,
+		LastRevisedAt: &now,
+		NotBefore:     &now,
+		ExpiresAt:     &expiresAt,
+		Payload:       json.RawMessage(`{"plan":"enterprise"}`),
+	}
+
+	token, err := generateToken(key, FromLicenseKey(licenseKey), "test-issuer")
+	g.Expect(err).ToNot(HaveOccurred())
+
+	pubKey, err := key.PublicKey()
+	g.Expect(err).ToNot(HaveOccurred())
+
+	parsed, err := jwt.Parse([]byte(token), jwt.WithKey(jwa.EdDSA(), pubKey))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	subject, ok := parsed.Subject()
+	g.Expect(ok).To(BeTrue())
+	g.Expect(subject).To(Equal(licenseKey.ID.String()))
+
+	issuer, ok := parsed.Issuer()
+	g.Expect(ok).To(BeTrue())
+	g.Expect(issuer).To(Equal("test-issuer"))
+
+	plan, err := jwt.Get[string](parsed, "plan")
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(plan).To(Equal("enterprise"))
+}
+
+func TestGenerateToken_OrganizationClaim(t *testing.T) {
+	g := NewWithT(t)
+	key := testKey(t)
+	now := time.Now().Truncate(time.Second)
+	expiresAt := now.Add(24 * time.Hour)
+	orgID := uuid.New()
+	licenseKey := types.LicenseKey{
+		ID:             uuid.New(),
+		OrganizationID: orgID,
+		CreatedAt:      now,
+		LastRevisedAt:  &now,
+		NotBefore:      &now,
+		ExpiresAt:      &expiresAt,
+		Payload:        json.RawMessage(`{}`),
+	}
+
+	token, err := generateToken(key, FromLicenseKey(licenseKey), "test-issuer")
+	g.Expect(err).ToNot(HaveOccurred())
+
+	pubKey, _ := key.PublicKey()
+	parsed, err := jwt.Parse([]byte(token), jwt.WithKey(jwa.EdDSA(), pubKey))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	org, err := jwt.Get[string](parsed, OrganizationIDClaimName)
+	g.Expect(err).NotTo(HaveOccurred())
+	g.Expect(org).To(Equal(orgID.String()))
+}
+
+func TestGenerateToken_NoOrganizationClaimWhenUnset(t *testing.T) {
+	g := NewWithT(t)
+	key := testKey(t)
+	now := time.Now().Truncate(time.Second)
+	expiresAt := now.Add(24 * time.Hour)
+
+	token, err := generateToken(key, LicenseKeyData{
+		LicenseKeyID: uuid.New(),
+		IssuedAt:     now,
+		NotBefore:    now,
+		ExpiresAt:    expiresAt,
+		Payload:      json.RawMessage(`{}`),
+	}, "test-issuer")
+	g.Expect(err).ToNot(HaveOccurred())
+
+	pubKey, _ := key.PublicKey()
+	parsed, err := jwt.Parse([]byte(token), jwt.WithKey(jwa.EdDSA(), pubKey))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	_, err = jwt.Get[string](parsed, OrganizationIDClaimName)
+	g.Expect(err).To(HaveOccurred())
+}
+
+func TestGenerateToken_ReservedClaimsStripped(t *testing.T) {
+	g := NewWithT(t)
+	key := testKey(t)
+	now := time.Now().Truncate(time.Second)
+	expiresAt := now.Add(24 * time.Hour)
+	licenseKey := types.LicenseKey{
+		ID:            uuid.New(),
+		CreatedAt:     now,
+		LastRevisedAt: &now,
+		NotBefore:     &now,
+		ExpiresAt:     &expiresAt,
+		Payload:       json.RawMessage(`{"exp":99999,"plan":"pro"}`),
+	}
+
+	token, err := generateToken(key, FromLicenseKey(licenseKey), "test-issuer")
+	g.Expect(err).ToNot(HaveOccurred())
+
+	pubKey, _ := key.PublicKey()
+	parsed, err := jwt.Parse([]byte(token), jwt.WithKey(jwa.EdDSA(), pubKey))
+	g.Expect(err).ToNot(HaveOccurred())
+
+	// exp must be the one from licenseKey.ExpiresAt, not the payload override
+	exp, ok := parsed.Expiration()
+	g.Expect(ok).To(BeTrue())
+	g.Expect(exp.UTC()).To(Equal(licenseKey.ExpiresAt.UTC()))
+}
+
+func TestValidatePayload(t *testing.T) {
+	g := NewWithT(t)
+	g.Expect(ValidatePayload(json.RawMessage(`{"foo":"bar"}`))).To(Succeed())
+	g.Expect(ValidatePayload(json.RawMessage(`{"exp":12345}`))).To(HaveOccurred())
+	g.Expect(ValidatePayload(json.RawMessage(`not-json`))).To(HaveOccurred())
+}

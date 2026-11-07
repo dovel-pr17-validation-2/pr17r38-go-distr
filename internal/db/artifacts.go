@@ -1,0 +1,2065 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"math"
+	"slices"
+	"strings"
+	"time"
+
+	"github.com/containers/image/v5/manifest"
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/dbcrypto"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+	"go.uber.org/zap"
+)
+
+var (
+	artifactOutputExpr = artifactOutputExprWith(EncryptedColumn.Output)
+	// artifactRowOutputExpr is artifactOutputExpr for a row constructor, where the alias that a scan
+	// by name needs is a syntax error.
+	artifactRowOutputExpr = artifactOutputExprWith(EncryptedColumn.Value)
+)
+
+func artifactOutputExprWith(upstreamCredential func(EncryptedColumn, string) string) string {
+	return ` a.id, a.created_at, a.organization_id, a.name, a.image_id, a.title_image_id, a.public, ` +
+		`a.featured, ` +
+		`a.upstream_url, a.last_synced_at, a.last_sync_error, a.upstream_auth_type, ` +
+		upstreamCredential(artifactUpstreamUsername, "a") + `, ` +
+		upstreamCredential(artifactUpstreamPassword, "a") + ` `
+}
+
+var artifactWithDownloadsOutputExpr = artifactOutputExpr +
+	", o.slug AS organization_slug," +
+	artifactDownloadsOutExpr
+
+const (
+	artifactDownloadsOutExpr = `
+		count(DISTINCT avpl.id) AS downloads_total,
+		count(DISTINCT avpl.useraccount_id) FILTER (WHERE avpl.customer_organization_id IS NULL)
+			AS downloaded_by_users_count,
+		coalesce(array_agg(DISTINCT avpl.useraccount_id)
+			FILTER (WHERE avpl.useraccount_id IS NOT NULL
+				AND avpl.customer_organization_id IS NULL), ARRAY[]::UUID[])
+			AS downloaded_by_users,
+		count(DISTINCT avpl.customer_organization_id)
+			AS downloaded_by_customer_organizations_count,
+		coalesce(array_agg(DISTINCT avpl.customer_organization_id)
+			FILTER (WHERE avpl.customer_organization_id IS NOT NULL), ARRAY[]::UUID[])
+			AS downloaded_by_customer_organizations `
+
+	// artifactPullOfCustomerOrgExpr matches pulls of the customer organization given as
+	// @customerOrganizationId, including those of its controllers, which have no user account.
+	// Pulls that predate the customer_organization_id column are attributed via the puller's membership.
+	artifactPullOfCustomerOrgExpr = `
+		(avpl.customer_organization_id = @customerOrganizationId
+			OR (avpl.customer_organization_id IS NULL AND EXISTS (
+				SELECT 1
+				FROM Organization_UserAccount oua
+				WHERE oua.user_account_id = avpl.useraccount_id
+					AND oua.customer_organization_id = @customerOrganizationId
+			))) `
+
+	// customerOrgPullsExpr is a CTE of the pulls of the customer organization given as
+	// @customerOrganizationId. It matches the same pulls as artifactPullOfCustomerOrgExpr, split into two
+	// branches so that each can use an index instead of evaluating the OR for every pull. Neither branch
+	// is limited to an organization, so a query has to scope the pulled artifact to one.
+	customerOrgPullsExpr = `
+	customer_pull AS (
+		SELECT avpl.id
+		FROM ArtifactVersionPull avpl
+		WHERE avpl.customer_organization_id = @customerOrganizationId
+		UNION ALL
+		SELECT avpl.id
+		FROM Organization_UserAccount oua
+			JOIN ArtifactVersionPull avpl
+				ON avpl.useraccount_id = oua.user_account_id AND avpl.customer_organization_id IS NULL
+		WHERE oua.customer_organization_id = @customerOrganizationId
+	)`
+
+	artifactVersionOutputExpr = `
+		v.id,
+		v.created_at,
+		v.created_by_useraccount_id,
+		v.updated_at,
+		v.updated_by_useraccount_id,
+		v.name,
+		v.manifest_blob_digest,
+		v.manifest_blob_size,
+		v.manifest_content_type,
+		v.manifest_data,
+		v.artifact_id `
+)
+
+// artifactVersionPullOutputExpr selects a types.ArtifactVersionPull by position from the pull p joined by
+// artifactVersionPullJoinExpr.
+var artifactVersionPullOutputExpr = `
+	p.id,
+	p.created_at,
+	p.remote_address,
+	p.anonymous,
+	CASE WHEN u.id IS NOT NULL THEN (` + userAccountOutputExpr + `) ELSE NULL END,
+	CASE WHEN co.id IS NOT NULL THEN (` + customerOrganizationOutputExpr + `) ELSE NULL END,
+	CASE WHEN dt.id IS NOT NULL THEN (dt.id, dt.name) ELSE NULL END,
+	(` + artifactRowOutputExpr + `),
+	(` + artifactVersionOutputExpr + `) `
+
+const artifactVersionPullJoinExpr = `
+	LEFT JOIN UserAccount u ON u.id = p.useraccount_id
+	LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id
+	LEFT JOIN DeploymentTarget dt ON dt.id = p.deployment_target_id
+	JOIN ArtifactVersion v ON v.id = p.artifact_version_id
+	JOIN Artifact a ON a.id = v.artifact_id `
+
+// An ArtifactVersion is named either after a tag or, for the row that makes a manifest pullable by
+// digest, after its own manifest digest. Every push creates both, and these expressions are the only
+// place that tells the two apart.
+func artifactVersionIsTagExpr(alias string) string {
+	return alias + ".name <> " + alias + ".manifest_blob_digest"
+}
+
+// versionIsReleaseTagExpr matches the version v when it is a tag that does not match
+// types.NonReleaseTagPattern.
+const versionIsReleaseTagExpr = `v.name <> v.manifest_blob_digest AND v.name !~ '` + types.NonReleaseTagPattern + `'`
+
+//nolint:unparam // the counterpart of artifactVersionIsTagExpr, which takes the alias as well
+func artifactVersionIsDigestExpr(alias string) string {
+	return alias + ".name = " + alias + ".manifest_blob_digest"
+}
+
+func GetArtifactsByOrgID(ctx context.Context, orgID uuid.UUID) ([]types.ArtifactWithDownloads, error) {
+	db := internalctx.GetDb(ctx)
+	if artifactRows, err := db.Query(ctx, `
+			SELECT `+artifactWithDownloadsOutputExpr+`
+			FROM Artifact a
+			JOIN Organization o
+				ON o.id = a.organization_id
+			LEFT JOIN ArtifactVersion av
+				ON a.id = av.artifact_id
+			LEFT JOIN ArtifactVersionPull avpl
+				ON avpl.artifact_version_id = av.id
+			WHERE a.organization_id = @orgId
+			GROUP BY a.id, a.created_at, a.organization_id, a.name, o.slug
+			ORDER BY max(av.created_at) DESC`,
+		pgx.NamedArgs{
+			"orgId": orgID,
+		}); err != nil {
+		return nil, fmt.Errorf("failed to query artifacts: %w", err)
+	} else if artifacts, err := pgx.CollectRows(
+		artifactRows, pgx.RowToStructByName[types.ArtifactWithDownloads],
+	); err != nil {
+		return nil, fmt.Errorf("failed to collect artifacts: %w", err)
+	} else {
+		return artifacts, nil
+	}
+}
+
+func HasUserAccountPulledArtifact(ctx context.Context, userAccountID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var result bool
+	if err := db.QueryRow(ctx,
+		`SELECT EXISTS (SELECT 1 FROM ArtifactVersionPull WHERE useraccount_id = @userAccountId)`,
+		pgx.NamedArgs{"userAccountId": userAccountID},
+	).Scan(&result); err != nil {
+		return false, fmt.Errorf("failed to query artifact pulls of user account: %w", err)
+	}
+	return result, nil
+}
+
+func GetArtifactsByEntitlementOwnerID(ctx context.Context, orgID uuid.UUID, ownerID uuid.UUID) (
+	[]types.ArtifactWithDownloads, error,
+) {
+	db := internalctx.GetDb(ctx)
+	if artifactRows, err := db.Query(ctx, `
+			SELECT `+artifactWithDownloadsOutputExpr+`
+			FROM Artifact a
+			JOIN Organization o
+				ON o.id = a.organization_id
+			LEFT JOIN ArtifactVersion av
+				ON a.id = av.artifact_id
+			LEFT JOIN ArtifactVersionPull avpl
+				ON avpl.artifact_version_id = av.id AND `+artifactPullOfCustomerOrgExpr+`
+			WHERE a.organization_id = @orgId
+			AND (
+				a.public
+				OR EXISTS(
+					SELECT ala.id
+					FROM ArtifactEntitlement_Artifact ala
+					INNER JOIN ArtifactEntitlement al ON ala.artifact_entitlement_id = al.id
+					WHERE al.customer_organization_id = @customerOrganizationId
+					AND (al.expires_at IS NULL OR al.expires_at > now())
+					AND ala.artifact_id = a.id
+				)
+			)
+			GROUP BY a.id, a.created_at, a.organization_id, a.name, o.slug
+			ORDER BY max(av.created_at) DESC`,
+		pgx.NamedArgs{
+			"orgId":                  orgID,
+			"customerOrganizationId": ownerID,
+		}); err != nil {
+		return nil, fmt.Errorf("failed to query artifacts: %w", err)
+	} else if artifacts, err := pgx.CollectRows(
+		artifactRows, pgx.RowToStructByName[types.ArtifactWithDownloads],
+	); err != nil {
+		return nil, fmt.Errorf("failed to collect artifacts: %w", err)
+	} else {
+		return artifacts, nil
+	}
+}
+
+func GetArtifactByID(
+	ctx context.Context,
+	orgID uuid.UUID,
+	artifactID uuid.UUID,
+	customerOrgID *uuid.UUID,
+) (
+	*types.ArtifactWithTaggedVersion,
+	error,
+) {
+	db := internalctx.GetDb(ctx)
+	isVendorUser := customerOrgID == nil
+
+	rows, err := db.Query(
+		ctx, `
+			SELECT `+artifactWithDownloadsOutputExpr+`
+			FROM Artifact a
+			JOIN Organization o
+				ON o.id = a.organization_id
+			LEFT JOIN ArtifactVersion av
+				ON a.id = av.artifact_id
+			LEFT JOIN ArtifactVersionPull avpl
+				ON @isVendorUser AND avpl.artifact_version_id = av.id
+			LEFT JOIN Organization_UserAccount oua_dl
+				ON oua_dl.organization_id = a.organization_id
+					AND oua_dl.user_account_id = avpl.useraccount_id
+			WHERE a.id = @id AND a.organization_id = @orgId
+			GROUP BY a.id, a.created_at, a.organization_id, a.name, o.slug`,
+		pgx.NamedArgs{
+			"id":           artifactID,
+			"orgId":        orgID,
+			"isVendorUser": isVendorUser,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query artifact by ID: %w", err)
+	}
+
+	artifact, err := pgx.CollectExactlyOneRow(rows, pgx.RowToAddrOfStructByName[types.ArtifactWithDownloads])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to collect artifact by ID: %w", err)
+	} else if versions, err := GetVersionsForArtifact(ctx, artifact.ID, customerOrgID); err != nil {
+		return nil, fmt.Errorf("failed to get artifact versions: %w", err)
+	} else if customerOrgID != nil && len(versions) == 0 {
+		return nil, distrerr.ErrNotFound
+	} else {
+		return &types.ArtifactWithTaggedVersion{ArtifactWithDownloads: *artifact, Versions: versions}, nil
+	}
+}
+
+func GetArtifactByName(ctx context.Context, orgSlug, name string) (*types.Artifact, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT`+artifactOutputExpr+`
+			FROM Artifact a
+			JOIN Organization o on o.id = a.organization_id
+			WHERE o.slug = @orgSlug AND a.name = @name
+			ORDER BY a.name`,
+		pgx.NamedArgs{
+			"orgSlug": orgSlug,
+			"name":    name,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query artifacts: %w", err)
+	}
+	if a, err := pgx.CollectExactlyOneRow(rows, pgx.RowToAddrOfStructByName[types.Artifact]); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("failed to get artifact: %w", err)
+	} else {
+		return a, nil
+	}
+}
+
+// artifactVersionVisibleExpr matches the digest version av when it has a tag and either @isVendorUser is set
+// or @customerOrgId may pull it.
+var artifactVersionVisibleExpr = `(
+	@isVendorUser
+	OR a.public
+	-- only check entitlement if there is at least one entitlement in this organization
+	OR NOT EXISTS (
+		SELECT al.id
+		FROM artifact a
+		JOIN ArtifactEntitlement al ON a.organization_id = al.organization_id
+		WHERE a.id = av.artifact_id
+	)
+	-- entitlement check
+	OR EXISTS (
+		-- entitlement for all versions of the artifact
+		SELECT *
+		FROM ArtifactEntitlement_Artifact ala
+		INNER JOIN ArtifactEntitlement al ON ala.artifact_entitlement_id = al.id
+		WHERE ala.artifact_id = av.artifact_id AND ala.artifact_version_id IS NULL
+		AND al.customer_organization_id = @customerOrgId AND (al.expires_at IS NULL OR al.expires_at > now())
+	)
+	OR EXISTS (
+		-- or entitlement only for specific versions or their parent versions
+		WITH RECURSIVE ArtifactVersionAggregate (id, manifest_blob_digest) AS (
+			SELECT avx.id, avx.manifest_blob_digest
+			FROM ArtifactVersion avx
+			WHERE avx.manifest_blob_digest = av.manifest_blob_digest AND avx.artifact_id = av.artifact_id
+
+			UNION ALL
+
+			SELECT DISTINCT avx.id, avx.manifest_blob_digest
+			FROM ArtifactVersion avx
+			JOIN ArtifactVersionPart avp ON avx.id = avp.artifact_version_id
+			JOIN ArtifactVersionAggregate agg ON avp.artifact_blob_digest = agg.manifest_blob_digest
+		)
+		SELECT *
+		FROM ArtifactVersionAggregate avagg
+		INNER JOIN ArtifactEntitlement_Artifact ala ON ala.artifact_version_id = avagg.id
+		INNER JOIN ArtifactEntitlement al ON ala.artifact_entitlement_id = al.id
+		WHERE al.customer_organization_id = @customerOrgId AND (al.expires_at IS NULL OR al.expires_at > now())
+		AND ala.artifact_id = av.artifact_id
+	)
+)
+AND EXISTS (
+	-- only versions that have a tag
+	SELECT avt.id
+	FROM ArtifactVersion avt
+	WHERE avt.manifest_blob_digest = av.manifest_blob_digest
+	AND avt.artifact_id = av.artifact_id
+	AND ` + artifactVersionIsTagExpr("avt") + `
+)`
+
+// ListArtifactReleaseVersions returns the tagged versions of the artifacts with their tag names and whether
+// they are signatures. With licensing, only those the customer organization may pull.
+func ListArtifactReleaseVersions(
+	ctx context.Context,
+	artifactIDs []uuid.UUID,
+	customerOrgID uuid.UUID,
+	licensing bool,
+) ([]types.ArtifactReleaseVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT
+			av.artifact_id,
+			av.id,
+			av.created_at,
+			coalesce((
+				SELECT array_agg(avt.name ORDER BY avt.name)
+				FROM ArtifactVersion avt
+				WHERE avt.manifest_blob_digest = av.manifest_blob_digest
+					AND avt.artifact_id = av.artifact_id
+					AND `+artifactVersionIsTagExpr("avt")+`
+			), ARRAY[]::TEXT[]) AS tag_names,
+			EXISTS (
+				SELECT 1
+				FROM ArtifactVersionPart avp
+					JOIN ArtifactVersion av1 ON av1.manifest_blob_digest = avp.artifact_blob_digest
+				WHERE avp.artifact_version_id = av.id
+					AND convert_from(av1.manifest_data, 'UTF8')::jsonb ->> 'artifactType' = @signatureArtifactType
+			) AS signature
+		FROM ArtifactVersion av
+			JOIN Artifact a ON a.id = av.artifact_id
+		WHERE av.artifact_id = any(@artifactIds)
+			AND `+artifactVersionIsDigestExpr("av")+`
+			AND `+artifactVersionVisibleExpr+`
+		ORDER BY av.created_at DESC`,
+		pgx.NamedArgs{
+			"artifactIds":           artifactIDs,
+			"customerOrgId":         customerOrgID,
+			"isVendorUser":          !licensing,
+			"signatureArtifactType": types.SignatureArtifactType,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query artifact release versions: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ArtifactReleaseVersion])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect artifact release versions: %w", err)
+	}
+	return result, nil
+}
+
+// GetArtifactTagsEntitledToCustomer returns the newest release tags of the artifacts created since, at most
+// limit of them. With licensing, only those the customer organization may pull.
+func GetArtifactTagsEntitledToCustomer(
+	ctx context.Context,
+	artifactIDs []uuid.UUID,
+	customerOrgID uuid.UUID,
+	licensing bool,
+	since time.Time,
+	limit int,
+) ([]types.ArtifactVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+artifactVersionOutputExpr+`
+		FROM ArtifactVersion v
+			JOIN Artifact a ON a.id = v.artifact_id
+			JOIN ArtifactVersion av
+				ON av.artifact_id = v.artifact_id
+					AND av.manifest_blob_digest = v.manifest_blob_digest
+					AND `+artifactVersionIsDigestExpr("av")+`
+		WHERE v.artifact_id = any(@artifactIds)
+			AND v.created_at > @since
+			AND `+versionIsReleaseTagExpr+`
+			AND `+artifactVersionVisibleExpr+`
+		ORDER BY v.created_at DESC
+		LIMIT @limit`,
+		pgx.NamedArgs{
+			"artifactIds":   artifactIDs,
+			"customerOrgId": customerOrgID,
+			"isVendorUser":  !licensing,
+			"since":         since,
+			"limit":         limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query artifact tags: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ArtifactVersion])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect artifact tags: %w", err)
+	}
+	return result, nil
+}
+
+func GetVersionsForArtifact(ctx context.Context, artifactID uuid.UUID, customerOrgID *uuid.UUID) (
+	[]types.TaggedArtifactVersion,
+	error,
+) {
+	isVendorUser := customerOrgID == nil
+
+	db := internalctx.GetDb(ctx)
+	if rows, err := db.Query(ctx, `
+			SELECT
+				av.id,
+				av.created_at,
+				av.manifest_blob_digest,
+				av.manifest_content_type,
+				av.manifest_data,
+				coalesce((
+					SELECT array_agg(row (avt.id, avt.name, (
+						SELECT ROW(
+							count(distinct avplx.id),
+							count(DISTINCT avplx.useraccount_id)
+								FILTER (WHERE avplx.customer_organization_id IS NULL),
+							coalesce(array_agg(DISTINCT avplx.useraccount_id)
+								FILTER (WHERE avplx.useraccount_id IS NOT NULL
+									AND avplx.customer_organization_id IS NULL), ARRAY[]::UUID[]),
+							count(DISTINCT avplx.customer_organization_id),
+							coalesce(array_agg(DISTINCT avplx.customer_organization_id)
+								FILTER (WHERE avplx.customer_organization_id IS NOT NULL), ARRAY[]::UUID[])
+						)
+						FROM ArtifactVersionPull avplx
+						WHERE @isVendorUser AND avplx.artifact_version_id = avt.id
+						)) ORDER BY avt.name
+					)
+					FROM ArtifactVersion avt
+					WHERE avt.manifest_blob_digest = av.manifest_blob_digest
+					AND avt.artifact_id = av.artifact_id
+					AND `+artifactVersionIsTagExpr("avt")+`
+				), ARRAY []::RECORD[]) AS tags,
+				av.manifest_blob_size + coalesce(max(avp.total_parts_size), 0) AS size,
+				`+artifactDownloadsOutExpr+`,
+				(
+					SELECT array_agg(artifact_type)
+					FROM (
+						SELECT DISTINCT
+							array_to_json(array[jsonb_path_query(
+								convert_from(av1.manifest_data ,'UTF8')::jsonb,
+								'$.artifactType'
+							)])->>0 artifact_type
+						FROM ArtifactVersionPart avp
+							JOIN ArtifactVersion av1 ON av1.manifest_blob_digest = avp.artifact_blob_digest
+						WHERE avp.artifact_version_id = av.id
+					) AS referrer_types
+				) AS referrer_artifact_types
+			FROM ArtifactVersion av
+			LEFT JOIN LATERAL (
+				WITH RECURSIVE aggregate AS (
+					SELECT avp.artifact_version_id as base_av_id,
+						   avp.artifact_version_id as related_av_id,
+						   avp.artifact_blob_digest,
+						   avp.artifact_blob_size
+					FROM ArtifactVersionPart avp
+						WHERE avp.artifact_version_id = av.id
+					UNION ALL
+					SELECT aggregate.base_av_id, av1.id, avp.artifact_blob_digest, avp.artifact_blob_size
+					FROM aggregate
+					JOIN ArtifactVersion av1 ON av1.manifest_blob_digest = aggregate.artifact_blob_digest
+					JOIN ArtifactVersionPart avp ON av1.id = avp.artifact_version_id
+				)
+				-- window function (not aggregate) so each row is preserved for the avpl join below;
+				-- max(avp.total_parts_size) in the outer query then recovers the correct total
+				SELECT *, sum(artifact_blob_size) OVER () AS total_parts_size
+				FROM (SELECT DISTINCT * FROM aggregate) d
+			) avp ON av.id = avp.base_av_id
+			LEFT JOIN ArtifactVersionPull avpl ON @isVendorUser AND avpl.artifact_version_id = avp.related_av_id
+			LEFT JOIN Artifact a ON a.id = av.artifact_id
+			LEFT JOIN Organization_UserAccount oua_dl
+				ON oua_dl.organization_id = a.organization_id
+					AND oua_dl.user_account_id = avpl.useraccount_id
+			WHERE av.artifact_id = @artifactId
+			AND `+artifactVersionIsDigestExpr("av")+`
+			AND `+artifactVersionVisibleExpr+`
+			GROUP BY av.id, av.created_at, av.manifest_blob_digest, a.organization_id
+			ORDER BY av.created_at DESC
+			`,
+		pgx.NamedArgs{
+			"artifactId":    artifactID,
+			"customerOrgId": customerOrgID,
+			"isVendorUser":  isVendorUser,
+		}); err != nil {
+		return nil, err
+	} else if versions, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.TaggedArtifactVersion]); err != nil {
+		return nil, err
+	} else {
+		for i, version := range versions {
+			version.InferredType = types.ManifestTypeGeneric
+			if slices.Contains(version.ReferrerArtifactTypes, types.SignatureArtifactType) {
+				version.InferredType = types.ManifestTypeSignature
+			} else if strings.HasPrefix(version.ManifestContentType, "application/vnd.docker") {
+				version.InferredType = types.ManifestTypeContainerImage
+			} else if !manifest.MIMETypeIsMultiImage(version.ManifestContentType) && len(version.ManifestData) > 0 {
+				parsedManifest, err := manifest.FromBlob(version.ManifestData, version.ManifestContentType)
+				if err != nil {
+					return nil, err
+				}
+
+				if strings.HasPrefix(parsedManifest.ConfigInfo().MediaType, "application/vnd.cncf.helm") ||
+					slices.ContainsFunc(parsedManifest.LayerInfos(), func(layer manifest.LayerInfo) bool {
+						return strings.HasPrefix(layer.MediaType, "application/vnd.cncf.helm")
+					}) {
+					version.InferredType = types.ManifestTypeHelmChart
+				}
+			}
+			versions[i] = version
+		}
+		return versions, nil
+	}
+}
+
+func GetOrCreateArtifact(ctx context.Context, orgID uuid.UUID, artifactName string) (*types.Artifact, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO Artifact AS a (name, organization_id)
+		VALUES (@name, @orgId)
+		ON CONFLICT ON CONSTRAINT Artifact_unique_name DO UPDATE SET name = EXCLUDED.name
+		RETURNING`+artifactOutputExpr,
+		pgx.NamedArgs{
+			"name":  artifactName,
+			"orgId": orgID,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not get or create artifact: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.Artifact]); err != nil {
+		return nil, fmt.Errorf("could not collect artifact: %w", err)
+	} else {
+		return &result, nil
+	}
+}
+
+func CreateArtifact(ctx context.Context, artifact *types.Artifact) error {
+	upstreamUsernameEnc, err := artifactUpstreamUsername.EncryptPtr(artifact.UpstreamUsername, artifact.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt upstream username: %w", err)
+	}
+	upstreamPasswordEnc, err := artifactUpstreamPassword.EncryptPtr(artifact.UpstreamPassword, artifact.OrganizationID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt upstream password: %w", err)
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO Artifact AS a (name, organization_id, upstream_url, upstream_auth_type, upstream_username_enc,
+			upstream_password_enc)
+		VALUES (@name, @organizationId, @upstreamUrl, @upstreamAuthType, @upstreamUsernameEnc,
+			@upstreamPasswordEnc)
+		RETURNING `+artifactOutputExpr,
+		pgx.NamedArgs{
+			"name":                artifact.Name,
+			"organizationId":      artifact.OrganizationID,
+			"upstreamUrl":         artifact.UpstreamURL,
+			"upstreamAuthType":    artifact.UpstreamAuthType,
+			"upstreamUsernameEnc": upstreamUsernameEnc,
+			"upstreamPasswordEnc": upstreamPasswordEnc,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert Artifact: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.Artifact]); err != nil {
+		if pgError, ok := errors.AsType[*pgconn.PgError](err); ok && pgError.Code == pgerrcode.UniqueViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return err
+	} else {
+		*artifact = result
+		return nil
+	}
+}
+
+func UpdateArtifactSyncStatus(ctx context.Context, artifactID uuid.UUID, lastSyncError *string) error {
+	db := internalctx.GetDb(ctx)
+	var lastSyncedAt *time.Time
+	if lastSyncError == nil {
+		now := time.Now().UTC()
+		lastSyncedAt = &now
+	}
+	_, err := db.Exec(ctx,
+		`UPDATE Artifact SET last_synced_at = @lastSyncedAt, last_sync_error = @lastSyncError WHERE id = @id`,
+		pgx.NamedArgs{
+			"id":            artifactID,
+			"lastSyncedAt":  lastSyncedAt,
+			"lastSyncError": lastSyncError,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update artifact sync status: %w", err)
+	}
+	return nil
+}
+
+type UpdateArtifactUpstreamParams struct {
+	UpdateURL   bool
+	UpstreamURL *string
+	UpdateAuth  bool
+	AuthType    *types.UpstreamAuthType
+	Username    *dbcrypto.String
+	Password    *dbcrypto.String
+}
+
+// UpdateArtifactUpstream requires the organization of the stored row to still hold: the new
+// credentials are sealed for it and could not be opened in a row moved to another one meanwhile.
+func UpdateArtifactUpstream(
+	ctx context.Context,
+	artifactID, organizationID uuid.UUID,
+	p UpdateArtifactUpstreamParams,
+) error {
+	if !p.UpdateURL && !p.UpdateAuth {
+		return nil
+	}
+	db := internalctx.GetDb(ctx)
+	var setClauses []string
+	args := pgx.NamedArgs{"id": artifactID, "organizationId": organizationID}
+	if p.UpdateURL {
+		setClauses = append(setClauses, "upstream_url = @upstreamUrl")
+		args["upstreamUrl"] = p.UpstreamURL
+	}
+	if p.UpdateAuth {
+		usernameEnc, err := artifactUpstreamUsername.EncryptPtr(p.Username, organizationID)
+		if err != nil {
+			return fmt.Errorf("could not encrypt upstream username: %w", err)
+		}
+		passwordEnc, err := artifactUpstreamPassword.EncryptPtr(p.Password, organizationID)
+		if err != nil {
+			return fmt.Errorf("could not encrypt upstream password: %w", err)
+		}
+		setClauses = append(setClauses,
+			"upstream_auth_type = @authType",
+			"upstream_username = NULL",
+			"upstream_username_enc = @usernameEnc",
+			"upstream_password = NULL",
+			"upstream_password_enc = @passwordEnc",
+		)
+		args["authType"] = p.AuthType
+		args["usernameEnc"] = usernameEnc
+		args["passwordEnc"] = passwordEnc
+	}
+	_, err := db.Exec(ctx,
+		`UPDATE Artifact SET `+strings.Join(setClauses, ", ")+
+			` WHERE id = @id AND organization_id = @organizationId`,
+		args,
+	)
+	if err != nil {
+		return fmt.Errorf("could not update artifact upstream: %w", err)
+	}
+	return nil
+}
+
+func UpdateArtifactPublic(ctx context.Context, artifactID, organizationID uuid.UUID, public bool) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(ctx,
+		`UPDATE Artifact SET public = @public WHERE id = @id AND organization_id = @organizationId`,
+		pgx.NamedArgs{"id": artifactID, "organizationId": organizationID, "public": public},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update artifact visibility: %w", err)
+	}
+	return nil
+}
+
+func UpdateArtifactFeatured(
+	ctx context.Context,
+	artifactID, organizationID uuid.UUID,
+	featured bool,
+) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(ctx,
+		`UPDATE Artifact SET featured = @featured WHERE id = @id AND organization_id = @organizationId`,
+		pgx.NamedArgs{"id": artifactID, "organizationId": organizationID, "featured": featured},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update whether the artifact is featured: %w", err)
+	}
+	return nil
+}
+
+func GetArtifactsWithUpstreamURL(ctx context.Context) ([]types.Artifact, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `SELECT`+artifactOutputExpr+`FROM Artifact a WHERE a.upstream_url IS NOT NULL`)
+	if err != nil {
+		return nil, fmt.Errorf("could not query artifacts with upstream URL: %w", err)
+	}
+	return pgx.CollectRows(rows, pgx.RowToStructByName[types.Artifact])
+}
+
+func HasAnyArtifactEntitlement(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var hasEntitlements bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM ArtifactEntitlement al
+			WHERE al.organization_id = @orgId
+		)`,
+		pgx.NamedArgs{"orgId": orgID},
+	).Scan(&hasEntitlements)
+	if err != nil {
+		return false, fmt.Errorf("could not check for entitlements: %w", err)
+	}
+	return hasEntitlements, nil
+}
+
+func CheckEntitlementForArtifact(
+	ctx context.Context,
+	orgName, name, reference string,
+	customerOrganizationID uuid.UUID,
+	orgID uuid.UUID,
+) error {
+	hasEntitlements, err := HasAnyArtifactEntitlement(ctx, orgID)
+	if err != nil {
+		return err
+	} else if !hasEntitlements {
+		return nil
+	}
+
+	db := internalctx.GetDb(ctx)
+	// referenceExists tells us whether the reference resolves to any ArtifactVersion at all, so that a
+	// non-existent reference (e.g. an OCI referrers fallback tag "sha256-<digest>" that was never pushed)
+	// results in a 404 further down the line instead of being misreported as a missing entitlement.
+	var referenceExists, entitled bool
+	err = db.QueryRow(
+		ctx,
+		`WITH RECURSIVE ArtifactVersionAggregate (id, artifact_id, manifest_blob_digest) AS (
+			SELECT av.id, av.artifact_id, av.manifest_blob_digest
+				FROM Artifact a
+				JOIN ArtifactVersion av ON a.id = av.artifact_id
+				JOIN ArtifactVersion avx ON a.id = avx.artifact_id AND avx.manifest_blob_digest = av.manifest_blob_digest
+				JOIN Organization o ON o.id = a.organization_id
+				WHERE o.slug = @orgName
+				AND a.name = @name
+				AND (avx.name = @reference OR avx.manifest_blob_digest = @reference)
+			UNION ALL
+			SELECT DISTINCT av.id, av.artifact_id, av.manifest_blob_digest
+				FROM ArtifactVersion av
+				JOIN ArtifactVersionPart avp ON av.id = avp.artifact_version_id
+				JOIN ArtifactVersionAggregate agg ON avp.artifact_blob_digest = agg.manifest_blob_digest
+		)
+		SELECT
+			exists(SELECT 1 FROM ArtifactVersionAggregate),
+			exists(
+				SELECT 1
+					FROM Artifact a
+					WHERE a.organization_id = @orgId AND a.name = @name AND a.public
+			)
+			OR exists(
+				SELECT 1
+					FROM ArtifactVersionAggregate av
+					JOIN ArtifactEntitlement_Artifact ala
+						ON av.artifact_id = ala.artifact_id
+							AND (ala.artifact_version_id IS NULL OR ala.artifact_version_id = av.id)
+					JOIN ArtifactEntitlement al ON ala.artifact_entitlement_id = al.id
+					WHERE al.customer_organization_id = @customerOrganizationId
+						AND (al.expires_at IS NULL OR al.expires_at > now())
+			)`,
+		pgx.NamedArgs{
+			"orgName":                orgName,
+			"orgId":                  orgID,
+			"name":                   name,
+			"reference":              reference,
+			"customerOrganizationId": customerOrganizationID,
+		},
+	).Scan(&referenceExists, &entitled)
+	if err != nil {
+		return fmt.Errorf("could not query ArtifactVersion: %w", err)
+	} else if referenceExists && !entitled {
+		return distrerr.ErrForbidden
+	}
+	return nil
+}
+
+func ArtifactBlobBelongsToOrg(ctx context.Context, orgID uuid.UUID, blobDigest string) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	var belongs bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM ArtifactVersionPart avp
+			JOIN ArtifactVersion av ON av.id = avp.artifact_version_id
+			JOIN Artifact a ON a.id = av.artifact_id
+			WHERE a.organization_id = @orgId AND avp.artifact_blob_digest = @blobDigest
+		) OR EXISTS(
+			SELECT 1
+			FROM ArtifactVersion av
+			JOIN Artifact a ON a.id = av.artifact_id
+			WHERE a.organization_id = @orgId AND av.manifest_blob_digest = @blobDigest
+		)`,
+		pgx.NamedArgs{"orgId": orgID, "blobDigest": blobDigest},
+	).Scan(&belongs)
+	if err != nil {
+		return false, fmt.Errorf("could not check blob ownership: %w", err)
+	}
+	return belongs, nil
+}
+
+// ArtifactBlobBelongsToPublicArtifact narrows ArtifactBlobBelongsToOrg down to a single public
+// artifact, so that an anonymous caller who knows a digest cannot reach it through a private
+// artifact that happens to reference the same blob.
+func ArtifactBlobBelongsToPublicArtifact(
+	ctx context.Context,
+	orgSlug, artifactName, blobDigest string,
+) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	args := pgx.NamedArgs{"orgSlug": orgSlug, "name": artifactName, "blobDigest": blobDigest}
+	var belongs bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS(
+			SELECT 1
+			FROM ArtifactVersionPart avp
+			JOIN ArtifactVersion av ON av.id = avp.artifact_version_id
+			JOIN Artifact a ON a.id = av.artifact_id
+			JOIN Organization o ON o.id = a.organization_id
+			WHERE o.slug = @orgSlug AND a.name = @name AND a.public
+				AND avp.artifact_blob_digest = @blobDigest
+		) OR EXISTS(
+			SELECT 1
+			FROM ArtifactVersion av
+			JOIN Artifact a ON a.id = av.artifact_id
+			JOIN Organization o ON o.id = a.organization_id
+			WHERE o.slug = @orgSlug AND a.name = @name AND a.public
+				AND av.manifest_blob_digest = @blobDigest
+		)`,
+		args,
+	).Scan(&belongs)
+	if err != nil {
+		return false, fmt.Errorf("could not check public blob ownership: %w", err)
+	}
+	return belongs, nil
+}
+
+func CheckEntitlementForArtifactBlob(ctx context.Context, digest, artifactName string,
+	customerOrganizationID uuid.UUID,
+	orgID uuid.UUID,
+) error {
+	hasEntitlements, err := HasAnyArtifactEntitlement(ctx, orgID)
+	if err != nil {
+		return err
+	} else if !hasEntitlements {
+		return nil
+	}
+
+	db := internalctx.GetDb(ctx)
+
+	// NOTE: Unlike CheckEntitlementForArtifact, this check must NOT treat an unknown digest as "not found
+	// and therefore allowed". The digest is not scoped to a repo here, and for pull-through cache artifacts
+	// the blob handler fetches unknown blobs from upstream on demand. Allowing an unresolved digest would
+	// let a licensed customer without an entitlement trigger such a fetch and receive the blob. We therefore
+	// deny whenever the digest does not resolve to an entitled ArtifactVersion.
+	rows, err := db.Query(
+		ctx,
+		`WITH RECURSIVE ArtifactVersionAggregate (id, artifact_id, manifest_blob_digest) AS (
+			SELECT av.id, av.artifact_id, av.manifest_blob_digest
+				FROM ArtifactVersion av
+				JOIN ArtifactVersionPart avp ON av.id = avp.artifact_version_id
+				WHERE avp.artifact_blob_digest = @digest
+			UNION ALL
+			SELECT DISTINCT av.id, av.artifact_id, av.manifest_blob_digest
+				FROM ArtifactVersion av
+				JOIN ArtifactVersionPart avp ON av.id = avp.artifact_version_id
+				JOIN ArtifactVersionAggregate agg ON avp.artifact_blob_digest = agg.manifest_blob_digest
+		)
+		SELECT exists(
+			-- a blob digest is shared across organizations, so the public artifact that carries it
+			-- has to be the one this request names, in the organization the caller belongs to
+			SELECT 1
+				FROM ArtifactVersionAggregate av
+				JOIN Artifact a ON a.id = av.artifact_id
+				WHERE a.organization_id = @orgId AND a.name = @artifactName AND a.public
+		) OR exists(
+			SELECT *
+				FROM ArtifactVersionAggregate av
+				JOIN ArtifactEntitlement_Artifact ala
+					ON av.artifact_id = ala.artifact_id
+						AND (ala.artifact_version_id IS NULL OR ala.artifact_version_id = av.id)
+				JOIN ArtifactEntitlement al ON ala.artifact_entitlement_id = al.id
+				WHERE al.customer_organization_id = @customerOrganizationId
+					AND (al.expires_at IS NULL OR al.expires_at > now())
+		)`,
+		pgx.NamedArgs{
+			"digest":                 digest,
+			"artifactName":           artifactName,
+			"orgId":                  orgID,
+			"customerOrganizationId": customerOrganizationID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	exists, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	if err != nil {
+		return fmt.Errorf("could not query ArtifactVersion: %w", err)
+	} else if !exists {
+		return distrerr.ErrForbidden
+	}
+	return nil
+}
+
+func GetArtifactVersion(ctx context.Context, orgName, name, reference string) (*types.ArtifactVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT`+artifactVersionOutputExpr+`
+		FROM Artifact a
+		JOIN Organization o ON o.id = a.organization_id
+		LEFT JOIN ArtifactVersion v ON a.id = v.artifact_id
+		WHERE o.slug = @orgName
+			AND a.name = @name
+			AND v.name = @reference`,
+		pgx.NamedArgs{"orgName": orgName, "name": name, "reference": reference},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersion])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	return &result, nil
+}
+
+func GetArtifactTagDigest(
+	ctx context.Context,
+	organizationID uuid.UUID,
+	orgSlug, artifactName, tag string,
+) (*types.Digest, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT v.manifest_blob_digest
+		FROM ArtifactVersion v
+		JOIN Artifact a ON a.id = v.artifact_id
+		JOIN Organization o ON o.id = a.organization_id
+		WHERE o.id = @organizationId
+			AND o.slug = @orgSlug
+			AND a.name = @artifactName
+			AND v.name = @tag`,
+		pgx.NamedArgs{"organizationId": organizationID, "orgSlug": orgSlug, "artifactName": artifactName, "tag": tag},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersion digest: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[types.Digest])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("could not get ArtifactVersion digest: %w", err)
+	}
+	return &result, nil
+}
+
+func GetNewestArtifactTag(
+	ctx context.Context,
+	artifactID uuid.UUID,
+	artifactVersionIDs []uuid.UUID,
+) (*types.ArtifactVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`SELECT`+artifactVersionOutputExpr+`
+		FROM ArtifactVersion v
+		WHERE v.artifact_id = @artifactId
+			AND `+versionIsReleaseTagExpr+`
+			AND (@allVersions OR v.manifest_blob_digest IN (
+				SELECT manifest_blob_digest FROM ArtifactVersion WHERE id = any(@artifactVersionIds)
+			))
+		ORDER BY v.created_at DESC
+		LIMIT 1`,
+		pgx.NamedArgs{
+			"artifactId":         artifactID,
+			"allVersions":        len(artifactVersionIDs) == 0,
+			"artifactVersionIds": artifactVersionIDs,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersion])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("could not collect ArtifactVersion: %w", err)
+	}
+	return &result, nil
+}
+
+func CreateArtifactVersion(ctx context.Context, av *types.ArtifactVersion) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO ArtifactVersion AS av (
+            name,
+			created_by_useraccount_id,
+			manifest_blob_digest,
+			manifest_blob_size,
+			manifest_content_type,
+			manifest_data,
+			artifact_id
+        ) VALUES (
+        	@name, @createdById, @manifestBlobDigest, @manifestBlobSize, @manifestContentType, @manifestData,
+			@artifactId
+        ) RETURNING *`,
+		pgx.NamedArgs{
+			"name":                av.Name,
+			"createdById":         av.CreatedByUserAccountID,
+			"manifestBlobDigest":  av.ManifestBlobDigest,
+			"manifestBlobSize":    av.ManifestBlobSize,
+			"manifestContentType": av.ManifestContentType,
+			"manifestData":        av.ManifestData,
+			"artifactId":          av.ArtifactID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert ArtifactVersion: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersion]); err != nil {
+		var pgError *pgconn.PgError
+		if errors.As(err, &pgError) && pgError.Code == pgerrcode.UniqueViolation {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+		return err
+	} else {
+		*av = result
+		return nil
+	}
+}
+
+func CreateArtifactVersionPart(ctx context.Context, avp *types.ArtifactVersionPart) error {
+	db := internalctx.GetDb(ctx)
+	if rows, err := db.Query(
+		ctx,
+		`INSERT INTO ArtifactVersionPart AS avp (
+        	artifact_version_id, artifact_blob_digest, artifact_blob_size
+        ) VALUES (@versionId, @blobDigest, @blobSize)
+		ON CONFLICT (artifact_version_id, artifact_blob_digest)
+			DO UPDATE SET
+				artifact_version_id = @versionId,
+				artifact_blob_digest = @blobDigest,
+				artifact_blob_size = @blobSize
+		RETURNING *`,
+		pgx.NamedArgs{
+			"versionId":  avp.ArtifactVersionID,
+			"blobDigest": avp.ArtifactBlobDigest,
+			"blobSize":   avp.ArtifactBlobSize,
+		},
+	); err != nil {
+		return fmt.Errorf("could not insert ArtifactVersionPart: %w", err)
+	} else if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersionPart]); err != nil {
+		return err
+	} else {
+		*avp = result
+		return nil
+	}
+}
+
+func BulkUpsertArtifactVersionParts(ctx context.Context, parts []types.ArtifactVersionPart) error {
+	if len(parts) == 0 {
+		return nil
+	}
+	db := internalctx.GetDb(ctx)
+
+	type key struct {
+		versionID uuid.UUID
+		digest    types.Digest
+	}
+	seen := make(map[key]struct{}, len(parts))
+	deduped := parts[:0:0]
+	for _, p := range parts {
+		k := key{p.ArtifactVersionID, p.ArtifactBlobDigest}
+		if _, ok := seen[k]; !ok {
+			seen[k] = struct{}{}
+			deduped = append(deduped, p)
+		}
+	}
+	parts = deduped
+
+	versionIDs := make([]uuid.UUID, len(parts))
+	digests := make([]string, len(parts))
+	sizes := make([]int64, len(parts))
+	for i, p := range parts {
+		versionIDs[i] = p.ArtifactVersionID
+		digests[i] = string(p.ArtifactBlobDigest)
+		sizes[i] = p.ArtifactBlobSize
+	}
+	_, err := db.Exec(ctx, `
+		INSERT INTO ArtifactVersionPart (artifact_version_id, artifact_blob_digest, artifact_blob_size)
+		SELECT * FROM unnest($1::uuid[], $2::text[], $3::bigint[])
+		ON CONFLICT (artifact_version_id, artifact_blob_digest) DO UPDATE SET
+			artifact_blob_size = EXCLUDED.artifact_blob_size`,
+		versionIDs, digests, sizes,
+	)
+	if err != nil {
+		return fmt.Errorf("could not bulk upsert ArtifactVersionParts: %w", err)
+	}
+	return nil
+}
+
+// GetFirstArtifactVersionPullsOfCustomerOrganization returns when each user of the customer organization first
+// pulled each release tag created within the time window.
+func GetFirstArtifactVersionPullsOfCustomerOrganization(
+	ctx context.Context,
+	orgID, customerOrgID uuid.UUID,
+	artifactIDs []uuid.UUID,
+	since time.Time,
+	limit int,
+) ([]types.ArtifactVersionPull, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`WITH `+customerOrgPullsExpr+`
+		SELECT * FROM (
+			SELECT DISTINCT ON (v.id, p.useraccount_id) `+artifactVersionPullOutputExpr+`
+			FROM customer_pull cp
+				JOIN ArtifactVersionPull p ON p.id = cp.id `+artifactVersionPullJoinExpr+`
+			WHERE a.organization_id = @orgId
+				AND a.id = any(@artifactIds)
+				AND p.useraccount_id IS NOT NULL
+				AND v.created_at > @since
+				AND `+versionIsReleaseTagExpr+`
+			ORDER BY v.id, p.useraccount_id, p.created_at
+		) first_pull
+		ORDER BY created_at DESC
+		LIMIT @limit`,
+		pgx.NamedArgs{
+			"orgId":                  orgID,
+			"customerOrganizationId": customerOrgID,
+			"artifactIds":            artifactIDs,
+			"since":                  since,
+			"limit":                  limit,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query first artifact version pulls: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.ArtifactVersionPull])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect first artifact version pulls: %w", err)
+	}
+	return result, nil
+}
+
+// GetLatestArtifactPullsOfCustomerOrganization returns the most recent pull of a release tag by the customer
+// organization for each of the given artifacts that it has pulled at all. Pulls of a manifest by digest are
+// left out: a client pulling by tag always resolves the tag first, which is recorded as well, and the child
+// manifests of an index are only ever pulled by digest.
+func GetLatestArtifactPullsOfCustomerOrganization(
+	ctx context.Context,
+	orgID, customerOrgID uuid.UUID,
+	artifactIDs []uuid.UUID,
+) ([]types.ArtifactVersionPull, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`WITH `+customerOrgPullsExpr+`
+		SELECT DISTINCT ON (v.artifact_id) `+artifactVersionPullOutputExpr+`
+		FROM customer_pull cp
+			JOIN ArtifactVersionPull p ON p.id = cp.id `+artifactVersionPullJoinExpr+`
+		WHERE a.organization_id = @orgId
+			AND v.artifact_id = any(@artifactIds)
+			AND `+versionIsReleaseTagExpr+`
+		ORDER BY v.artifact_id, p.created_at DESC`,
+		pgx.NamedArgs{"orgId": orgID, "customerOrganizationId": customerOrgID, "artifactIds": artifactIDs},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query latest artifact pulls: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.ArtifactVersionPull])
+	if err != nil {
+		return nil, fmt.Errorf("failed to collect latest artifact pulls: %w", err)
+	}
+	return result, nil
+}
+
+func CreateArtifactPullLogEntry(
+	ctx context.Context,
+	versionID,
+	userID uuid.UUID,
+	remoteAddress string,
+	customerOrgID *uuid.UUID,
+	deploymentTargetID *uuid.UUID,
+	anonymous bool,
+) error {
+	db := internalctx.GetDb(ctx)
+	remoteAddressPtr := &remoteAddress
+	if remoteAddress == "" {
+		remoteAddressPtr = nil
+	}
+
+	args := pgx.NamedArgs{
+		"versionId":          versionID,
+		"remoteAddress":      remoteAddressPtr,
+		"customerOrgId":      customerOrgID,
+		"deploymentTargetId": deploymentTargetID,
+		"anonymous":          anonymous,
+	}
+
+	if userID != uuid.Nil {
+		args["userId"] = userID
+	} else {
+		args["userId"] = nil
+	}
+
+	_, err := db.Exec(
+		ctx,
+		`INSERT INTO ArtifactVersionPull (
+			artifact_version_id,
+			useraccount_id,
+			remote_address,
+			customer_organization_id,
+			deployment_target_id,
+			anonymous
+		)
+		VALUES (
+			@versionId,
+			@userId,
+			@remoteAddress,
+			@customerOrgId,
+			@deploymentTargetId,
+			@anonymous
+		)`,
+		args,
+	)
+	if err != nil {
+		return fmt.Errorf("could not create artifact pull log entry: %w", err)
+	}
+	return nil
+}
+
+func EnsureArtifactTagLimitForInsert(ctx context.Context, orgID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT count(av.name) + 1 < coalesce(
+			o.artifact_tag_limit,
+			CASE WHEN @defaultLimit > 0 THEN @defaultLimit ELSE @maxLimit END
+		)
+		FROM ArtifactVersion av
+		JOIN Artifact a on av.artifact_id = a.id
+		JOIN Organization o ON a.organization_id = o.id
+		WHERE o.id = @orgId AND `+artifactVersionIsTagExpr("av")+`
+		GROUP BY o.id;`,
+		pgx.NamedArgs{
+			"orgId":        orgID,
+			"defaultLimit": env.ArtifactTagsDefaultLimitPerOrg(),
+			"maxLimit":     math.MaxInt32,
+		},
+	)
+	if err != nil {
+		return false, fmt.Errorf("could not check quota: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[struct{ Ok bool }])
+	// If there are no rows, the organization has no tags yet, and the limit is not exceeded.
+	if errors.Is(err, pgx.ErrNoRows) {
+		return true, nil
+	} else if err != nil {
+		return false, fmt.Errorf("could not check quota: %w", err)
+	} else {
+		return result.Ok, nil
+	}
+}
+
+func GetArtifactVersionPullFilterOptions(
+	ctx context.Context,
+	orgID uuid.UUID,
+	partnerOrganizationID *uuid.UUID,
+) (*types.ArtifactVersionPullFilterOptions, error) {
+	db := internalctx.GetDb(ctx)
+	result := &types.ArtifactVersionPullFilterOptions{}
+
+	baseFromExpr := ` ArtifactVersionPull p` +
+		` JOIN ArtifactVersion v ON v.id = p.artifact_version_id` +
+		` JOIN Artifact a ON a.id = v.artifact_id `
+	baseWhereExpr := ` a.organization_id = @orgId AND (@isVendor OR co.partner_organization_id = @partnerOrgId) `
+
+	args := pgx.NamedArgs{
+		"orgId":        orgID,
+		"isVendor":     partnerOrganizationID == nil,
+		"partnerOrgId": partnerOrganizationID,
+	}
+
+	// Customer organizations
+	rows, err := db.Query(
+		ctx,
+		`SELECT co.id, co.name FROM `+baseFromExpr+
+			` JOIN CustomerOrganization co ON co.id = p.customer_organization_id`+
+			` WHERE `+baseWhereExpr+
+			` GROUP BY co.id, co.name ORDER BY co.name`,
+		args,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query customer organizations for filter options: %w", err)
+	}
+	if result.CustomerOrganizations, err = pgx.CollectRows(rows, pgx.RowToStructByPos[types.FilterOption]); err != nil {
+		return nil, fmt.Errorf("could not scan customer organizations for filter options: %w", err)
+	}
+
+	// User accounts
+	rows, err = db.Query(
+		ctx,
+		`SELECT u.id, COALESCE(NULLIF(u.name, ''), u.email) AS name FROM `+baseFromExpr+
+			` JOIN UserAccount u ON u.id = p.useraccount_id`+
+			` LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id`+
+			` WHERE `+baseWhereExpr+
+			` GROUP BY u.id, u.name, u.email ORDER BY name`,
+		args,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query user accounts for filter options: %w", err)
+	}
+	if result.UserAccounts, err = pgx.CollectRows(rows, pgx.RowToStructByPos[types.FilterOption]); err != nil {
+		return nil, fmt.Errorf("could not scan user accounts for filter options: %w", err)
+	}
+
+	// Remote addresses
+	rows, err = db.Query(
+		ctx,
+		`SELECT p.remote_address FROM `+baseFromExpr+
+			` LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id`+
+			` WHERE `+baseWhereExpr+` AND p.remote_address IS NOT NULL`+
+			` GROUP BY p.remote_address ORDER BY p.remote_address`,
+		args,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query remote addresses for filter options: %w", err)
+	}
+	if result.RemoteAddresses, err = pgx.CollectRows(rows, pgx.RowTo[string]); err != nil {
+		return nil, fmt.Errorf("could not scan remote addresses for filter options: %w", err)
+	}
+
+	// Artifacts
+	rows, err = db.Query(
+		ctx,
+		`SELECT a.id, a.name FROM `+baseFromExpr+
+			` LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id`+
+			` WHERE `+baseWhereExpr+
+			` GROUP BY a.id, a.name ORDER BY a.name`,
+		args,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query artifacts for filter options: %w", err)
+	}
+	if result.Artifacts, err = pgx.CollectRows(rows, pgx.RowToStructByPos[types.FilterOption]); err != nil {
+		return nil, fmt.Errorf("could not scan artifacts for filter options: %w", err)
+	}
+
+	// Deployment targets
+	rows, err = db.Query(
+		ctx,
+		`SELECT dt.id, dt.name FROM `+baseFromExpr+
+			` JOIN DeploymentTarget dt ON dt.id = p.deployment_target_id`+
+			` LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id`+
+			` WHERE `+baseWhereExpr+
+			` GROUP BY dt.id, dt.name ORDER BY dt.name`,
+		args,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query deployment targets for filter options: %w", err)
+	}
+	if result.DeploymentTargets, err = pgx.CollectRows(rows, pgx.RowToStructByPos[types.FilterOption]); err != nil {
+		return nil, fmt.Errorf("could not scan deployment targets for filter options: %w", err)
+	}
+
+	return result, nil
+}
+
+func GetArtifactVersionPullVersionOptions(
+	ctx context.Context,
+	orgID uuid.UUID,
+	artifactID uuid.UUID,
+	partnerOrganizationID *uuid.UUID,
+) ([]types.FilterOption, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`SELECT v.id, v.name
+		FROM ArtifactVersionPull p
+			JOIN ArtifactVersion v ON v.id = p.artifact_version_id
+			JOIN Artifact a ON a.id = v.artifact_id
+			LEFT JOIN CustomerOrganization co ON co.id = p.customer_organization_id
+		WHERE a.organization_id = @orgId
+			AND a.id = @artifactId
+			AND (@isVendor OR co.partner_organization_id = @partnerOrgId)
+		GROUP BY v.id, v.name
+		ORDER BY v.name`,
+		pgx.NamedArgs{
+			"orgId":        orgID,
+			"artifactId":   artifactID,
+			"isVendor":     partnerOrganizationID == nil,
+			"partnerOrgId": partnerOrganizationID,
+		})
+	if err != nil {
+		return nil, fmt.Errorf("could not query artifact version options: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.FilterOption])
+	if err != nil {
+		return nil, fmt.Errorf("could not scan artifact version options: %w", err)
+	}
+	return result, nil
+}
+
+func GetArtifactVersionPulls(
+	ctx context.Context,
+	filter types.ArtifactVersionPullFilter,
+) ([]types.ArtifactVersionPull, error) {
+	db := internalctx.GetDb(ctx)
+
+	conditions := []string{
+		"a.organization_id = @orgId",
+		"p.created_at < @before",
+		"(@isVendor OR co.partner_organization_id = @partnerOrgId)",
+	}
+	args := pgx.NamedArgs{
+		"orgId":        filter.OrgID,
+		"before":       filter.Before,
+		"count":        filter.Count,
+		"isVendor":     filter.PartnerOrganizationID == nil,
+		"partnerOrgId": filter.PartnerOrganizationID,
+	}
+
+	if !filter.After.IsZero() {
+		conditions = append(conditions, "p.created_at > @after")
+		args["after"] = filter.After
+	}
+	if filter.CustomerOrganizationID != nil {
+		conditions = append(conditions, "p.customer_organization_id = @customerOrgId")
+		args["customerOrgId"] = *filter.CustomerOrganizationID
+	}
+	if filter.UserAccountID != nil {
+		conditions = append(conditions, "p.useraccount_id = @userAccountId")
+		args["userAccountId"] = *filter.UserAccountID
+	}
+	if filter.Anonymous {
+		conditions = append(conditions, "p.anonymous")
+	}
+	if filter.RemoteAddress != nil {
+		conditions = append(conditions, "p.remote_address = @remoteAddress")
+		args["remoteAddress"] = *filter.RemoteAddress
+	}
+	if filter.ArtifactID != nil {
+		conditions = append(conditions, "a.id = @artifactId")
+		args["artifactId"] = *filter.ArtifactID
+	}
+	if filter.ArtifactVersionID != nil {
+		conditions = append(conditions, "v.id = @artifactVersionId")
+		args["artifactVersionId"] = *filter.ArtifactVersionID
+	}
+	if filter.DeploymentTargetID != nil {
+		conditions = append(conditions, "p.deployment_target_id = @deploymentTargetId")
+		args["deploymentTargetId"] = *filter.DeploymentTargetID
+	}
+
+	query := `SELECT ` + artifactVersionPullOutputExpr + `
+		FROM ArtifactVersionPull p ` + artifactVersionPullJoinExpr + `
+		WHERE ` + strings.Join(conditions, " AND ") + `
+		ORDER BY p.created_at DESC
+		LIMIT @count`
+
+	rows, err := db.Query(ctx, query, args)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersionPulls: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.ArtifactVersionPull])
+	if err != nil {
+		return nil, fmt.Errorf("could not scan ArtifactVersionPulls: %w", err)
+	}
+	return result, nil
+}
+
+func UpdateArtifactImage(ctx context.Context, artifact *types.ArtifactWithTaggedVersion, imageID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	row := db.QueryRow(ctx,
+		`UPDATE Artifact SET image_id = @imageId WHERE id = @id RETURNING image_id`,
+		pgx.NamedArgs{"imageId": imageID, "id": artifact.ID},
+	)
+	if err := row.Scan(&artifact.ImageID); err != nil {
+		return fmt.Errorf("could not save image id to artifact: %w", err)
+	}
+	return nil
+}
+
+func UpdateArtifactTitleImage(ctx context.Context, artifact *types.ArtifactWithTaggedVersion, imageID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	row := db.QueryRow(ctx,
+		`UPDATE Artifact SET title_image_id = @imageId WHERE id = @id RETURNING title_image_id`,
+		pgx.NamedArgs{"imageId": imageID, "id": artifact.ID},
+	)
+	if err := row.Scan(&artifact.TitleImageID); err != nil {
+		return fmt.Errorf("could not save title image id to artifact: %w", err)
+	}
+	return nil
+}
+
+func ArtifactIsReferencedInEntitlements(ctx context.Context, artifactID uuid.UUID) (bool, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT count(ala.id) > 0
+		FROM ArtifactEntitlement_Artifact ala
+		WHERE ala.artifact_id = @artifactId`,
+		pgx.NamedArgs{"artifactId": artifactID},
+	)
+	if err != nil {
+		return false, err
+	}
+	exists, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
+}
+
+// GetArtifactVersionByName retrieves an artifact version by its tag name
+func GetArtifactVersionByName(
+	ctx context.Context,
+	artifactID uuid.UUID,
+	tagName string,
+) (*types.ArtifactVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+artifactVersionOutputExpr+`
+		FROM ArtifactVersion v
+		WHERE v.artifact_id = @artifactId
+		AND v.name = @tagName`,
+		pgx.NamedArgs{
+			"artifactId": artifactID,
+			"tagName":    tagName,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersion])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not query ArtifactVersion: %w", err)
+	}
+	return &result, nil
+}
+
+// GetArtifactVersionsByDigest retrieves all artifact versions with the same manifest_blob_digest
+func GetArtifactVersionsByDigest(
+	ctx context.Context,
+	artifactID uuid.UUID,
+	digest string,
+) ([]types.ArtifactVersion, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT `+artifactVersionOutputExpr+`
+		FROM ArtifactVersion v
+		WHERE v.artifact_id = @artifactId
+		AND v.manifest_blob_digest = @digest
+		ORDER BY v.created_at DESC`,
+		pgx.NamedArgs{
+			"artifactId": artifactID,
+			"digest":     digest,
+		},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query ArtifactVersions: %w", err)
+	}
+	results, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.ArtifactVersion])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect ArtifactVersions: %w", err)
+	}
+	return results, nil
+}
+
+// CheckArtifactVersionDeletionForEntitlements performs comprehensive entitlement validation before deleting a tag
+// It checks if the deletion would break entitlement access by verifying:
+// 1. If the SHA version is referenced in entitlements
+// 2. If there are other non-SHA tags pointing to the same digest
+// 3. If there are all-versions entitlements (without artifact_version_id)
+// Returns error if deletion should be prevented due to entitlement references
+func CheckArtifactVersionDeletionForEntitlements(
+	ctx context.Context,
+	artifactID uuid.UUID,
+	version *types.ArtifactVersion,
+	versionsWithSameDigest []types.ArtifactVersion,
+) error {
+	db := internalctx.GetDb(ctx)
+
+	var digestVersion *types.ArtifactVersion
+	for i := range versionsWithSameDigest {
+		if versionsWithSameDigest[i].IsDigestVersion() {
+			digestVersion = &versionsWithSameDigest[i]
+			break
+		}
+	}
+
+	if digestVersion == nil {
+		return checkAllVersionsEntitlement(ctx, artifactID)
+	}
+
+	var isReferencedCount int64
+	err := db.QueryRow(ctx, `
+		SELECT count(*)
+		FROM ArtifactEntitlement_Artifact ala
+		WHERE ala.artifact_version_id = @digestVersionId`,
+		pgx.NamedArgs{
+			"digestVersionId": digestVersion.ID,
+		},
+	).Scan(&isReferencedCount)
+	if err != nil {
+		return fmt.Errorf("could not check entitlement references: %w", err)
+	}
+
+	if isReferencedCount > 0 {
+		otherTags := 0
+		for _, v := range versionsWithSameDigest {
+			if v.Name != version.Name && !v.IsDigestVersion() {
+				otherTags++
+			}
+		}
+
+		if otherTags == 0 {
+			return distrerr.NewBadRequest(
+				"cannot delete tag: the manifest digest is referenced in one or more entitlements " +
+					"and this is the last non-SHA tag pointing to it",
+			)
+		}
+	}
+
+	return checkAllVersionsEntitlement(ctx, artifactID)
+}
+
+// checkAllVersionsEntitlement checks if there's an entitlement referencing the artifact without any artifact_version_id
+func checkAllVersionsEntitlement(ctx context.Context, artifactID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	var hasAllVersionsEntitlement bool
+	err := db.QueryRow(ctx, `
+		SELECT count(*) > 0
+		FROM ArtifactEntitlement_Artifact ala
+		WHERE ala.artifact_id = @artifactId
+		AND ala.artifact_version_id IS NULL`,
+		pgx.NamedArgs{
+			"artifactId": artifactID,
+		},
+	).Scan(&hasAllVersionsEntitlement)
+	if err != nil {
+		return fmt.Errorf("could not check all-versions entitlement: %w", err)
+	}
+
+	if hasAllVersionsEntitlement {
+		return distrerr.NewBadRequest("cannot delete tag: there is an all-versions entitlement for this artifact")
+	}
+
+	return nil
+}
+
+func DeleteArtifactWithID(ctx context.Context, id uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(ctx, `DELETE FROM Artifact WHERE id = @id`, pgx.NamedArgs{"id": id})
+	if err != nil {
+		if isStillReferencedError(err) {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+	} else if cmd.RowsAffected() == 0 {
+		err = distrerr.ErrNotFound
+	}
+
+	if err != nil {
+		return fmt.Errorf("could not delete Artifact: %w", err)
+	}
+
+	return nil
+}
+
+func IsLastTagOfArtifact(ctx context.Context, artifactID uuid.UUID, tagName string) (bool, error) {
+	db := internalctx.GetDb(ctx)
+
+	var hasOtherTags bool
+	err := db.QueryRow(ctx, `
+		SELECT EXISTS (
+			SELECT 1
+			FROM ArtifactVersion
+			WHERE artifact_id = @artifactId
+			AND name <> @tagName
+			AND `+artifactVersionIsTagExpr("ArtifactVersion")+`
+		)`,
+		pgx.NamedArgs{
+			"artifactId": artifactID,
+			"tagName":    tagName,
+		}).Scan(&hasOtherTags)
+	if err != nil {
+		return false, fmt.Errorf("could not check for other tags: %w", err)
+	}
+
+	return !hasOtherTags, nil
+}
+
+func DeleteArtifactVersion(ctx context.Context, artifactID uuid.UUID, tagName string) error {
+	db := internalctx.GetDb(ctx)
+
+	cmd, err := db.Exec(ctx, `
+		DELETE FROM ArtifactVersion
+		WHERE artifact_id = @artifactId
+		AND name = @tagName
+		AND `+artifactVersionIsTagExpr("ArtifactVersion"),
+		pgx.NamedArgs{
+			"artifactId": artifactID,
+			"tagName":    tagName,
+		})
+	if err != nil {
+		if isStillReferencedError(err) {
+			err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+		}
+	} else if cmd.RowsAffected() == 0 {
+		err = distrerr.ErrNotFound
+	}
+
+	if err != nil {
+		return fmt.Errorf("could not delete tag: %w", err)
+	}
+
+	return nil
+}
+
+// DeleteArtifactTag deletes a tag of an artifact, together with every version that only the deleted
+// tag referenced. Deleting the last tag deletes the whole artifact, which the result reports. The last
+// tag of a pull-through cache artifact cannot be deleted, since that would delete its upstream configuration.
+func DeleteArtifactTag(ctx context.Context, artifact *types.Artifact, tagName string) (bool, error) {
+	artifactID := artifact.ID
+	artifactDeleted := false
+	err := RunTx(ctx, func(ctx context.Context) error {
+		if err := LockArtifactExclusive(ctx, artifactID); err != nil {
+			return err
+		}
+		// A push locks the artifact row in GetOrCreateArtifact until it commits, so waiting for it here
+		// keeps the check for other tags below from missing a tag pushed concurrently.
+		if err := LockArtifactRows(ctx, []uuid.UUID{artifactID}); err != nil {
+			return err
+		}
+
+		version, err := GetArtifactVersionByName(ctx, artifactID, tagName)
+		if err != nil {
+			return err
+		} else if version.IsDigestVersion() {
+			return distrerr.ErrNotFound
+		}
+
+		versionsWithSameDigest, err := GetArtifactVersionsByDigest(ctx, artifactID, string(version.ManifestBlobDigest))
+		if err != nil {
+			return err
+		}
+
+		if err := CheckArtifactVersionDeletionForEntitlements(
+			ctx, artifactID, version, versionsWithSameDigest,
+		); err != nil {
+			return err
+		}
+
+		if isLast, err := IsLastTagOfArtifact(ctx, artifactID, tagName); err != nil {
+			return err
+		} else if isLast && artifact.UpstreamURL != nil {
+			return distrerr.NewConflict(
+				"cannot delete the last tag of a pull-through cache artifact, delete the artifact instead",
+			)
+		} else if isLast {
+			if isReferenced, err := ArtifactIsReferencedInEntitlements(ctx, artifactID); err != nil {
+				return err
+			} else if isReferenced {
+				return distrerr.NewBadRequest(
+					"cannot delete tag: it is the last tag of the artifact, which is referenced in one or more entitlements",
+				)
+			}
+			artifactDeleted = true
+			return DeleteArtifactWithID(ctx, artifactID)
+		}
+
+		// Has to run before the tag is gone: its parts are what leads to the referenced manifests.
+		digests, err := getReferencedManifestDigests(ctx, artifactID, version.ID)
+		if err != nil {
+			return err
+		}
+
+		if err := DeleteArtifactVersion(ctx, artifactID, tagName); err != nil {
+			return err
+		}
+
+		return deleteUnreferencedArtifactVersions(ctx, artifactID, digests)
+	})
+	if err != nil {
+		return false, err
+	}
+	return artifactDeleted, nil
+}
+
+// getReferencedManifestDigests returns the given version's manifest digest plus the digests of the
+// manifests it references, transitively. Layer and config digests are dropped from the result.
+func getReferencedManifestDigests(ctx context.Context, artifactID, versionID uuid.UUID) ([]string, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`WITH RECURSIVE referenced (digest) AS (
+			SELECT av.manifest_blob_digest
+			FROM ArtifactVersion av
+			WHERE av.id = @versionId
+			-- UNION, not UNION ALL, so a cyclic manifest graph still terminates
+			UNION
+			SELECT avp.artifact_blob_digest
+			FROM referenced r
+			JOIN ArtifactVersion av
+				ON av.artifact_id = @artifactId AND av.manifest_blob_digest = r.digest
+			JOIN ArtifactVersionPart avp ON avp.artifact_version_id = av.id
+		)
+		SELECT r.digest
+		FROM referenced r
+		WHERE EXISTS (
+			SELECT 1
+			FROM ArtifactVersion av
+			WHERE av.artifact_id = @artifactId AND av.manifest_blob_digest = r.digest
+		)`,
+		pgx.NamedArgs{"artifactId": artifactID, "versionId": versionID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query referenced manifest digests: %w", err)
+	}
+	defer rows.Close()
+
+	digests, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect referenced manifest digests: %w", err)
+	}
+	return digests, nil
+}
+
+// deleteUnreferencedArtifactVersions deletes the digest-named versions among the given manifest digests
+// that nothing references any more. It repeats because a child of an index only becomes unreferenced
+// once the pass that deleted the index has finished.
+func deleteUnreferencedArtifactVersions(ctx context.Context, artifactID uuid.UUID, digests []string) error {
+	if len(digests) == 0 {
+		return nil
+	}
+
+	db := internalctx.GetDb(ctx)
+	for range len(digests) + 1 {
+		cmd, err := db.Exec(
+			ctx,
+			`DELETE FROM ArtifactVersion av
+			WHERE av.artifact_id = @artifactId
+			AND `+artifactVersionIsDigestExpr("av")+`
+			AND av.manifest_blob_digest = any (@digests)
+			AND NOT EXISTS (
+				-- a tag points at it
+				SELECT 1
+				FROM ArtifactVersion tag
+				WHERE tag.artifact_id = av.artifact_id
+				AND tag.manifest_blob_digest = av.manifest_blob_digest
+				AND `+artifactVersionIsTagExpr("tag")+`
+			)
+			AND NOT EXISTS (
+				-- another version references it, e.g. a multi-arch index its children
+				SELECT 1
+				FROM ArtifactVersionPart avp
+				JOIN ArtifactVersion other ON other.id = avp.artifact_version_id
+				WHERE avp.artifact_blob_digest = av.manifest_blob_digest
+				AND other.artifact_id = av.artifact_id
+				AND other.id <> av.id
+			)`,
+			pgx.NamedArgs{"artifactId": artifactID, "digests": digests},
+		)
+		if err != nil {
+			return fmt.Errorf("could not delete unreferenced artifact versions: %w", err)
+		} else if cmd.RowsAffected() == 0 {
+			return nil
+		}
+	}
+
+	internalctx.GetLogger(ctx).Warn("stopped deleting unreferenced artifact versions before the graph was empty",
+		zap.String("artifactId", artifactID.String()), zap.Int("passes", len(digests)+1))
+	return nil
+}
+
+// LockArtifactExclusive locks an artifact against a concurrent deletion of one of its tags, which
+// deletes a different row and would therefore not conflict, but whose uncommitted tag each deletion
+// still reads as a reason to keep a manifest. It cannot cover a concurrent push, whose manifests are
+// unreferenced across several requests with no transaction spanning them.
+func LockArtifactExclusive(ctx context.Context, artifactID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	// Advisory locks share one namespace instance-wide, hence the entity prefix in the key.
+	if _, err := db.Exec(
+		ctx,
+		`SELECT pg_advisory_xact_lock(hashtextextended('Artifact:' || @artifactId::TEXT, 0))`,
+		pgx.NamedArgs{"artifactId": artifactID},
+	); err != nil {
+		return fmt.Errorf("could not lock artifact: %w", err)
+	}
+	return nil
+}
+
+func UpsertArtifactVersionForSync(ctx context.Context, av *types.ArtifactVersion) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(
+		ctx,
+		`INSERT INTO ArtifactVersion AS av (
+            name,
+			manifest_blob_digest,
+			manifest_blob_size,
+			manifest_content_type,
+			manifest_data,
+			artifact_id
+        ) VALUES (
+        	@name, @manifestBlobDigest, @manifestBlobSize, @manifestContentType, @manifestData, @artifactId
+        )
+		ON CONFLICT ON CONSTRAINT ArtifactVersion_unique_name DO UPDATE SET
+			manifest_blob_digest = EXCLUDED.manifest_blob_digest,
+			manifest_blob_size = EXCLUDED.manifest_blob_size,
+			manifest_content_type = EXCLUDED.manifest_content_type,
+			manifest_data = EXCLUDED.manifest_data,
+			updated_at = now()
+		RETURNING *`,
+		pgx.NamedArgs{
+			"name":                av.Name,
+			"manifestBlobDigest":  av.ManifestBlobDigest,
+			"manifestBlobSize":    av.ManifestBlobSize,
+			"manifestContentType": av.ManifestContentType,
+			"manifestData":        av.ManifestData,
+			"artifactId":          av.ArtifactID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not upsert ArtifactVersion: %w", err)
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.ArtifactVersion]); err != nil {
+		return fmt.Errorf("could not collect upserted ArtifactVersion: %w", err)
+	} else {
+		*av = result
+		return nil
+	}
+}
+
+func GetPullThroughBlobSize(ctx context.Context, orgSlug, artifactName, blobDigest string) (int64, error) {
+	db := internalctx.GetDb(ctx)
+	var size int64
+	err := db.QueryRow(ctx, `
+		SELECT avp.artifact_blob_size
+		FROM ArtifactVersionPart avp
+		JOIN ArtifactVersion av ON av.id = avp.artifact_version_id
+		JOIN Artifact a ON a.id = av.artifact_id
+		JOIN Organization o ON o.id = a.organization_id
+		WHERE o.slug = @orgSlug AND a.name = @artifactName
+		  AND a.upstream_url IS NOT NULL
+		  AND avp.artifact_blob_digest = @blobDigest
+		LIMIT 1`,
+		pgx.NamedArgs{
+			"orgSlug":      orgSlug,
+			"artifactName": artifactName,
+			"blobDigest":   blobDigest,
+		},
+	).Scan(&size)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return 0, distrerr.ErrNotFound
+		}
+		return 0, fmt.Errorf("could not query blob size: %w", err)
+	}
+	return size, nil
+}
+
+// GetRegistryStorageUsage returns the total size of all registry blobs of the given organization.
+// Manifest blobs are included because blob cleanup considers them referenced just like part blobs.
+// Blobs are deduplicated by digest, so a blob shared between artifact versions, or one that is both
+// a version manifest and a part of a multi-arch index, is only counted once.
+// A version of a pull-through artifact only counts once it has been pulled, since the sync records
+// its blobs without fetching them and only the first pull stores them.
+func GetRegistryStorageUsage(ctx context.Context, orgID uuid.UUID) (int64, error) {
+	db := internalctx.GetDb(ctx)
+	var size int64
+	err := db.QueryRow(ctx, `
+		WITH stored_versions AS (
+			SELECT av.id, av.manifest_blob_digest, av.manifest_blob_size
+			FROM ArtifactVersion av
+			JOIN Artifact a ON a.id = av.artifact_id
+			WHERE a.organization_id = @orgId
+				AND (
+					a.upstream_url IS NULL
+					OR EXISTS (SELECT 1 FROM ArtifactVersionPull p WHERE p.artifact_version_id = av.id)
+				)
+		)
+		SELECT COALESCE(SUM(distinct_blobs.artifact_blob_size), 0)
+		FROM (
+			SELECT blobs.artifact_blob_digest, MAX(blobs.artifact_blob_size) AS artifact_blob_size
+			FROM (
+				SELECT avp.artifact_blob_digest, avp.artifact_blob_size
+				FROM ArtifactVersionPart avp
+				JOIN stored_versions sv ON sv.id = avp.artifact_version_id
+				UNION ALL
+				SELECT sv.manifest_blob_digest, sv.manifest_blob_size
+				FROM stored_versions sv
+			) AS blobs
+			GROUP BY blobs.artifact_blob_digest
+		) AS distinct_blobs`,
+		pgx.NamedArgs{"orgId": orgID},
+	).Scan(&size)
+	if err != nil {
+		return 0, fmt.Errorf("could not query registry storage usage: %w", err)
+	}
+	return size, nil
+}
+
+func GetAllReferencedBlobDigests(ctx context.Context) ([]string, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT manifest_blob_digest FROM ArtifactVersion
+		UNION ALL
+		SELECT artifact_blob_digest FROM ArtifactVersionPart
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("could not query referenced blob digests: %w", err)
+	}
+	digests, err := pgx.CollectRows(rows, pgx.RowTo[string])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect referenced blob digests: %w", err)
+	}
+	return digests, nil
+}

@@ -1,0 +1,138 @@
+[**@distr-sh/distr-sdk**](../README.md)
+
+---
+
+[@distr-sh/distr-sdk](../README.md) / DeploymentTarget
+
+# Interface: DeploymentTarget
+
+## Extends
+
+- [`BaseModel`](BaseModel.md)
+- [`Named`](Named.md)
+
+## Properties
+
+### autohealEnabled?
+
+> `optional` **autohealEnabled?**: `boolean`
+
+---
+
+### automaticUpdatesEnabled?
+
+> `optional` **automaticUpdatesEnabled?**: `boolean`
+
+---
+
+### controllerVersion?
+
+> `optional` **controllerVersion?**: [`ControllerVersion`](ControllerVersion.md)
+
+---
+
+### createdAt?
+
+> `optional` **createdAt?**: `string`
+
+#### Inherited from
+
+[`BaseModel`](BaseModel.md).[`createdAt`](BaseModel.md#createdat)
+
+---
+
+### customerOrganization?
+
+> `optional` **customerOrganization?**: [`CustomerOrganization`](CustomerOrganization.md)
+
+---
+
+### deploymentLogsAfter?
+
+> `optional` **deploymentLogsAfter?**: `string`
+
+---
+
+### deploymentLogsEnabled
+
+> **deploymentLogsEnabled**: `boolean`
+
+---
+
+### deployments
+
+> **deployments**: [`DeploymentWithLatestRevision`](DeploymentWithLatestRevision.md)[]
+
+---
+
+### dockerEndpoint?
+
+> `optional` **dockerEndpoint?**: `string`
+
+---
+
+### id?
+
+> `optional` **id?**: `string`
+
+#### Inherited from
+
+[`BaseModel`](BaseModel.md).[`id`](BaseModel.md#id)
+
+---
+
+### imageCleanupEnabled
+
+> **imageCleanupEnabled**: `boolean`
+
+---
+
+### metricsEnabled
+
+> **metricsEnabled**: `boolean`
+
+---
+
+### name
+
+> **name**: `string`
+
+#### Overrides
+
+[`Named`](Named.md).[`name`](Named.md#name)
+
+---
+
+### namespace?
+
+> `optional` **namespace?**: `string`
+
+---
+
+### reconnectPending?
+
+> `optional` **reconnectPending?**: `boolean`
+
+---
+
+### reportedControllerVersionId?
+
+> `optional` **reportedControllerVersionId?**: `string`
+
+---
+
+### resources?
+
+> `optional` **resources?**: [`DeploymentTargetResources`](DeploymentTargetResources.md)
+
+---
+
+### scope?
+
+> `optional` **scope?**: [`DeploymentTargetScope`](../type-aliases/DeploymentTargetScope.md)
+
+---
+
+### type
+
+> **type**: [`DeploymentType`](../type-aliases/DeploymentType.md)

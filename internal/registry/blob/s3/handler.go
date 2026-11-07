@@ -1,0 +1,762 @@
+package s3
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"net/url"
+	"path"
+
+	awsmiddleware "github.com/aws/aws-sdk-go-v2/aws/middleware"
+	"github.com/aws/aws-sdk-go-v2/service/s3"
+	s3types "github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
+	"github.com/aws/smithy-go/middleware"
+	smithyhttp "github.com/aws/smithy-go/transport/http"
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/registry/blob"
+	"github.com/distr-sh/distr/internal/registry/verify"
+	"github.com/glasskube/pkg/seekbuf"
+	"github.com/google/uuid"
+	"github.com/opencontainers/go-digest"
+	"go.uber.org/zap"
+)
+
+const (
+	chunksPrefix  = "chunks"
+	minS3PartSize = int64(5) * 1024 * 1024        // S3 minimum size of every part but the last is 5 MiB
+	maxS3PartSize = int64(5) * 1024 * 1024 * 1024 // S3 maximum per-part size is 5 GiB
+	splitPartSize = int64(1) * 1024 * 1024 * 1024 // target size per UploadPart call
+)
+
+type blobHandler struct {
+	s3Client        *s3.Client
+	s3PresignClient *s3.PresignClient
+	allowRedirect   bool
+	bucket          string
+}
+
+var (
+	_ blob.BlobHandler               = &blobHandler{}
+	_ blob.BlobPutHandler            = &blobHandler{}
+	_ blob.BlobDeleteHandler         = &blobHandler{}
+	_ blob.BlobChunkMinLengthHandler = &blobHandler{}
+)
+
+func NewBlobHandler(ctx context.Context, s3Client *s3.Client) (blob.BlobHandler, error) {
+	s3Config := env.RegistryS3Config()
+
+	if s3Config.CreateBucket {
+		if err := ensureBucketExists(ctx, s3Client, s3Config.Bucket, s3Config.Region); err != nil {
+			return nil, err
+		}
+	}
+
+	h := blobHandler{
+		s3Client:      s3Client,
+		allowRedirect: s3Config.AllowRedirect,
+		bucket:        s3Config.Bucket,
+	}
+
+	if h.allowRedirect {
+		h.s3PresignClient = s3.NewPresignClient(s3Client)
+	}
+
+	return &h, nil
+}
+
+func ensureBucketExists(ctx context.Context, client *s3.Client, bucket string, region string) error {
+	log := internalctx.GetLogger(ctx).With(zap.String("bucket", bucket))
+	log.Debug("initializing object store bucket")
+
+	_, err := client.CreateBucket(ctx, &s3.CreateBucketInput{
+		Bucket: &bucket,
+		CreateBucketConfiguration: &s3types.CreateBucketConfiguration{
+			LocationConstraint: s3types.BucketLocationConstraint(region),
+		},
+	})
+	if err != nil {
+		if _, ok := errors.AsType[*s3types.BucketAlreadyOwnedByYou](err); ok {
+			log.Debug("bucket already exists")
+			return nil
+		}
+
+		return err
+	}
+
+	log.Info("bucket created")
+	return nil
+}
+
+// Get implements blob.BlobHandler.
+func (handler *blobHandler) Get(
+	ctx context.Context,
+	repo string,
+	h digest.Digest,
+	allowRedirect bool,
+) (io.ReadCloser, error) {
+	key := h.String()
+	if handler.allowRedirect && allowRedirect {
+		resp, err := handler.s3PresignClient.PresignGetObject(ctx,
+			&s3.GetObjectInput{Bucket: &handler.bucket, Key: &key})
+		if err != nil {
+			return nil, convertErrNotFound(err)
+		} else {
+			return nil, blob.RedirectError{
+				Code:     http.StatusTemporaryRedirect,
+				Location: resp.URL,
+			}
+		}
+	} else {
+		obj, err := handler.s3Client.GetObject(ctx, &s3.GetObjectInput{Bucket: &handler.bucket, Key: &key})
+		if err != nil {
+			return nil, convertErrNotFound(err)
+		}
+		return obj.Body, nil
+	}
+}
+
+// Stat implements blob.BlobHandler.
+func (handler *blobHandler) Stat(ctx context.Context, repo string, h digest.Digest) (int64, error) {
+	key := h.String()
+	obj, err := handler.s3Client.HeadObject(ctx, &s3.HeadObjectInput{Bucket: &handler.bucket, Key: &key})
+	if err != nil {
+		return 0, convertErrNotFound(err)
+	}
+	return *obj.ContentLength, nil
+}
+
+// Put implements blob.BlobPutHandler.
+func (handler *blobHandler) Put(
+	ctx context.Context,
+	repo string,
+	h digest.Digest,
+	contentType string,
+	r io.Reader,
+) error {
+	key := h.String()
+	if rc, ok := r.(io.Closer); ok {
+		defer rc.Close()
+	}
+
+	// The AWS S3 SDK requires an io.ReadSeeker even though the interface only specifies io.Reader.
+	// We additionally need an io.ReaderAt so that large blobs can be uploaded via multipart upload
+	// using io.SectionReader without buffering any part in memory.
+	rsa, ok := r.(seekbuf.ReadSeekAt)
+	if !ok {
+		if s, err := seekbuf.New(r); err != nil {
+			return err
+		} else {
+			defer func() {
+				if err := s.Destroy(); err != nil {
+					internalctx.GetLogger(ctx).Warn("ephemeral resource cleanup error", zap.Error(err))
+				}
+			}()
+			if sr, err := s.Get(); err != nil {
+				return err
+			} else {
+				defer sr.Close()
+				rsa = sr
+			}
+		}
+	}
+
+	size, err := rsa.Seek(0, io.SeekEnd)
+	if err != nil {
+		return fmt.Errorf("failed to measure blob size: %w", err)
+	}
+	if _, err := rsa.Seek(0, io.SeekStart); err != nil {
+		return fmt.Errorf("failed to rewind blob: %w", err)
+	}
+
+	// S3 PutObject is limited to 5 GiB. Larger blobs must be uploaded via multipart upload.
+	if size > maxS3PartSize {
+		return handler.putMultipart(ctx, key, contentType, rsa, size)
+	}
+
+	input := s3.PutObjectInput{
+		Bucket: &handler.bucket,
+		Key:    &key,
+		Body:   rsa,
+	}
+
+	if contentType != "" {
+		input.ContentType = &contentType
+	}
+
+	if _, err := handler.s3Client.PutObject(ctx, &input); err != nil {
+		return convertErrNotFound(err)
+	}
+	return nil
+}
+
+// putMultipart uploads r to key using an S3 multipart upload, splitting it into parts of at most
+// splitPartSize. Each part is served via io.SectionReader over the seekable source so that no part
+// is buffered in memory.
+func (handler *blobHandler) putMultipart(
+	ctx context.Context,
+	key, contentType string,
+	r io.ReaderAt,
+	size int64,
+) error {
+	log := internalctx.GetLogger(ctx)
+
+	createInput := &s3.CreateMultipartUploadInput{
+		Bucket: &handler.bucket,
+		Key:    &key,
+	}
+	if contentType != "" {
+		createInput.ContentType = &contentType
+	}
+	upload, err := handler.s3Client.CreateMultipartUpload(ctx, createInput)
+	if err != nil {
+		return err
+	}
+
+	completed := false
+	abort := func() {
+		if completed {
+			return
+		}
+
+		if _, abortErr := handler.s3Client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{
+			Bucket:   &handler.bucket,
+			Key:      &key,
+			UploadId: upload.UploadId,
+		}); abortErr != nil {
+			log.Warn("failed to abort multipart upload", zap.Error(abortErr))
+		}
+	}
+
+	completedParts, err := handler.uploadParts(ctx, key, upload.UploadId, 1, r, size)
+	if err != nil {
+		abort()
+		return err
+	}
+
+	if _, err := handler.s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          &handler.bucket,
+		Key:             &key,
+		UploadId:        upload.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completedParts},
+	}); err != nil {
+		abort()
+		return err
+	}
+
+	completed = true
+
+	return nil
+}
+
+// uploadParts uploads size bytes of r to key as a series of UploadPart calls, each of at most
+// splitPartSize bytes, numbering parts sequentially starting at startPartNumber. The final part
+// absorbs any remainder so that no non-final part is smaller than splitPartSize (keeping every
+// part well above the S3 5 MiB minimum). Parts are served via io.SectionReader so none are
+// buffered in memory. The returned parts can be passed to CompleteMultipartUpload.
+func (handler *blobHandler) uploadParts(
+	ctx context.Context,
+	key string,
+	uploadID *string,
+	startPartNumber int32,
+	r io.ReaderAt,
+	size int64,
+) ([]s3types.CompletedPart, error) {
+	numParts := max(int64(1), size/splitPartSize)
+	completedParts := make([]s3types.CompletedPart, numParts)
+	for i := range numParts {
+		partNumber := startPartNumber + int32(i)
+		offset := i * splitPartSize
+		partSize := splitPartSize
+		if i == numParts-1 {
+			partSize = size - offset
+		}
+		result, err := handler.s3Client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:        &handler.bucket,
+			Key:           &key,
+			UploadId:      uploadID,
+			PartNumber:    &partNumber,
+			Body:          io.NewSectionReader(r, offset, partSize),
+			ContentLength: &partSize,
+		})
+		if err != nil {
+			return nil, err
+		}
+		completedParts[i] = s3types.CompletedPart{PartNumber: &partNumber, ETag: result.ETag}
+	}
+	return completedParts, nil
+}
+
+func (handler *blobHandler) StartSession(ctx context.Context, repo string) (string, error) {
+	if id, err := uuid.NewRandom(); err != nil {
+		return "", err
+	} else {
+		return id.String(), nil
+	}
+}
+
+func (handler *blobHandler) PutChunk(ctx context.Context, id string, r io.Reader, start int64) (int64, error) {
+	if rc, ok := r.(io.Closer); ok {
+		defer rc.Close()
+	}
+
+	uploadKey := path.Join(chunksPrefix, id)
+	var uploadID *string
+	var partNumber int32
+	var size, lastPartSize int64
+
+	if start == 0 {
+		if _, err := handler.getUploadID(ctx, uploadKey); err == nil {
+			// upload ID must not exist if start == 0!
+			return 0, blob.NewErrBadUpload("range is not as expected")
+		} else if !errors.Is(err, blob.ErrBadUpload) {
+			return 0, err
+		} else if upload, err := handler.s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+			Bucket: &handler.bucket,
+			Key:    &uploadKey,
+		}); err != nil {
+			return 0, err
+		} else {
+			uploadID = upload.UploadId
+			partNumber = 1
+		}
+	} else {
+		if id, err := handler.getUploadID(ctx, uploadKey); err != nil {
+			return 0, err
+		} else {
+			uploadID = &id
+		}
+
+		if parts, err := handler.getExistingParts(ctx, uploadKey, *uploadID); err != nil {
+			return 0, err
+		} else {
+			partNumber = int32(len(parts) + 1)
+			for _, part := range parts {
+				size += *part.Size
+				lastPartSize = *part.Size
+			}
+		}
+	}
+
+	if size != start {
+		return 0, blob.NewErrBadUpload("range is not as expected")
+	}
+
+	// S3 rejects completing a multipart upload with a part below the minimum size that is not the last,
+	// so the upload cannot succeed anymore once a chunk follows a smaller one.
+	if start > 0 && lastPartSize < minS3PartSize {
+		if _, err := handler.s3Client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{
+			Bucket:   &handler.bucket,
+			Key:      &uploadKey,
+			UploadId: uploadID,
+		}); err != nil {
+			internalctx.GetLogger(ctx).Warn("failed to abort multipart upload", zap.Error(err))
+		}
+		return 0, blob.NewErrBadUpload(fmt.Sprintf(
+			"every chunk except the last must be at least %d bytes (OCI-Chunk-Min-Length)", minS3PartSize))
+	}
+
+	s, err := seekbuf.New(r)
+	if err != nil {
+		return 0, fmt.Errorf("failed to create buffer: %w", err)
+	}
+	defer func() {
+		if err := s.Destroy(); err != nil {
+			internalctx.GetLogger(ctx).Warn("ephemeral resource cleanup error", zap.Error(err))
+		}
+	}()
+
+	sr, err := s.Get()
+	if err != nil {
+		return 0, fmt.Errorf("failed to get buffer reader: %w", err)
+	}
+	defer sr.Close()
+
+	chunkSize, err := sr.Seek(0, io.SeekEnd)
+	if err != nil {
+		return 0, fmt.Errorf("failed to measure chunk size: %w", err)
+	}
+	size += chunkSize
+
+	if _, err := handler.uploadParts(ctx, uploadKey, uploadID, partNumber, sr, chunkSize); err != nil {
+		return 0, err
+	}
+
+	return size, nil
+}
+
+func (handler *blobHandler) GetUploadedPartsSize(ctx context.Context, id string) (int64, error) {
+	uploadKey := path.Join(chunksPrefix, id)
+	var size int64
+
+	if uploadID, err := handler.getUploadID(ctx, uploadKey); errors.Is(err, blob.ErrBadUpload) {
+		// The multipart upload is only created with the first chunk, so a new session has none yet.
+		return 0, nil
+	} else if err != nil {
+		return 0, err
+	} else if parts, err := handler.getExistingParts(ctx, uploadKey, uploadID); err != nil {
+		return 0, err
+	} else {
+		for _, part := range parts {
+			size += *part.Size
+		}
+		return size, nil
+	}
+}
+
+func (handler *blobHandler) CompleteSession(ctx context.Context, repo, id string, digest digest.Digest) error {
+	uploadKey := path.Join(chunksPrefix, id)
+	if uploadID, err := handler.getUploadID(ctx, uploadKey); err != nil {
+		return err
+	} else if uploadedParts, err := handler.getExistingParts(ctx, uploadKey, uploadID); err != nil {
+		return err
+	} else {
+		completionParts := make([]s3types.CompletedPart, len(uploadedParts))
+		for i, part := range uploadedParts {
+			completionParts[i] = s3types.CompletedPart{PartNumber: part.PartNumber, ETag: part.ETag}
+		}
+
+		completed, err := handler.s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+			Bucket:          &handler.bucket,
+			Key:             &uploadKey,
+			UploadId:        &uploadID,
+			MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completionParts},
+		})
+		if err != nil {
+			return err
+		}
+
+		// Blobs of all organizations share one key per digest, so an object stored under a digest it
+		// does not match would replace the blob of every artifact referencing that digest. S3 cannot
+		// compute a SHA256 of a whole multipart object, so it is read back once here.
+		// https://docs.aws.amazon.com/AmazonS3/latest/userguide/checking-object-integrity.html#Full-object-checksums
+		// The upload id stays usable after completion, so a concurrent completion of the same id can
+		// replace the object between verifying and copying it. Every read is therefore pinned to the
+		// ETag of the object completed here.
+		var copyErr error
+		if completed.ETag == nil {
+			copyErr = errors.New("completed multipart upload has no ETag")
+		} else if copyErr = handler.verifyObject(ctx, uploadKey, *completed.ETag, digest); copyErr == nil {
+			copyErr = handler.copyObject(ctx, uploadKey, *completed.ETag, digest.String())
+		}
+
+		// ArtifactBlob cleanup only deletes digest-shaped keys, so a chunk left behind here is
+		// never collected, not even when the copy above failed.
+		if _, err := handler.s3Client.DeleteObject(context.WithoutCancel(ctx), &s3.DeleteObjectInput{
+			Bucket: &handler.bucket,
+			Key:    &uploadKey,
+		}); err != nil {
+			internalctx.GetLogger(ctx).Warn("failed to remove completed upload chunk", zap.Error(err))
+		}
+
+		return copyErr
+	}
+}
+
+func (handler *blobHandler) verifyObject(ctx context.Context, key, etag string, h digest.Digest) error {
+	obj, err := handler.s3Client.GetObject(ctx, &s3.GetObjectInput{Bucket: &handler.bucket, Key: &key, IfMatch: &etag})
+	if err != nil {
+		return err
+	}
+	vrc, err := verify.ReadCloser(obj.Body, verify.SizeUnknown, h)
+	if err != nil {
+		_ = obj.Body.Close()
+		return err
+	}
+	defer vrc.Close()
+	_, err = io.Copy(io.Discard, vrc)
+	return err
+}
+
+// ChunkMinLength implements blob.BlobChunkMinLengthHandler.
+func (handler *blobHandler) ChunkMinLength() int64 {
+	return minS3PartSize
+}
+
+// copyObject copies srcKey to dstKey within the same bucket and fails if srcKey no longer has srcETag. For objects
+// larger than the 5 GB CopyObject limit, it falls back to a multipart copy using UploadPartCopy, and for backends
+// that do not implement that operation to copyObjectWithoutPartCopy.
+func (handler *blobHandler) copyObject(ctx context.Context, srcKey, srcETag, dstKey string) error {
+	head, err := handler.s3Client.HeadObject(ctx, &s3.HeadObjectInput{
+		Bucket:  &handler.bucket,
+		Key:     &srcKey,
+		IfMatch: &srcETag,
+	})
+	if err != nil {
+		return err
+	}
+	objectSize := *head.ContentLength
+	src := pinnedSource{key: srcKey, etag: srcETag, gcsGeneration: gcsGeneration(head.ResultMetadata)}
+
+	if objectSize <= maxS3PartSize {
+		return handler.copyObjectSingle(ctx, src, dstKey)
+	}
+
+	// GCS implements the multipart upload API but not UploadPartCopy: it documents
+	// x-amz-copy-source-range as not applicable and answers NotImplemented.
+	if src.gcsGeneration != "" {
+		return handler.copyObjectWithoutPartCopy(ctx, src, dstKey, objectSize)
+	}
+
+	copySource := handler.bucket + "/" + srcKey
+
+	upload, err := handler.s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: &handler.bucket,
+		Key:    &dstKey,
+	})
+	if err != nil {
+		return err
+	}
+
+	abort := func() {
+		_, _ = handler.s3Client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{
+			Bucket:   &handler.bucket,
+			Key:      &dstKey,
+			UploadId: upload.UploadId,
+		})
+	}
+
+	numParts := (objectSize + maxS3PartSize - 1) / maxS3PartSize
+	completedParts := make([]s3types.CompletedPart, numParts)
+
+	for i := range numParts {
+		partNumber := int32(i + 1)
+		rangeStart := i * maxS3PartSize
+		rangeEnd := min(rangeStart+maxS3PartSize, objectSize) - 1
+		copySourceRange := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
+
+		result, err := handler.s3Client.UploadPartCopy(ctx, &s3.UploadPartCopyInput{
+			Bucket:            &handler.bucket,
+			Key:               &dstKey,
+			UploadId:          upload.UploadId,
+			PartNumber:        &partNumber,
+			CopySource:        &copySource,
+			CopySourceRange:   &copySourceRange,
+			CopySourceIfMatch: &srcETag,
+		})
+		if err != nil {
+			abort()
+			if apiErr, ok := errors.AsType[smithy.APIError](err); ok && apiErr.ErrorCode() == "NotImplemented" {
+				return handler.copyObjectWithoutPartCopy(ctx, src, dstKey, objectSize)
+			}
+			return err
+		}
+		completedParts[i] = s3types.CompletedPart{PartNumber: &partNumber, ETag: result.CopyPartResult.ETag}
+	}
+
+	if _, err = handler.s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          &handler.bucket,
+		Key:             &dstKey,
+		UploadId:        upload.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completedParts},
+	}); err != nil {
+		abort()
+		return err
+	}
+	return nil
+}
+
+// pinnedSource is the verified object a copy reads from. gcsGeneration is only set on GCS.
+type pinnedSource struct {
+	key, etag     string
+	gcsGeneration string
+}
+
+func gcsGeneration(metadata middleware.Metadata) string {
+	if resp, ok := awsmiddleware.GetRawResponse(metadata).(*smithyhttp.Response); ok {
+		return resp.Header.Get("x-goog-generation")
+	}
+	return ""
+}
+
+// copyObjectSingle copies src to dstKey in a single CopyObject request that fails if src has changed.
+func (handler *blobHandler) copyObjectSingle(ctx context.Context, src pinnedSource, dstKey string) error {
+	input := &s3.CopyObjectInput{
+		Bucket: &handler.bucket,
+		Key:    &dstKey,
+	}
+	copySource := handler.bucket + "/" + src.key
+	if src.gcsGeneration != "" {
+		// GCS answers x-amz-copy-source-if-match with InvalidArgument unless the ETag is an MD5 hash,
+		// which the ETag of a multipart object is not, and rejects a request that mixes x-amz and
+		// x-goog headers, so x-goog-copy-source-if-generation-match is no option either. GCS maps
+		// versionId to the generation and answers NoSuchKey once that generation was replaced.
+		copySource += "?versionId=" + url.QueryEscape(src.gcsGeneration)
+	} else {
+		input.CopySourceIfMatch = &src.etag
+	}
+	input.CopySource = &copySource
+	_, err := handler.s3Client.CopyObject(ctx, input)
+	return err
+}
+
+// copyObjectWithoutPartCopy copies an object that exceeds the CopyObject limit on a backend that does not
+// implement UploadPartCopy. The 5 GB limit is an S3 restriction that does not necessarily apply elsewhere, so
+// a single request is tried first: on GCS a copy within one bucket is a server-side rewrite, which is orders of
+// magnitude cheaper than moving the whole blob through the registry.
+func (handler *blobHandler) copyObjectWithoutPartCopy(
+	ctx context.Context,
+	src pinnedSource,
+	dstKey string,
+	objectSize int64,
+) error {
+	if err := handler.copyObjectSingle(ctx, src, dstKey); err == nil {
+		return nil
+	} else {
+		internalctx.GetLogger(ctx).Info("copying large blob in a single request failed, streaming it instead",
+			zap.Int64("objectSize", objectSize), zap.Error(err))
+	}
+
+	return handler.copyObjectViaUpload(ctx, src.key, src.etag, dstKey, objectSize)
+}
+
+// copyObjectViaUpload copies an object by downloading it range by range and uploading each range as a
+// destination multipart part, so that no range is buffered in memory.
+func (handler *blobHandler) copyObjectViaUpload(
+	ctx context.Context,
+	srcKey, srcETag, dstKey string,
+	objectSize int64,
+) error {
+	upload, err := handler.s3Client.CreateMultipartUpload(ctx, &s3.CreateMultipartUploadInput{
+		Bucket: &handler.bucket,
+		Key:    &dstKey,
+	})
+	if err != nil {
+		return err
+	}
+
+	abort := func() {
+		_, _ = handler.s3Client.AbortMultipartUpload(context.WithoutCancel(ctx), &s3.AbortMultipartUploadInput{
+			Bucket:   &handler.bucket,
+			Key:      &dstKey,
+			UploadId: upload.UploadId,
+		})
+	}
+
+	// A GetObject body is not seekable, so the SDK cannot rewind it to retry a part. Keep the parts
+	// small enough that losing one to a transient error does not discard much of the transfer. As
+	// in uploadParts, the final part absorbs the remainder so that no other part can end up below
+	// the 5 MiB minimum part size.
+	numParts := max(int64(1), objectSize/splitPartSize)
+	completedParts := make([]s3types.CompletedPart, numParts)
+
+	internalctx.GetLogger(ctx).Info("streaming large blob to its final location",
+		zap.Int64("objectSize", objectSize), zap.Int64("parts", numParts))
+
+	for i := range numParts {
+		partNumber := int32(i + 1)
+		rangeStart := i * splitPartSize
+		rangeEnd := rangeStart + splitPartSize - 1
+		if i == numParts-1 {
+			rangeEnd = objectSize - 1
+		}
+		objectRange := fmt.Sprintf("bytes=%d-%d", rangeStart, rangeEnd)
+
+		result, err := handler.s3Client.GetObject(ctx, &s3.GetObjectInput{
+			Bucket:  &handler.bucket,
+			Key:     &srcKey,
+			Range:   &objectRange,
+			IfMatch: &srcETag,
+		})
+		if err != nil {
+			abort()
+			return err
+		}
+
+		partSize := rangeEnd - rangeStart + 1
+		part, uploadErr := handler.s3Client.UploadPart(ctx, &s3.UploadPartInput{
+			Bucket:        &handler.bucket,
+			Key:           &dstKey,
+			UploadId:      upload.UploadId,
+			PartNumber:    &partNumber,
+			Body:          result.Body,
+			ContentLength: &partSize,
+		})
+		closeErr := result.Body.Close()
+		if uploadErr != nil {
+			abort()
+			return uploadErr
+		}
+		if closeErr != nil {
+			abort()
+			return closeErr
+		}
+		completedParts[i] = s3types.CompletedPart{PartNumber: &partNumber, ETag: part.ETag}
+	}
+
+	if _, err = handler.s3Client.CompleteMultipartUpload(ctx, &s3.CompleteMultipartUploadInput{
+		Bucket:          &handler.bucket,
+		Key:             &dstKey,
+		UploadId:        upload.UploadId,
+		MultipartUpload: &s3types.CompletedMultipartUpload{Parts: completedParts},
+	}); err != nil {
+		abort()
+		return err
+	}
+	return nil
+}
+
+// Delete implements blob.BlobDeleteHandler.
+func (handler *blobHandler) Delete(ctx context.Context, repo string, h digest.Digest) error {
+	key := h.String()
+	_, err := handler.s3Client.DeleteObject(ctx, &s3.DeleteObjectInput{Bucket: &handler.bucket, Key: &key})
+	if err != nil {
+		return convertErrNotFound(err)
+	}
+	return nil
+}
+
+func (handler *blobHandler) getUploadID(ctx context.Context, uploadKey string) (string, error) {
+	if uploads, err := handler.s3Client.ListMultipartUploads(ctx, &s3.ListMultipartUploadsInput{
+		Bucket: &handler.bucket,
+		Prefix: &uploadKey,
+	}); err != nil {
+		return "", err
+	} else {
+		for _, upload := range uploads.Uploads {
+			if *upload.Key == uploadKey {
+				return *upload.UploadId, nil
+			}
+		}
+		// ListMultipartUploads returns at most 1000 elements.
+		// This means that if there are more than 1000 multipart uploads in progress at the same time, finding the upload
+		// ID for a specific multipart upload can fail, since it might not be in among the returned elements!
+		if uploads.IsTruncated != nil && *uploads.IsTruncated {
+			return "", errors.New("too many concurrent uploads. please try again later")
+		}
+		return "", blob.NewErrBadUpload("unknown upload session")
+	}
+}
+
+func (handler *blobHandler) getExistingParts(
+	ctx context.Context,
+	uploadKey string,
+	uploadID string,
+) ([]s3types.Part, error) {
+	paginator := s3.NewListPartsPaginator(handler.s3Client, &s3.ListPartsInput{
+		Bucket:   &handler.bucket,
+		Key:      &uploadKey,
+		UploadId: &uploadID,
+	})
+	var parts []s3types.Part
+	for paginator.HasMorePages() {
+		page, err := paginator.NextPage(ctx)
+		if err != nil {
+			return nil, err
+		}
+		parts = append(parts, page.Parts...)
+	}
+	return parts, nil
+}
+
+func convertErrNotFound(err error) error {
+	var nf *s3types.NotFound
+	var nsk *s3types.NoSuchKey
+	if errors.As(err, &nf) || errors.As(err, &nsk) {
+		err = fmt.Errorf("%w: %w", blob.ErrNotFound, err)
+	}
+	return err
+}

@@ -1,0 +1,351 @@
+package routing
+
+import (
+	"context"
+	"io/fs"
+	"net/http"
+	"strings"
+	"time"
+
+	"github.com/distr-sh/distr/internal/auth"
+	"github.com/distr-sh/distr/internal/buildconfig"
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/frontend"
+	"github.com/distr-sh/distr/internal/handlers"
+	"github.com/distr-sh/distr/internal/logstore"
+	"github.com/distr-sh/distr/internal/middleware"
+	"github.com/distr-sh/distr/internal/oidc"
+	"github.com/distr-sh/distr/internal/prometheus"
+	"github.com/distr-sh/distr/internal/respond"
+	"github.com/distr-sh/distr/internal/tracers"
+	"github.com/go-chi/chi/v5"
+	chimiddleware "github.com/go-chi/chi/v5/middleware"
+	"github.com/go-chi/httprate"
+	"github.com/go-mailx/mailx"
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/oaswrap/spec-ui/config"
+	"github.com/oaswrap/spec/adapter/chiopenapi"
+	"github.com/oaswrap/spec/openapi"
+	"github.com/oaswrap/spec/option"
+	"go.uber.org/zap"
+)
+
+const apiDescription = `
+Distr enables software and AI companies to distribute applications to self-managed customers with minimal setup.
+
+## Main features
+
+- **Centralized Management:** View & manage all deployments, artifacts, connected controllers, self-managed &
+  BYOC customers via the intuitive web UI
+- **Deployment Automation:** Optional prebuilt Helm and Docker controllers manage deployments, collect logs and metrics,
+  and allow remote troubleshooting.
+- **White-label customer portal:** Let your customers control their deployments or download your artifacts
+- **License Management:** Distribute specific versions of your application to specific customers
+- **Container registry:** Distribute OCI-compatible artifacts (Docker images, Helm charts, Terraform modules)
+  with built-in granular access control and analytics.
+- Access the API using our [**rich SDK**](https://distr.sh/docs/integrations/sdk/)
+- Fully Open Source and [self-hostable](https://distr.sh/docs/self-hosting/)
+
+Check out the hosted version at https://distr.sh/get-started/.
+
+## About
+
+Distr is an Open Source software distribution platform that provides a ready-to-use setup with prebuilt components to
+help software and AI companies distribute applications to customers in complex, self-managed environments.
+
+**Use cases include:**
+
+- On-premises, VPC and self-managed software deployments
+- Bring Your Own Cloud (BYOC) automation
+- Edge & Fleet management
+
+Read more about Distr and our use cases at https://distr.sh/docs/
+`
+
+func NewRouter(
+	logger *zap.Logger,
+	db *pgxpool.Pool,
+	dbReadonly *pgxpool.Pool,
+	mailer *mailx.Mailer,
+	tracers *tracers.Tracers,
+	oidcer *oidc.OIDCer,
+	prometheusCollector *prometheus.DistrCollector,
+	logStore logstore.LogStore,
+) http.Handler {
+	baseRouter := chi.NewRouter()
+	baseRouter.Use(
+		// Handles panics
+		chimiddleware.Recoverer,
+	)
+
+	openapiRouter := chiopenapi.NewRouter(
+		baseRouter,
+		option.WithTitle("Distr API Reference"),
+		// Serve the spec as JSON: the library marshals YAML with single-quoted scalars, which do not
+		// interpret escape sequences, so multi-line descriptions would render with literal "\n" in the UI.
+		option.WithSpecPath("/docs/openapi.json"),
+		option.WithDescription(apiDescription),
+		option.WithVersion(buildconfig.Version()),
+		option.WithSecurity("bearer", option.SecurityHTTPBearer("Bearer")),
+		option.WithSecurity(
+			"accessToken",
+			option.SecurityAPIKey("Authorization", openapi.SecuritySchemeAPIKeyInHeader),
+			option.SecurityDescription(
+				"Provide a PAT using the Authorization header and adding the AccessToken prefix.\n\n"+
+					"Example: `Authorization: AccessToken distr-xxxxxx_yyyyyy`",
+			),
+		),
+		option.WithStoplightElements(config.StoplightElements{
+			HideSchemas: true,
+			Logo:        "/distr-logo.svg",
+			Layout:      "responsive",
+		}),
+	)
+	openapiRouter.Route("/api", ApiRouter(logger, db, dbReadonly, mailer, tracers, oidcer, prometheusCollector, logStore))
+
+	baseRouter.Mount("/internal", InternalRouter())
+	baseRouter.Mount("/status", StatusRouter())
+	baseRouter.Mount("/ready", ReadyRouter(db))
+	baseRouter.Mount("/.well-known", WellKnownRouter())
+	baseRouter.Mount("/", FrontendRouter())
+
+	return baseRouter
+}
+
+func ApiRouter(
+	logger *zap.Logger,
+	db *pgxpool.Pool,
+	dbReadonly *pgxpool.Pool,
+	mailer *mailx.Mailer,
+	tracers *tracers.Tracers,
+	oidcer *oidc.OIDCer,
+	prometheusCollector *prometheus.DistrCollector,
+	logStore logstore.LogStore,
+) func(r chiopenapi.Router) {
+	// Uploads are limited per file by maxFileSize in internal/handlers/file.go and maxMultipartFileSize in
+	// internal/handlers/util.go, which have to leave room for the multipart encoding within this limit.
+	requestSize1MiB := middleware.RequestSize(1024 * 1024)
+	requestSize10MiB := middleware.RequestSize(10 * 1024 * 1024)
+	requestSize50MiB := middleware.RequestSize(50 * 1024 * 1024)
+
+	return func(r chiopenapi.Router) {
+		r.Use(
+			chimiddleware.RequestID,
+			chimiddleware.ClientIPFromRemoteAddr,
+			chimiddleware.ClientIPFromXFFTrustedProxies(1),
+			middleware.Sentry,
+			middleware.LoggerCtxMiddleware(logger),
+			middleware.LoggingMiddleware,
+			middleware.MaintenanceMode,
+			middleware.ContextInjectorMiddleware(db, dbReadonly, mailer, oidcer, prometheusCollector, logStore),
+		)
+
+		r.Route("/public/v1", PublicRouter(tracers))
+
+		r.Route("/v1", func(r chiopenapi.Router) {
+			r.Group(func(r chiopenapi.Router) {
+				r.Use(
+					middleware.OTEL(tracers.Default()),
+					requestSize1MiB,
+				)
+
+				// public routes go here
+				r.Group(func(r chiopenapi.Router) {
+					r.Route("/auth", handlers.AuthRouter)
+					r.Route("/webhook", handlers.WebhookRouter)
+				})
+
+				// authenticated routes go here
+				r.Group(func(r chiopenapi.Router) {
+					r.WithOptions(
+						option.GroupSecurity("accessToken"),
+						option.GroupSecurity("bearer"),
+					)
+
+					r.Use(
+						auth.Authentication.Middleware,
+						middleware.SetSentryUserFromUserAuth,
+						middleware.RequireEmailVerified,
+						httprate.LimitBy(30, 1*time.Second, middleware.RateLimitUserIDKey),
+						httprate.LimitBy(300, 1*time.Minute, middleware.RateLimitUserIDKey),
+						httprate.LimitBy(2000, 1*time.Hour, middleware.RateLimitUserIDKey),
+
+						// TODO (low-prio) in the future, additionally check token audience and require it to be "api"/"user",
+						// such that controllers cant access anything here (they also can't now, because their tokens will not
+						// pass the Authentication chain (DbAuthenticator can't find the user -> 401)
+					)
+					r.Route("/controller-versions", handlers.ControllerVersionsRouter)
+					r.Route("/application-entitlements", handlers.ApplicationEntitlementsRouter)
+					r.Route("/activity-feed", handlers.ActivityFeedRouter)
+					r.Route("/applications", handlers.ApplicationsRouter)
+					r.Route("/artifact-entitlements", handlers.ArtifactEntitlementsRouter)
+					r.With(middleware.UseReadonlyDB).Route("/artifact-pulls", handlers.ArtifactPullsRouter)
+					r.Route("/artifacts", handlers.ArtifactsRouter)
+					r.Route("/billing", handlers.BillingRouter)
+					r.Route("/context", handlers.ContextRouter)
+					r.Route("/customer-organizations", handlers.CustomerOrganizationsRouter)
+					r.Route("/customer-settings", handlers.CustomerSettingsRouter)
+					r.With(middleware.CustomDomainsFeatureMiddleware).
+						Route("/custom-domains", handlers.CustomDomainsRouter)
+					r.With(middleware.CustomEmailsFeatureMiddleware).
+						Route("/custom-email", handlers.CustomEmailsRouter)
+					r.With(middleware.CustomOidcProvidersFeatureMiddleware).
+						Route("/custom-oidc", handlers.CustomOIDCConfigurationsRouter)
+					r.With(middleware.PartnerManagementFeatureMiddleware).
+						Route("/partner-organizations", handlers.PartnerOrganizationsRouter)
+					r.With(middleware.UseReadonlyDB).Route("/dashboard", handlers.DashboardRouter)
+					r.Route("/alert-configurations", handlers.AlertConfigurationsRouter)
+					r.Route("/update-notification-configurations",
+						handlers.UpdateNotificationConfigurationsRouter)
+					r.With(middleware.UseReadonlyDB).
+						Route("/deployment-target-metrics", handlers.DeploymentTargetMetricsRouter)
+					r.Route("/deployment-targets", handlers.DeploymentTargetsRouter)
+					r.Route("/deployments", handlers.DeploymentsRouter)
+					r.Route("/files", handlers.FileRouter)
+					r.Route("/lenses", handlers.LensesRouter)
+					r.With(middleware.UseReadonlyDB).Route("/notification-records", handlers.NotificationRecordsRouter)
+					r.Route("/organization", handlers.OrganizationRouter)
+					r.Route("/organizations", handlers.OrganizationsRouter)
+					r.Route("/secrets", handlers.SecretsRouter)
+					r.Route("/settings", handlers.SettingsRouter)
+					r.With(middleware.ProFeature).Route("/support-bundles", handlers.SupportBundlesRouter)
+					r.Route("/tutorial-progress", handlers.TutorialsRouter)
+					r.Route("/license-keys", handlers.LicenseKeysRouter)
+					r.Route("/license-templates", handlers.LicenseTemplatesRouter)
+					r.Route("/licenses", handlers.LicensesRouter)
+					r.Route("/user-accounts", handlers.UserAccountsRouter)
+					r.With(middleware.VulnerabilitiesFeatureMiddleware, middleware.VulnerabilitiesCustomerFeatureMiddleware).
+						Route("/advisories", handlers.AdvisoriesRouter)
+				})
+			})
+
+			// controller connect and download routes go here (authenticated but with accessKeyId and accessKeySecret)
+			r.Group(func(r chiopenapi.Router) {
+				r.Group(func(r chiopenapi.Router) {
+					r.Use(
+						middleware.OTEL(tracers.Controller()),
+						requestSize50MiB,
+					)
+					r.Route("/", handlers.ControllerRouter)
+				})
+
+				r.Group(func(r chiopenapi.Router) {
+					r.Use(
+						middleware.OTEL(tracers.Default()),
+						// Collected resources (up to SUPPORT_BUNDLE_RESOURCE_MAX_BYTES each) can be
+						// sizeable, so allow a larger request body than the default.
+						requestSize10MiB,
+					)
+					r.Route("/support-bundle-collect", handlers.SupportBundleScriptRouter)
+				})
+			})
+		})
+	}
+}
+
+func InternalRouter() http.Handler {
+	router := chi.NewRouter()
+	router.Route("/", handlers.InternalRouter)
+	return router
+}
+
+// CaddyAskRouter serves the Caddy on-demand TLS ask endpoint on the internal HTTP server
+// (see env.InternalServerAddr()), which must never be exposed outside the cluster.
+func CaddyAskRouter(logger *zap.Logger, db *pgxpool.Pool) http.Handler {
+	router := chi.NewRouter()
+	router.Use(
+		chimiddleware.Recoverer,
+		chimiddleware.RequestID,
+		middleware.Sentry,
+		middleware.LoggerCtxMiddleware(logger),
+		middleware.ContextInjectorMiddleware(db, nil, nil, nil, nil, nil),
+	)
+	router.Get("/internal/webhook/tls/ask", respond.Handler(handlers.TLSAskHandler))
+	return router
+}
+
+func StatusRouter() http.Handler {
+	router := chi.NewRouter()
+	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"status":"ok"}`))
+	})
+	return router
+}
+
+func ReadyRouter(db *pgxpool.Pool) http.Handler {
+	router := chi.NewRouter()
+	router.Get("/", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if !isReady(r.Context(), db) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = w.Write([]byte(`{"ready":false}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"ready":true}`))
+	})
+	return router
+}
+
+// isReady reports whether requests can be served. In maintenance mode the instance is never ready,
+// because the frontend probes this endpoint to decide whether to show its maintenance page. The
+// Kubernetes probes target "/" instead, so a maintenance window does not take the pod out of its
+// service and the frontend keeps being served.
+func isReady(ctx context.Context, db *pgxpool.Pool) bool {
+	if env.MaintenanceMode() {
+		return false
+	}
+	var result int
+	return db.QueryRow(ctx, "SELECT 1").Scan(&result) == nil
+}
+
+func PublicRouter(tracers *tracers.Tracers) func(r chiopenapi.Router) {
+	return func(r chiopenapi.Router) {
+		r.Use(middleware.OTEL(tracers.Default()))
+
+		r.Route("/license-keys", handlers.PublicLicenseKeysRouter)
+		r.Route("/files", handlers.PublicFileRouter)
+		r.Route("/portal", handlers.PublicPortalRouter)
+	}
+}
+
+func FrontendRouter() http.Handler {
+	router := chi.NewRouter()
+	router.Use(
+		chimiddleware.Compress(5, "text/html", "text/css", "text/javascript"),
+		middleware.CacheControlBundleAssets,
+		middleware.CacheControlMediaAssets,
+	)
+
+	router.Handle("/*", staticFileHandler(frontend.BrowserFS()))
+
+	return router
+}
+
+func staticFileHandler(fsys fs.FS) http.HandlerFunc {
+	server := http.FileServer(http.FS(fsys))
+	return func(w http.ResponseWriter, r *http.Request) {
+		if info, err := fs.Stat(fsys, strings.TrimPrefix(r.URL.Path, "/")); err == nil && !info.IsDir() {
+			server.ServeHTTP(w, r)
+		} else if middleware.IsAssetPath(r.URL.Path) {
+			// Overrides the max-age of the cache middleware, since another replica may have the asset.
+			w.Header().Set("Cache-Control", "no-store")
+			http.NotFound(w, r)
+		} else {
+			w.Header().Set("Cache-Control", "no-cache")
+			http.ServeFileFS(w, r, fsys, "index.html")
+		}
+	}
+}
+
+func WellKnownRouter() http.Handler {
+	router := chi.NewRouter()
+	if env.WellKnownMicrosoftIdentityAssociation() != nil {
+		router.Get("/microsoft-identity-association.json", func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(env.WellKnownMicrosoftIdentityAssociation())
+		})
+	}
+
+	return router
+}

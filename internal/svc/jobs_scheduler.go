@@ -1,0 +1,129 @@
+package svc
+
+import (
+	"context"
+
+	"github.com/distr-sh/distr/internal/cleanup"
+	"github.com/distr-sh/distr/internal/customdomains"
+	"github.com/distr-sh/distr/internal/env"
+	"github.com/distr-sh/distr/internal/jobs"
+	"github.com/distr-sh/distr/internal/notification"
+	"github.com/distr-sh/distr/internal/registry/upstream"
+)
+
+func (r *Registry) GetJobsScheduler() *jobs.Scheduler {
+	return r.jobsScheduler
+}
+
+func (r *Registry) createJobsScheduler() (*jobs.Scheduler, error) {
+	scheduler, err := jobs.NewScheduler(r.GetLogger(), r.GetDbPool(), r.GetMailer(), r.GetTracers().Always(), r.s3Client)
+	if err != nil {
+		return nil, err
+	}
+
+	if cron := env.CleanupDeploymentTargetMetricsCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob(
+				"DeploymentTargetMetricsCleanup",
+				cleanup.RunDeploymentTargetMetricsCleanup,
+				env.CleanupDeploymentTargetMetricsTimeout(),
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CleanupOIDCStateCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("OIDCStateCleanup", cleanup.RunOIDCStateCleanup, env.CleanupOIDCStateCronTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CleanupArtifactBlobCron(); cron != nil && r.s3Client != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("ArtifactBlobCleanup", cleanup.RunArtifactBlobCleanup, env.CleanupArtifactBlobTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CleanupOrganizationCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("OrganizationCleanup", cleanup.RunOrganizationCleanup, env.CleanupOrganizationTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CleanupUserAccountCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("UserAccountCleanup", cleanup.RunUserAccountCleanup, env.CleanupUserAccountTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CleanupFileCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("FileCleanup", cleanup.RunFileCleanup, env.CleanupFileTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.DeploymentStatusNotificationCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob(
+				"DeploymentStatusNotification",
+				notification.RunDeploymentStatusNotifications,
+				env.DeploymentStatusNotificationTimeout(),
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.CustomDomainVerificationCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob(
+				"CustomDomainVerification",
+				customdomains.RunCustomDomainVerification,
+				env.CustomDomainVerificationTimeout(),
+			),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	if cron := env.RegistryUpstreamSyncCron(); cron != nil {
+		err = scheduler.RegisterCronJob(
+			*cron,
+			jobs.NewJob("RegistryUpstreamSync", func(ctx context.Context) error {
+				return upstream.RunUpstreamSync(ctx, true)
+			}, env.RegistryUpstreamSyncTimeout()),
+		)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	return scheduler, nil
+}

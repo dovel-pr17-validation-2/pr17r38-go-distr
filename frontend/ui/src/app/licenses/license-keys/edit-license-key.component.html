@@ -1,0 +1,102 @@
+<form [formGroup]="editForm" class="space-y-4">
+  @if (isEditMode()) {
+    <app-alert type="info">
+      @if (editForm.value.licenseTemplateId) {
+        This license key is configured with a license template. Manually changing the dates or payload is not supported.
+      } @else {
+        Changing the dates or payload will create a new revision. The name and customer assignment cannot be changed
+        after creation.
+      }
+    </app-alert>
+  }
+
+  <div class="mt-4 space-y-4">
+    <div>
+      <label for="name" class="distr-label mb-2">Name *</label>
+      <input formControlName="name" autotrim type="text" id="name" class="distr-input" placeholder="License name" />
+      @if (editForm.controls.name.invalid && editForm.controls.name.touched) {
+        <p class="mt-1 text-sm text-red-600 dark:text-red-500">Field is required.</p>
+      }
+    </div>
+
+    <div>
+      <label for="description" class="distr-label mb-2">Description</label>
+      <textarea
+        formControlName="description"
+        id="description"
+        rows="2"
+        class="distr-input"
+        placeholder="License description"></textarea>
+    </div>
+
+    @if (isEditMode()) {
+      @if (selectedLicenseTemplate(); as template) {
+        <div>
+          <label class="distr-label mb-1">License Template</label>
+          <p class="text-sm text-gray-900 dark:text-white">{{ template.name }}</p>
+        </div>
+      }
+    } @else if (templates().length > 0) {
+      <div>
+        <label for="licenseTemplateId" class="distr-label mb-2"> License Template </label>
+        <select formControlName="licenseTemplateId" id="licenseTemplateId" class="distr-input">
+          <option [ngValue]="undefined">— None (manual payload) —</option>
+          @for (template of templates(); track template.id) {
+            <option [value]="template.id">{{ template.name }}</option>
+          }
+        </select>
+        @if (hasTemplate) {
+          <p class="mt-1 text-xs text-gray-500 dark:text-gray-400">
+            Payload and dates will be set automatically by Stripe when a subscription event is received.
+          </p>
+        }
+      </div>
+    }
+
+    @if (!hasTemplate) {
+      <div class="space-y-4">
+        <div>
+          <label for="notBefore" class="distr-label mb-2">Not Before *</label>
+          <input formControlName="notBefore" type="date" id="notBefore" class="distr-input" />
+          @if (editForm.errors?.['notBeforeRequired'] && editForm.controls.notBefore.touched) {
+            <p class="mt-1 text-sm text-red-600 dark:text-red-500">Field is required.</p>
+          }
+        </div>
+        <div>
+          <label for="expiresAt" class="distr-label mb-2">Expires At *</label>
+          <app-expires-at-picker formControlName="expiresAt" inputId="expiresAt" [allowNoExpiration]="false" />
+          @if (editForm.errors?.['expiresAtRequired'] && editForm.controls.expiresAt.touched) {
+            <p class="mt-1 text-sm text-red-600 dark:text-red-500">Field is required.</p>
+          }
+        </div>
+      </div>
+      @if (
+        editForm.errors?.['dateRange'] && (editForm.controls.notBefore.touched || editForm.controls.expiresAt.touched)
+      ) {
+        <p class="text-sm text-red-600 dark:text-red-500">{{ editForm.errors?.['dateRange'] }}</p>
+      }
+
+      <div>
+        <label #payloadLabel class="distr-label mb-2">Payload (JSON) *</label>
+        <app-editor
+          [label]="payloadLabel"
+          formControlName="payload"
+          language="json"
+          class="block w-full rounded-lg border border-gray-300 bg-gray-50 text-sm text-gray-900 [--editor-min-height:--spacing(32)] dark:border-gray-600 dark:bg-gray-700 dark:text-white" />
+        @if (editForm.errors?.['payloadRequired'] && editForm.controls.payload.touched) {
+          <p class="mt-1 text-sm text-red-600 dark:text-red-500">Field is required.</p>
+        }
+        @if (editForm.controls.payload.errors?.['json'] && editForm.controls.payload.touched) {
+          <p class="mt-1 text-sm text-red-600 dark:text-red-500">{{ editForm.controls.payload.errors?.['json'] }}</p>
+        }
+      </div>
+    }
+
+    @if (selectedCustomer(); as c) {
+      <div>
+        <label class="distr-label mb-1">Customer</label>
+        <p class="text-sm text-gray-900 dark:text-white">{{ c.name }}</p>
+      </div>
+    }
+  </div>
+</form>

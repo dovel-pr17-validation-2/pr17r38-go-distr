@@ -1,0 +1,191 @@
+@layer base {
+  .markdown {
+    h1,
+    h2,
+    h3,
+    h4,
+    h5,
+    h6 {
+      @apply text-gray-900 dark:text-white;
+    }
+
+    h1 {
+      @apply text-2xl font-bold;
+      @apply mt-6 mb-4;
+    }
+
+    h2 {
+      @apply text-xl font-bold;
+      @apply mt-5 mb-3;
+    }
+
+    h3 {
+      @apply text-lg font-semibold;
+      @apply mt-4 mb-3;
+
+      &:has(+ ul, + ol) {
+        @apply mb-4;
+      }
+    }
+
+    h4 {
+      @apply text-base font-semibold;
+      @apply mt-3 mb-2;
+    }
+
+    h5 {
+      @apply text-sm font-semibold;
+      @apply mt-2 mb-2;
+    }
+
+    h6 {
+      @apply text-sm font-medium text-gray-600 dark:text-gray-300;
+      @apply mt-2 mb-2;
+    }
+
+    &.markdown-compact {
+      h1 {
+        @apply text-xl font-bold;
+      }
+
+      h2 {
+        @apply text-lg font-semibold;
+      }
+
+      h3 {
+        @apply text-base font-semibold;
+      }
+
+      h4 {
+        @apply text-sm font-semibold;
+      }
+
+      h5 {
+        @apply text-xs font-semibold;
+      }
+
+      h6 {
+        @apply text-xs font-medium text-gray-600 dark:text-gray-300;
+      }
+    }
+
+    > :first-child {
+      @apply mt-0;
+    }
+
+    pre {
+      @apply rounded-md;
+      @apply px-3;
+      @apply py-2;
+      @apply border border-gray-200 dark:border-gray-600;
+    }
+
+    code:not(a *),
+    strong {
+      @apply text-gray-900;
+      @apply dark:text-gray-200;
+    }
+
+    code {
+      @apply whitespace-pre;
+    }
+
+    pre code {
+      @apply whitespace-pre-wrap;
+    }
+
+    code:not(pre *) {
+      @apply rounded-sm;
+      @apply px-1;
+      @apply border border-gray-200 dark:border-gray-600;
+    }
+
+    pre,
+    code {
+      @apply bg-gray-200 dark:bg-gray-800;
+      @apply text-sm;
+    }
+
+    hr {
+      @apply h-px;
+      @apply my-8;
+      @apply bg-gray-300;
+      @apply border-0;
+      @apply dark:bg-gray-700;
+    }
+
+    ul,
+    ol {
+      @apply space-y-1;
+      @apply ms-6;
+    }
+
+    ul {
+      @apply list-disc;
+    }
+
+    ol {
+      @apply list-decimal;
+    }
+
+    pre,
+    p,
+    ol,
+    ul,
+    table {
+      @apply mb-3;
+    }
+
+    pre,
+    blockquote {
+      @apply my-5;
+    }
+
+    blockquote > :last-child {
+      @apply mb-0;
+    }
+
+    a {
+      @apply text-primary-600;
+      @apply dark:text-primary-400;
+      @apply underline;
+    }
+
+    p,
+    ol,
+    ul {
+      @apply text-gray-600;
+      @apply dark:text-gray-300;
+    }
+
+    blockquote {
+      @apply border-l-4;
+      @apply ps-4;
+      @apply border-gray-300;
+      @apply dark:border-gray-700;
+      @apply italic;
+    }
+
+    table {
+      @apply w-full border-collapse;
+
+      tr {
+        @apply hover:bg-gray-100 dark:hover:bg-gray-700;
+      }
+
+      th,
+      td {
+        @apply border border-gray-200 px-1 dark:border-gray-600 dark:text-white;
+      }
+    }
+
+    summary {
+      @apply cursor-pointer;
+      @apply mb-2;
+    }
+
+    details {
+      @apply mb-2;
+    }
+  }
+}

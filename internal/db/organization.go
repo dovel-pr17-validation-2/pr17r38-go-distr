@@ -1,0 +1,482 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"time"
+
+	"github.com/distr-sh/distr/internal/buildconfig"
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/dbcrypto"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/license"
+	"github.com/distr-sh/distr/internal/limit"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+var (
+	organizationOutputExpr = `
+		o.id,
+		o.created_at,
+		o.name,
+		o.slug,
+		o.features,
+		o.subscription_type,
+		o.subscription_period,
+		o.subscription_ends_at,
+		o.stripe_customer_id,
+		o.stripe_subscription_id,
+		o.subscription_customer_organization_quantity,
+		o.subscription_user_account_quantity,
+		o.docker_pre_connect_script,
+		o.docker_post_connect_script,
+		o.docker_connect_script_is_sudo,
+		o.kubernetes_pre_connect_script,
+		o.kubernetes_post_connect_script,
+		` + organizationStripeSecret.Value("o") + `,
+		` + organizationStripeSecret.IsSetValue("o") + `,
+		o.controller_image_repository
+	`
+	organizationWithUserRoleOutputExpr = organizationOutputExpr + `,
+		j.user_role,
+		cu.id AS customer_organization_id,
+		cu.name AS customer_organization_name,
+		po.id AS partner_organization_id,
+		po.name AS partner_organization_name,
+		j.created_at as joined_org_at `
+)
+
+func CreateOrganization(ctx context.Context, org *types.Organization) error {
+	// Defaults matching the database column defaults for a fresh organization.
+	plan := types.SubscriptionPlan{
+		Period:                  types.SubscriptionPeriodMonthly,
+		EndsAt:                  time.Now().AddDate(0, 1, 0),
+		CustomerOrganizationQty: limit.Unlimited,
+		UserAccountQty:          limit.Unlimited,
+	}
+	org.Features = []types.Feature{}
+
+	if buildconfig.IsCommunityEdition() {
+		plan.Type = types.SubscriptionTypeCommunity
+	} else if licenseData := license.GetLicenseData(); licenseData.EnforceLimitsOnStartup {
+		// Reconciliation puts every organization on the plan of the license key, so a new
+		// organization must start on it too.
+		plan = licenseData.Plan()
+	} else {
+		plan.Type = types.SubscriptionTypeTrial
+	}
+
+	org.ApplyPlan(plan)
+
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`INSERT INTO Organization AS o (
+			name,
+			slug,
+			subscription_type,
+			features,
+			subscription_period,
+			subscription_ends_at,
+			subscription_customer_organization_quantity,
+			subscription_user_account_quantity
+		)
+		VALUES (
+			@name,
+			@slug,
+			@subscription_type,
+			@features,
+			@subscription_period,
+			@subscription_ends_at,
+			@subscription_customer_organization_quantity,
+			@subscription_user_account_quantity
+		)
+		RETURNING `+organizationOutputExpr,
+		pgx.NamedArgs{
+			"name":                 org.Name,
+			"slug":                 org.Slug,
+			"subscription_type":    org.SubscriptionType,
+			"features":             org.Features,
+			"subscription_period":  org.SubscriptionPeriod,
+			"subscription_ends_at": org.SubscriptionEndsAt.UTC(),
+			"subscription_customer_organization_quantity": org.SubscriptionCustomerOrganizationQty,
+			"subscription_user_account_quantity":          org.SubscriptionUserAccountQty,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not create organization: %w", mapDuplicateSlugError(err))
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.Organization])
+	if err != nil {
+		return fmt.Errorf("could not create organization: %w", mapDuplicateSlugError(err))
+	}
+
+	RunAfterTx(ctx, func(ctx context.Context) {
+		log := internalctx.GetLogger(ctx)
+		if c := internalctx.GetPrometheusCollector(ctx); c != nil {
+			c.IncOrganizationsTotal()
+		} else {
+			log.Warn("could not update organizations total metric because collector is nil")
+		}
+	})
+
+	*org = result
+	return nil
+}
+
+func UpdateOrganization(ctx context.Context, org *types.Organization) error {
+	stripeWebhookSecretEnc, err := organizationStripeSecret.EncryptPtr(org.StripeWebhookSecret, org.ID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt Stripe webhook secret: %w", err)
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`UPDATE Organization AS o
+		SET
+			name = @name,
+			slug = @slug,
+			features = @features,
+			subscription_type = @subscription_type,
+			subscription_period = @subscription_period,
+			subscription_ends_at = @subscription_ends_at,
+			stripe_customer_id = @stripe_customer_id,
+			stripe_subscription_id = @stripe_subscription_id,
+			subscription_customer_organization_quantity = @subscription_customer_organization_quantity,
+			subscription_user_account_quantity = @subscription_user_account_quantity,
+			docker_pre_connect_script = @docker_pre_connect_script,
+			docker_post_connect_script = @docker_post_connect_script,
+			docker_connect_script_is_sudo = @docker_connect_script_is_sudo,
+			kubernetes_pre_connect_script = @kubernetes_pre_connect_script,
+			kubernetes_post_connect_script = @kubernetes_post_connect_script,
+			controller_image_repository = @controller_image_repository,
+			stripe_webhook_secret = NULL,
+			stripe_webhook_secret_enc = @stripe_webhook_secret_enc
+		WHERE id = @id
+		RETURNING `+organizationOutputExpr,
+		pgx.NamedArgs{
+			"id":                     org.ID,
+			"name":                   org.Name,
+			"features":               org.Features,
+			"slug":                   org.Slug,
+			"subscription_type":      org.SubscriptionType,
+			"subscription_period":    org.SubscriptionPeriod,
+			"subscription_ends_at":   org.SubscriptionEndsAt.UTC(),
+			"stripe_customer_id":     org.StripeCustomerID,
+			"stripe_subscription_id": org.StripeSubscriptionID,
+			"subscription_customer_organization_quantity": org.SubscriptionCustomerOrganizationQty,
+			"subscription_user_account_quantity":          org.SubscriptionUserAccountQty,
+			"docker_pre_connect_script":                   org.DockerPreConnectScript,
+			"docker_post_connect_script":                  org.DockerPostConnectScript,
+			"docker_connect_script_is_sudo":               org.DockerConnectScriptIsSudo,
+			"kubernetes_pre_connect_script":               org.KubernetesPreConnectScript,
+			"kubernetes_post_connect_script":              org.KubernetesPostConnectScript,
+			"controller_image_repository":                 org.ControllerImageRepository,
+			"stripe_webhook_secret_enc":                   stripeWebhookSecretEnc,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update organization: %w", mapDuplicateSlugError(err))
+	}
+	if result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.Organization]); err != nil {
+		return fmt.Errorf("could not update organization: %w", mapDuplicateSlugError(err))
+	} else {
+		*org = result
+		return nil
+	}
+}
+
+func mapDuplicateSlugError(err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.UniqueViolation {
+		return fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+	}
+	return err
+}
+
+func UpdateOrganizationSubscriptionType(ctx context.Context, subscriptionType types.SubscriptionType) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(
+		ctx,
+		`UPDATE Organization
+		SET subscription_type = @subscription_type`,
+		pgx.NamedArgs{"subscription_type": subscriptionType},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update Organization: %w", err)
+	}
+	return nil
+}
+
+// RemoveOrganizationFeaturesWithSubscriptionType removes the given features from all
+// organizations with one of the given subscription types. Features that are not passed in are
+// left untouched, so features granted outside of a subscription plan survive.
+func RemoveOrganizationFeaturesWithSubscriptionType(
+	ctx context.Context,
+	subscriptionType []types.SubscriptionType,
+	features []types.Feature,
+) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(
+		ctx,
+		`UPDATE Organization
+		SET features = array(
+			SELECT unnest(features)
+			EXCEPT
+			SELECT unnest(@features::feature[])
+		)
+		WHERE subscription_type = ANY(@subscription_type)
+			AND features && @features::feature[]`,
+		pgx.NamedArgs{"subscription_type": subscriptionType, "features": features},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update Organization: %w", err)
+	}
+	return nil
+}
+
+func GetOrganizationIDsWithoutFeature(ctx context.Context, feature types.Feature) ([]uuid.UUID, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		`SELECT id FROM Organization WHERE deleted_at IS NULL AND NOT @feature::FEATURE = ANY(features)`,
+		pgx.NamedArgs{"feature": feature},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query Organization: %w", err)
+	}
+	if result, err := pgx.CollectRows(rows, pgx.RowTo[uuid.UUID]); err != nil {
+		return nil, fmt.Errorf("could not collect Organization IDs: %w", err)
+	} else {
+		return result, nil
+	}
+}
+
+// ApplyPlanToAllOrganizations is the bulk equivalent of [types.Organization.ApplyPlan]: it puts
+// every organization on the given plan and adds its features without removing any other.
+func ApplyPlanToAllOrganizations(ctx context.Context, plan types.SubscriptionPlan) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(
+		ctx,
+		`UPDATE Organization
+		SET subscription_customer_organization_quantity = @max_customer_orgs,
+			subscription_user_account_quantity = @max_user_accounts,
+			subscription_period = @subscription_period,
+			subscription_ends_at = @subscription_ends_at,
+			subscription_type = @subscription_type,
+			features = array(SELECT DISTINCT unnest FROM unnest(features || @features::feature[]))
+		WHERE deleted_at IS NULL`,
+		pgx.NamedArgs{
+			"max_customer_orgs":    plan.CustomerOrganizationQty,
+			"max_user_accounts":    plan.UserAccountQty,
+			"subscription_period":  plan.Period,
+			"subscription_ends_at": plan.EndsAt.UTC(),
+			"subscription_type":    plan.Type,
+			"features":             plan.Features(),
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update Organization: %w", err)
+	}
+	return nil
+}
+
+func GetOrganizationsForUser(ctx context.Context, userID uuid.UUID) ([]types.OrganizationWithUserRole, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT`+organizationWithUserRoleOutputExpr+`
+			FROM UserAccount u
+			INNER JOIN Organization_UserAccount j ON u.id = j.user_account_id
+			INNER JOIN Organization o ON o.id = j.organization_id
+			LEFT JOIN CustomerOrganization cu ON cu.id = j.customer_organization_id
+			LEFT JOIN PartnerOrganization po ON po.id = j.partner_organization_id
+			WHERE u.id = @id
+				AND o.deleted_at IS NULL
+			ORDER BY o.name
+	`, pgx.NamedArgs{"id": userID})
+	if err != nil {
+		return nil, err
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.OrganizationWithUserRole])
+	if err != nil {
+		return nil, err
+	} else {
+		return result, nil
+	}
+}
+
+func GetAllOrganizationsForSuperAdmin(ctx context.Context) ([]types.OrganizationWithUserRole, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx, `
+		SELECT`+organizationOutputExpr+`,
+			'admin' as user_role,
+			NULL::UUID as customer_organization_id,
+			NULL::TEXT as customer_organization_name,
+			NULL::UUID as partner_organization_id,
+			NULL::TEXT as partner_organization_name,
+			o.created_at as joined_org_at
+			FROM Organization o
+			WHERE o.deleted_at IS NULL
+			ORDER BY o.subscription_type::text, o.name
+	`)
+	if err != nil {
+		return nil, err
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByPos[types.OrganizationWithUserRole])
+	if err != nil {
+		return nil, err
+	} else {
+		return result, nil
+	}
+}
+
+func CountAllOrganizations(ctx context.Context) (res int64, err error) {
+	db := internalctx.GetDb(ctx)
+	err = db.QueryRow(ctx, "SELECT count(id) FROM Organization WHERE deleted_at IS NULL").Scan(&res)
+	if err != nil {
+		err = fmt.Errorf("failed to get organizations count: %w", err)
+	}
+	return
+}
+
+func GetOrganizationByID(ctx context.Context, orgID uuid.UUID) (*types.Organization, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"SELECT "+organizationOutputExpr+" FROM Organization o WHERE id = @id AND o.deleted_at IS NULL",
+		pgx.NamedArgs{"id": orgID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.Organization])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: organization %v", distrerr.ErrNotFound, orgID)
+	} else if err != nil {
+		return nil, err
+	} else {
+		return &result, nil
+	}
+}
+
+// GetOrganizationByIDIncludingDeleted also returns whether the organization is soft-deleted.
+func GetOrganizationByIDIncludingDeleted(ctx context.Context, orgID uuid.UUID) (*types.Organization, bool, error) {
+	type organizationWithDeleted struct {
+		types.Organization
+		Deleted bool `db:"deleted"`
+	}
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"SELECT "+organizationOutputExpr+", o.deleted_at IS NOT NULL AS deleted FROM Organization o WHERE id = @id",
+		pgx.NamedArgs{"id": orgID},
+	)
+	if err != nil {
+		return nil, false, err
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[organizationWithDeleted])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, false, fmt.Errorf("%w: organization %v", distrerr.ErrNotFound, orgID)
+	} else if err != nil {
+		return nil, false, err
+	} else {
+		return &result.Organization, result.Deleted, nil
+	}
+}
+
+func GetOrganizationWithBranding(ctx context.Context, orgID uuid.UUID) (*types.OrganizationWithBranding, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		fmt.Sprintf(
+			`SELECT `+organizationOutputExpr+`,
+				CASE WHEN b.id IS NOT NULL THEN (%v) END AS branding
+			FROM Organization o
+			LEFT JOIN OrganizationBranding b ON b.organization_id = o.id
+			WHERE o.id = @id
+				AND o.deleted_at IS NULL`,
+			organizationBrandingOutputExpr,
+		),
+		pgx.NamedArgs{"id": orgID},
+	)
+	if err != nil {
+		return nil, err
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[types.OrganizationWithBranding])
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			err = distrerr.ErrNotFound
+		}
+		return nil, fmt.Errorf("could not get organization: %w", err)
+	} else {
+		return &result, nil
+	}
+}
+
+func SetOrganizationStripeWebhookSecret(ctx context.Context, orgID uuid.UUID, secret *dbcrypto.String) error {
+	secretEnc, err := organizationStripeSecret.EncryptPtr(secret, orgID)
+	if err != nil {
+		return fmt.Errorf("could not encrypt Stripe webhook secret: %w", err)
+	}
+	db := internalctx.GetDb(ctx)
+	_, err = db.Exec(ctx,
+		`UPDATE Organization SET stripe_webhook_secret = NULL, stripe_webhook_secret_enc = @secretEnc WHERE id = @id`,
+		pgx.NamedArgs{"id": orgID, "secretEnc": secretEnc},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update Organization stripe webhook secret: %w", err)
+	}
+	return nil
+}
+
+func DeleteOrganizationsOlderThan(ctx context.Context, minAge time.Duration) (int64, error) {
+	var rowsAffected int64
+	err := RunTx(ctx, func(ctx context.Context) error {
+		db := internalctx.GetDb(ctx)
+		if _, err := db.Exec(
+			ctx,
+			"SET CONSTRAINTS "+
+				"deployment_application_entitlement_id_fkey, "+
+				"deploymentrevision_application_version_id_fkey DEFERRED",
+		); err != nil {
+			return fmt.Errorf("could not defer constraints: %w", err)
+		}
+		result, err := db.Exec(
+			ctx,
+			"DELETE FROM Organization WHERE deleted_at IS NOT NULL AND now() - deleted_at > @minAge",
+			pgx.NamedArgs{"minAge": minAge},
+		)
+		if err != nil {
+			return fmt.Errorf("could not delete organizations: %w", err)
+		}
+		rowsAffected = result.RowsAffected()
+		return nil
+	})
+	return rowsAffected, err
+}
+
+// SetOrganizationDeletedAtNow returns the Stripe subscription ID of the deleted organization, which is nil if
+// it has none or was already deleted.
+func SetOrganizationDeletedAtNow(ctx context.Context, orgID uuid.UUID) (*string, error) {
+	db := internalctx.GetDb(ctx)
+	var stripeSubscriptionID *string
+	err := db.QueryRow(
+		ctx,
+		"UPDATE Organization SET deleted_at = now() WHERE id = @id AND deleted_at IS NULL RETURNING stripe_subscription_id",
+		pgx.NamedArgs{"id": orgID},
+	).Scan(&stripeSubscriptionID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, nil
+	} else if err != nil {
+		return nil, fmt.Errorf("could not update Organization: %w", err)
+	}
+
+	RunAfterTx(ctx, func(ctx context.Context) {
+		log := internalctx.GetLogger(ctx)
+		if c := internalctx.GetPrometheusCollector(ctx); c != nil {
+			c.DecOrganizationsTotal()
+		} else {
+			log.Warn("could not update organizations total metric because collector is nil")
+		}
+	})
+
+	return stripeSubscriptionID, nil
+}

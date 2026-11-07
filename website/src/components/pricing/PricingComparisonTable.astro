@@ -1,0 +1,481 @@
+---
+type Cell = '✓' | '—' | string;
+
+type Row = {
+  label: string;
+  community: Cell;
+  pro: Cell;
+  business: Cell;
+  enterprise: Cell;
+  indent?: boolean;
+};
+
+type Section = {
+  title: string;
+  rows: Row[];
+};
+
+const sections: Section[] = [
+  {
+    title: 'Limits',
+    rows: [
+      {
+        label: 'Self-Hosting or Cloud',
+        community: 'Self-Hosting',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Max Customers',
+        community: 'Unlimited',
+        pro: '100',
+        business: 'Unlimited',
+        enterprise: 'Unlimited',
+      },
+      {
+        label: 'Max Deployments per Customer',
+        community: '1',
+        pro: '8',
+        business: '8',
+        enterprise: 'Unlimited',
+      },
+      {
+        label: 'Max Users per Customer',
+        community: '1',
+        pro: 'Unlimited',
+        business: 'Unlimited',
+        enterprise: 'Unlimited',
+      },
+      {
+        label: 'Registry storage',
+        community: 'Self-hosted',
+        pro: 'Up to 1 TB',
+        business: 'Up to 5 TB',
+        enterprise: 'Custom',
+      },
+    ],
+  },
+  {
+    title: 'Licensing & Deployment',
+    rows: [
+      {
+        label: 'Deployment Controllers (Docker / K8s)',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Air-gapped Deployments (Zarf)',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Deployment History & Rollbacks',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'GitHub Release Automation',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Pre/Post Install Scripts',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Customer Portal',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'License Management',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Application & Artifact Entitlements',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+        indent: true,
+      },
+      {
+        label: 'License Keys (signed JWT tokens)',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+        indent: true,
+      },
+      {
+        label: 'License Templates',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Reseller / Partner Organizations',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Customer Billing',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+    ],
+  },
+  {
+    title: 'Security & Governance',
+    rows: [
+      {
+        label: 'Login with Google, GitHub & Microsoft',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Enterprise SSO: Bring-your-own OIDC (vendors & customers)',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'SAML SSO',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Role-based Access Controls',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Custom Roles',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+    ],
+  },
+  {
+    title: 'Observability',
+    rows: [
+      {
+        label: 'Live Container Metrics',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Deployment Status Metrics',
+        community: '✓',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Log Retention',
+        community: 'Self-hosted',
+        pro: '7 days',
+        business: '30 days',
+        enterprise: 'Custom',
+      },
+      {
+        label: 'Alerts',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Support Bundles (Remote Troubleshooting)',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Vulnerability Management',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Affected Customer Impact Analysis',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+    ],
+  },
+  {
+    title: 'White Label',
+    rows: [
+      {
+        label: 'Custom Branding for your Customer Portal',
+        community: '—',
+        pro: '✓',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'Custom Domains (Full White Label)',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+      {
+        label: 'White-label Emails (Custom Sender Domain)',
+        community: '—',
+        pro: '—',
+        business: '✓',
+        enterprise: '✓',
+      },
+    ],
+  },
+  {
+    title: 'Support / Operations',
+    rows: [
+      {
+        label: 'Support Type',
+        community: 'Community (GitHub)',
+        pro: 'Email + Slack',
+        business: 'Priority Email + Slack',
+        enterprise: 'Email + Slack + Phone',
+      },
+      {
+        label: 'Onboarding Support',
+        community: '—',
+        pro: 'Free Onboarding Call',
+        business: 'White Glove Onboarding',
+        enterprise: 'White Glove Onboarding',
+      },
+      {
+        label: 'Dedicated Support Engineer',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'SLA',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Custom Contracts & Procurement Support',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Dedicated Infrastructure',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Workflows / Automation',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Documentation Pages & Wiki',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Ticket System',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'Public Registry',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+      {
+        label: 'CVE Scanning',
+        community: '—',
+        pro: '—',
+        business: '—',
+        enterprise: '✓',
+      },
+    ],
+  },
+];
+
+const cellClass = (value: Cell) =>
+  `p-3.5 text-center align-middle text-sm border-b border-gray-100 dark:border-gray-800${
+    value === '✓' ? ' text-green-600 font-bold text-lg' : ''
+  }`;
+---
+
+<section class="py-8 md:py-16">
+  <div class="container mx-auto px-4 max-w-7xl">
+    <div class="mt-16 mx-auto">
+      <h2 class="text-center mb-8 text-3xl font-bold">Compare Features</h2>
+      <div class="overflow-x-auto lg:overflow-visible bg-white dark:bg-gray-900 rounded-xl shadow-md">
+        <table class="w-full border-collapse table-fixed">
+          <colgroup>
+            <col style="width: 24%;" />
+            <col style="width: 19%;" />
+            <col style="width: 19%;" />
+            <col style="width: 19%;" />
+            <col style="width: 19%;" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th class="plan-header rounded-tl-xl bg-white dark:bg-gray-900 font-semibold text-center p-5 border-b border-gray-200 dark:border-gray-700 text-base"></th>
+              <th class="plan-header bg-white dark:bg-gray-900 font-semibold text-center p-5 border-b border-gray-200 dark:border-gray-700 text-base">
+                Open Source
+                <br />
+                (Community)
+                <div class="absolute bottom-0 left-[15%] right-[15%] h-[3px] rounded-full bg-gray-500"></div>
+              </th>
+              <th class="plan-header bg-white dark:bg-gray-900 font-semibold text-center p-5 border-b border-gray-200 dark:border-gray-700 text-base">
+                Pro
+                <div class="absolute bottom-0 left-[15%] right-[15%] h-[3px] rounded-full bg-[#10b981]"></div>
+              </th>
+              <th class="plan-header bg-white dark:bg-gray-900 font-semibold text-center p-5 border-b border-gray-200 dark:border-gray-700 text-base">
+                Business
+                <div class="absolute bottom-0 left-[15%] right-[15%] h-[3px] rounded-full bg-accent-600"></div>
+              </th>
+              <th class="plan-header rounded-tr-xl bg-white dark:bg-gray-900 font-semibold text-center p-5 border-b border-gray-200 dark:border-gray-700 text-base">
+                Enterprise
+                <div class="absolute bottom-0 left-[15%] right-[15%] h-[3px] rounded-full bg-[#8b5cf6]"></div>
+              </th>
+            </tr>
+          </thead>
+          <tbody>
+            {sections.map(section => (
+              <>
+                <tr class="section-row bg-gray-100 dark:bg-gray-950 border-t-2 border-b-2 border-gray-300 dark:border-gray-700">
+                  <td
+                    colspan="5"
+                    class="font-bold text-left p-4 text-gray-900 dark:text-gray-200 uppercase tracking-wider text-sm">
+                    {section.title}
+                  </td>
+                </tr>
+                {section.rows.map(row => (
+                  <tr>
+                    <td
+                      class={`p-3.5 text-left font-medium text-sm border-b border-gray-100 dark:border-gray-800${
+                        row.indent
+                          ? ' pl-7 text-gray-500 dark:text-gray-400'
+                          : ''
+                      }`}>
+                      {row.label}
+                    </td>
+                    <td class={cellClass(row.community)}>{row.community}</td>
+                    <td class={cellClass(row.pro)}>{row.pro}</td>
+                    <td class={cellClass(row.business)}>{row.business}</td>
+                    <td class={cellClass(row.enterprise)}>{row.enterprise}</td>
+                  </tr>
+                ))}
+              </>
+            ))}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </div>
+</section>
+
+<style>
+  /* Starlight styles content tables as display:block with overflow:auto,
+     which would trap the sticky header inside the table. Horizontal
+     scrolling on small screens is handled by the wrapper div instead. */
+  table {
+    display: table;
+    overflow: visible;
+  }
+
+  /* Keep the plan names visible while scrolling through the table.
+     Offset by the site nav height so the row sticks below the fixed header. */
+  th.plan-header {
+    position: sticky;
+    top: var(--sl-nav-height, 0px);
+    z-index: 2;
+  }
+
+  /* Mobile responsive adjustments */
+  @media (max-width: 768px) {
+    th:first-child,
+    td:first-child {
+      position: sticky;
+      left: 0;
+      background-color: white;
+      z-index: 1;
+      box-shadow: 2px 0 5px rgba(0, 0, 0, 0.1);
+    }
+
+    :global([data-theme='dark']) th:first-child,
+    :global([data-theme='dark']) td:first-child {
+      background-color: rgb(17, 24, 39);
+      color: white;
+    }
+
+    tr.section-row td:first-child {
+      background-color: rgb(243, 244, 246);
+    }
+
+    :global([data-theme='dark']) tr.section-row td:first-child {
+      background-color: rgb(3, 7, 18);
+    }
+  }
+
+  tr:not(.section-row):hover {
+    background-color: rgba(0, 0, 0, 0.01);
+  }
+
+  :global([data-theme='dark']) tr:not(.section-row):hover {
+    background-color: rgba(255, 255, 255, 0.03);
+  }
+</style>

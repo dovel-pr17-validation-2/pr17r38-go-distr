@@ -1,0 +1,203 @@
+---
+title: License Keys
+description: Create and manage License Keys to issue signed JWT tokens your application can verify to enforce usage limits, seat counts, and feature access.
+slug: docs/platform/license-keys
+sidebar:
+  label: License Keys
+  order: 5
+---
+
+import {Aside} from '@astrojs/starlight/components';
+import ThemedImage from '~/components/util/ThemedImage.astro';
+import licenseKeyFormDark from '~/assets/docs/platform/licenses/license-keys/license-key-form-dark.png';
+import licenseKeyFormLight from '~/assets/docs/platform/licenses/license-keys/license-key-form-light.png';
+
+This guide walks you through how to use License Keys to issue cryptographically signed tokens that your application can verify at runtime to enforce usage limits, seat counts, feature flags, or any other constraint you define.
+
+<Aside type="note">
+  License Keys are a Pro feature available in Pro, Enterprise, and Pro Trial
+  plans. Learn more about [License
+  Management](/docs/platform/license-management/) and [subscription
+  plans](/docs/subscription-management/).
+</Aside>
+
+## What license keys are for
+
+License Keys are different from [Application Entitlements](/docs/platform/application-entitlements/) and [Artifact Entitlements](/docs/platform/artifact-entitlements/). Entitlements control what a customer can access within Distr. License keys carry arbitrary data (seat counts, plan tier, feature flags) that your _application_ reads and enforces independently of Distr.
+
+When you request a token for a license key, Distr generates a signed JWT. Your application verifies it using the public key you generate and distribute. No call back to Distr is needed at verification time, which means license key validation works in air-gapped and offline environments.
+
+## Creating a license key
+
+1. Navigate to **Licenses** in the sidebar
+2. Click the customer you want to create a license key for
+3. Select the **License Keys** tab and click **"Create License Key"**
+4. Fill in the form:
+   - **Name** (required): must be unique within your organization
+   - **Description** (optional)
+   - **Not Before**: the date from which the token is valid (defaults to today)
+   - **Expires At**: the date the token expires (defaults to one year from today)
+   - **Payload**: a JSON object with your custom claims (see [Payload](#payload) below)
+5. **Save**: the key is created immediately
+
+<ThemedImage
+  lightSrc={licenseKeyFormLight}
+  darkSrc={licenseKeyFormDark}
+  alt="License Key create form showing name, description, Not Before and Expires At date pickers, payload JSON editor, and customer field"
+/>
+
+<Aside type="note">
+  The description can be updated at any time. The name is set at creation and
+  cannot be changed. If you need to change the payload or dates, Distr generates
+  a new revision; the original is not modified. See [Editing a license
+  key](#editing-a-license-key).
+</Aside>
+
+## Payload
+
+The payload is a JSON object containing the custom claims you want to embed in the token. You define what these mean. Distr treats them as opaque data.
+
+Example payloads:
+
+```json
+{"seats": 25, "plan": "pro"}
+```
+
+```json
+{
+  "instances": 3,
+  "modules": ["analytics", "reporting"],
+  "expires_notice_days": 30
+}
+```
+
+The payload must be a JSON object (not an array or primitive). The following field names are reserved and cannot be used: the JWT-standard claims `exp`, `nbf`, `iss`, `sub`, `aud`, `iat`, as well as the Distr-specific claim `org`.
+
+## Getting the token
+
+Once a license key exists, you can retrieve the signed JWT at any time:
+
+**Vendor:** In the customer's detail view, open the actions menu (⋮) of the license key and choose **View license key**. Distr generates the token and displays it, so you can copy it to deliver to your customer.
+
+**Customer:** In the customer portal, navigate to **Licenses** and click the key. The token is available there directly. Customers can copy and use it in their environment.
+
+## Verifying tokens in your application
+
+The token is a standard JWT signed with EdDSA (Ed25519). Use any JWT library that supports EdDSA to verify it.
+
+The token contains:
+
+- `iss`: your Distr host URL
+- `sub`: the license key UUID
+- `aud`: `["license-key"]`
+- `iat`: issued at (when the key was created in Distr)
+- `nbf`: not before
+- `exp`: expiration
+- `org`: the UUID of your Distr organization that issued the license key
+- All fields from your payload as top-level claims
+
+### Retrieving the public key
+
+Your application needs the public key to verify license tokens. Distr exposes it via a public API endpoint that requires no authentication:
+
+```
+GET /api/public/v1/license-keys/public-key
+```
+
+The response is the PEM-encoded Ed25519 public key as plain text. This endpoint is available to anyone, so your application can fetch it at startup or embed it at build time.
+
+Example (curl):
+
+```shell
+curl https://your-distr.example.com/api/public/v1/license-keys/public-key
+```
+
+### Example verification
+
+Node.js with `jose`:
+
+```js
+import {importSPKI, jwtVerify} from 'jose';
+
+const publicKey = await importSPKI(PUBLIC_KEY_PEM, 'EdDSA');
+
+const {payload} = await jwtVerify(token, publicKey, {
+  audience: 'license-key',
+});
+
+console.log(payload.seats); // your custom claim
+```
+
+Your application is responsible for deciding what to do when verification fails or the token is expired.
+
+## Editing a license key
+
+You can update the **description** of an existing license key at any time. The name is set at creation and cannot be changed.
+
+If you need to change the **payload**, **Not Before**, or **Expires At**, Distr generates a new license key with the updated values; the original is not modified. You can view all previously generated license keys in the **Revisions** section of the edit view.
+
+If any active deployments reference this license key, Distr will show you which deployment targets are affected before saving.
+Confirming will save the new revision and automatically trigger a redeployment on those targets.
+
+To edit: in the customer's detail view, click the license key.
+
+## Deleting a license key
+
+<Aside type="caution">
+  Deleting a license key does **not** revoke tokens that have already been
+  issued. A token remains valid until its expiration date regardless of whether
+  the key still exists in Distr. If you need to invalidate a token before it
+  expires, you must implement a revocation check in your application (e.g., a
+  blocklist checked at verification time).
+</Aside>
+
+To delete: open the actions menu (⋮) of the license key, choose **Delete** and confirm.
+
+## Referencing license keys in deployments
+
+When you deploy via Distr controllers (Docker or Kubernetes), license keys assigned to the customer are automatically available as template variables in deployment environment files and Helm values. You don't need to copy or distribute tokens manually. Distr generates and injects them at deploy time.
+
+### Finding the reference syntax
+
+Each license key has a **Reference** column in the license keys list that shows the exact template variable to use: `{{ .LicenseKeys.MY_LICENSE_KEY }}`
+
+Copy this reference directly from the UI and paste it into your deployment configuration.
+
+### Docker (env file)
+
+Reference a license key in the deployment's environment file using Go template syntax:
+
+```dotenv
+LICENSE_TOKEN={{ .LicenseKeys.MY_LICENSE_KEY }}
+```
+
+In the application's Compose file, read the environment variable as usual:
+
+```yaml
+services:
+  app:
+    image: your-app:latest
+    environment:
+      - LICENSE_TOKEN
+```
+
+The token is resolved at deploy time. The application reads `process.env.LICENSE_TOKEN` (or the equivalent in your language) at startup and verifies it.
+
+### Helm (values YAML)
+
+Reference a license key in the deployment's Helm values:
+
+```yaml
+app:
+  licenseToken: {{.LicenseKeys.MY_LICENSE_KEY}}
+```
+
+The resolved token is passed into the chart at deploy time.
+
+### Registry-only deployments
+
+For customers who pull artifacts directly from your Distr registry without using deployment controllers, provide them with the token out-of-band. The customer is responsible for injecting it into their own deployment pipeline, typically as an environment variable, a mounted secret file, or a Kubernetes secret.
+
+## Customer portal view
+
+Customers see their license keys under **Licenses** in the Customer Portal sidebar. For the full customer-side guide, see [Customer Portal Licenses](/docs/platform/customer-portal/licenses/).

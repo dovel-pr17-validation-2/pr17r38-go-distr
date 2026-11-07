@@ -1,0 +1,783 @@
+# Default values for distr.
+# This is a YAML-formatted file.
+# Declare variables to be passed into your templates.
+
+global:
+  security:
+    # -- Allow the legacy Bitnami images the bundled PostgreSQL subchart is pinned to.
+    allowInsecureImages: true
+
+# -- Number of Distr [replicas](https://kubernetes.io/docs/concepts/workloads/controllers/replicaset/).
+# Ignored when `autoscaling.enabled` is true.
+replicaCount: 2
+
+# -- [Deployment strategy](https://kubernetes.io/docs/concepts/workloads/controllers/deployment/#strategy)
+# of Distr. Empty means the Kubernetes default.
+strategy: {}
+  # type: RollingUpdate
+  # rollingUpdate:
+  #   maxSurge: 25%
+  #   maxUnavailable: 25%
+
+image:
+  # -- Distr [image](https://kubernetes.io/docs/concepts/containers/images/) repository. The community
+  # edition is the default; the enterprise edition is `registry.distr.sh/enterprise/distr-ee`.
+  repository: ghcr.io/distr-sh/distr-ce
+  # -- Distr image pull policy.
+  pullPolicy: IfNotPresent
+  # -- Distr image tag.
+  # @default -- the chart appVersion
+  tag: '' # @schema type: [string, number]
+
+# -- [Secrets for pulling the images](https://kubernetes.io/docs/tasks/configure-pod-container/pull-image-private-registry/)
+# from a private repository.
+imagePullSecrets: []
+# -- Overrides the chart name used in resource names and labels.
+nameOverride: ''
+# -- Overrides the full name prefix of all resources created by this chart.
+fullnameOverride: ''
+
+serviceAccount:
+  # -- Create a [service account](https://kubernetes.io/docs/concepts/security/service-accounts/)
+  # for Distr.
+  create: true
+  # -- Automatically mount the service account's API credentials into the Distr pods.
+  automount: true
+  # -- Annotations to add to the service account.
+  annotations: {}
+  # -- Name of the service account to use. Generated from the fullname template when empty and
+  # `serviceAccount.create` is true.
+  name: ''
+
+distr:
+  # -- Environment of the Distr container. This is where Distr itself is configured; see the
+  # [configuration reference](https://distr.sh/docs/self-hosting/configuration/) for every
+  # supported variable, and the commented-out entries in this file for the common ones.
+  # @default -- see the values file
+  env: &defaultDistrEnv
+    - name: DISTR_HOST
+      value: http://distr.local
+    # - name: CONTROLLER_HOST
+    #   value: controller.distr.local
+    - name: REGISTRY_ENABLED
+      value: 'true'
+    # REGISTRY_* variables are only relevant if REGISTRY_ENABLED is true
+    - name: REGISTRY_HOST
+      value: pkg.distr.local
+    - name: REGISTRY_S3_BUCKET
+      value: distr
+    # Set to true only for in-cluster S3-compatible storage (e.g. RustFS/MinIO) that requires bucket creation on startup.
+    # Requires s3:CreateBucket permission. Set to false if the bucket already exists or CreateBucket permission is unavailable.
+    - name: REGISTRY_S3_CREATE_BUCKET
+      value: 'true'
+    - name: REGISTRY_S3_REGION
+      value: local
+    - name: REGISTRY_S3_ENDPOINT
+      value: http://distr-rustfs-svc:9000
+    - name: REGISTRY_S3_ACCESS_KEY_ID
+      value: distr
+    - name: REGISTRY_S3_SECRET_ACCESS_KEY
+      value: distr123
+    - name: REGISTRY_S3_USE_PATH_STYLE
+      value: 'true'
+    - name: REGISTRY_S3_ALLOW_REDIRECT
+      value: 'false'
+    # What a single client IP may pull from public artifacts without credentials, per replica.
+    # A value of 0 disables the limit it stands for.
+    # - name: REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_MINUTE
+    #   value: '10'
+    # - name: REGISTRY_ANONYMOUS_MANIFEST_RATE_LIMIT_PER_HOUR
+    #   value: '30'
+    # - name: REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_MINUTE
+    #   value: '60'
+    # - name: REGISTRY_ANONYMOUS_BLOB_RATE_LIMIT_PER_HOUR
+    #   value: '300'
+    # Set of variables required to use GCP as a S3 compatible backend
+    # - name: REGISTRY_S3_REQUEST_CHECKSUM_CALCULATION
+    #   value: 'true'
+    # - name: REGISTRY_S3_RESPONSE_CHECKSUM_VALIDATION
+    #   value: 'true'
+    # - name: REGISTRY_RESIGN_FOR_GCP
+    #   value: 'true'
+    # The base64 encoded JWT secret
+    # Can be generated with `openssl rand -base64 32`
+    - name: JWT_SECRET
+      value: WQrGMYx4tZdGwKlt0RTrhMzfQ+j1wr6z7oRWfmGlETk=
+      # We recommend reading the JWT secret from a secretKeyRef
+      # valueFrom:
+      #   secretKeyRef:
+      #     name: ""
+      #     key: ""
+    # The base64 encoded key that sensitive database columns are encrypted with.
+    # Can be generated with `openssl rand -base64 32`. Losing it makes every encrypted value
+    # unreadable, so back it up separately from the database.
+    # Rotating it takes two rollouts with more than one replica, see
+    # https://distr.sh/docs/self-hosting/security/#rotating-the-key
+    - name: DATABASE_ENCRYPTION_KEY
+      value: 8fVQ3nZ5kL0xR7cWtYbA1sJmEuHpDgNiO2vXqTzKcRo=
+      # We recommend reading the encryption key from a secretKeyRef
+      # valueFrom:
+      #   secretKeyRef:
+      #     name: ""
+      #     key: ""
+    # Both secrets above, and LICENSE_KEY_PRIVATE_KEY, can instead hold a "kms:<base64 ciphertext>"
+    # value that is unwrapped with AWS KMS or GCP Cloud KMS during startup, so that no key material
+    # is stored in the cluster. See
+    # https://distr.sh/docs/self-hosting/security/
+    # Name the key of exactly one service, which is also what selects it:
+    # - name: KMS_AWS_KEY_ID
+    #   value: 'arn:aws:kms:eu-central-1:123456789012:key/00000000-0000-0000-0000-000000000000'
+    # - name: KMS_GCP_KEY_NAME
+    #   value: 'projects/my-project/locations/europe-west3/keyRings/distr/cryptoKeys/distr-master'
+    - name: MAILER_FROM_ADDRESS
+      value: My Distr <noreply@distr.local>
+    - name: MAILER_TYPE
+      # change to "ses" for direct usage of the AWS SDK for SES
+      value: 'smtp'
+    - name: MAILER_SMTP_HOST
+      value: 'smtp.example.local'
+    - name: MAILER_SMTP_PORT
+      value: '25'
+    # - name: MAILER_SMTP_USERNAME
+    #   value: ""
+    # - name: MAILER_SMTP_PASSWORD
+    #  valueFrom:
+    #    secretKeyRef:
+    #      name: ""
+    #      key: ""
+    # Set MAILER_SMTP_IMPLICIT_TLS to "true", if you want to use SMTP over implicit TLS, rather than STARTTLS.
+    # Generally, implicit TLS is required if your SMTP port is 465.
+    # - name: MAILER_SMTP_IMPLICIT_TLS
+    #   value: 'true'
+    # User Registration Mode, one of "enabled" (default), "hidden", "disabled"
+    # - name: REGISTRATION
+    #   value: enabled
+    # Protect registrations with a Cloudflare Turnstile widget. Both variables must be set to enable it.
+    # - name: TURNSTILE_SITE_KEY
+    #   value: ''
+    # - name: TURNSTILE_SECRET
+    #   value: ''
+    # Address the frontend links to where it mentions support. Without it support is not a link.
+    # - name: SUPPORT_EMAIL
+    #   value: 'support@example.local'
+    - name: USER_EMAIL_VERIFICATION_REQUIRED
+      value: 'false'
+    - name: METRICS_ENTRIES_MAX_AGE
+      value: '1h'
+    # Loki stores deployment and deployment target log records (see the "loki" section below).
+    - name: LOKI_URL
+      value: http://distr-loki:3100
+    # - name: LOKI_BEARER_TOKEN
+    #   value: '...'
+    # - name: LOKI_BASIC_AUTH_USERNAME
+    #   value: '...'
+    # - name: LOKI_BASIC_AUTH_PASSWORD
+    #   value: '...'
+    # - name: LOKI_REQUEST_TIMEOUT
+    #   value: '30s'
+    # - name: CLEANUP_ARTIFACT_BLOB_MIN_AGE
+    #   value: '24h'
+    # - name: CLEANUP_ORGANIZATION_MIN_AGE
+    #   value: '720h'  # 30 days (default)
+    # - name: CLEANUP_USER_ACCOUNT_MIN_AGE
+    #   value: '720h'  # 30 days (default)
+    # - name: CLEANUP_FILE_MIN_AGE
+    #   value: '24h'
+    # OIDC providers, see https://distr.sh/docs/self-hosting/configuration/#oidc-authentication
+    # - name: OIDC_GITHUB_ENABLED
+    #   value: 'true'
+    # - name: OIDC_GITHUB_CLIENT_ID # required if OIDC_GITHUB_ENABLED
+    #   value:
+    # - name: OIDC_GITHUB_CLIENT_SECRET # required if OIDC_GITHUB_ENABLED
+    #   value:
+    # - name: OIDC_GOOGLE_ENABLED
+    #   value: 'true'
+    # - name: OIDC_GOOGLE_CLIENT_ID # required if OIDC_GOOGLE_ENABLED
+    #   value:
+    # - name: OIDC_GOOGLE_CLIENT_SECRET # required if OIDC_GOOGLE_ENABLED
+    #   value:
+    # - name: OIDC_MICROSOFT_ENABLED
+    #   value: 'true'
+    # - name: OIDC_MICROSOFT_CLIENT_ID # required if OIDC_MICROSOFT_ENABLED
+    #   value:
+    # - name: OIDC_MICROSOFT_CLIENT_SECRET # required if OIDC_MICROSOFT_ENABLED
+    #   value:
+    # - name: OIDC_MICROSOFT_TENANT_ID # required if OIDC_MICROSOFT_ENABLED
+    #   value:
+    # - name: OIDC_GENERIC_ENABLED
+    #   value: 'true'
+    # - name: OIDC_GENERIC_ISSUER
+    #   value: 'http://distr-oidc-dex:5556/dex'
+    # - name: OIDC_GENERIC_CLIENT_ID
+    #   value: 'example-app'
+    # - name: OIDC_GENERIC_CLIENT_SECRET
+    #   value: 'example-app-secret'
+    # - name: OIDC_GENERIC_SCOPES
+    #   value: 'foo,bar,baz'
+    - name: METRICS_ENABLED
+      value: 'true'
+    # - name: METRICS_ADDR
+    #   value: '...'
+    # - name: METRICS_BEARER_TOKEN
+    #   value: '...'
+    # Self-service custom domains, terminated by the Caddy deployment in the "caddy" section
+    # below. CUSTOM_DOMAIN_TARGET is the DNS name customers point every custom domain's CNAME
+    # record at, registry domains included; it must resolve to that Caddy's LoadBalancer and is
+    # what enables the feature in the UI. The chart derives INTERNAL_SERVER_ADDR from
+    # caddy.askServerPort itself.
+    # - name: CUSTOM_DOMAIN_TARGET
+    #   value: whitelabel.example.com
+    # Once a target is set, a registered domain is only used for links, mails, controller manifests and
+    # registry URLs while the custom-domain-verification CronJob below finds its CNAME record
+    # pointing at that target, so removing that job leaves every domain unverified. A verified domain
+    # is left alone for 12h before it is checked again; failing ones are checked on every run.
+    # - name: CUSTOM_DOMAIN_VERIFICATION_REFRESH_AFTER
+    #   value: 12h
+  # -- Sources to populate the Distr environment from, e.g. a ConfigMap or Secret reference.
+  envFrom: &defaultDistrEnvFrom []
+  scratch: &defaultDistrScratch
+    # -- Let the OCI registry buffer request bodies in temporary files instead of holding them in
+    # memory. This provisions a generic ephemeral volume (a per-pod PVC created and deleted together
+    # with the pod) and points REGISTRY_SCRATCH_DIR at its mount path. Requires Kubernetes >= 1.23.
+    enabled: false
+    # -- Mount path of the scratch volume, passed to Distr as REGISTRY_SCRATCH_DIR.
+    mountPath: /scratch
+    # -- Size requested for the ephemeral scratch volume.
+    size: 10Gi
+    # -- Storage class of the scratch volume. Empty means the cluster default.
+    storageClassName: ''
+    # -- Access modes of the scratch volume. It is mounted by exactly one pod, so ReadWriteOnce is
+    # sufficient.
+    accessModes:
+      - ReadWriteOnce
+  # Aliases of the three defaults above, which let the chart tell a value you wrote from the
+  # untouched default: Helm merges the chart's own values into a release's before rendering, so the
+  # templates have nothing else to compare against. They decide where the deprecated `hub` key below
+  # is still read, and are not settings.
+  # @ignore
+  defaults: # @schema hidden
+    env: *defaultDistrEnv
+    envFrom: *defaultDistrEnvFrom
+    scratch: *defaultDistrScratch
+
+# -- Deprecated name of the `distr` section above, so that values files written for chart versions
+# before the rename keep working. `env`, `envFrom` and `scratch` are read from here only while
+# `distr` still holds the chart default for that key, so anything you move to `distr` takes effect
+# immediately. Drop a setting here rather than emptying its counterpart: a value that equals the
+# chart default, `envFrom: []` for instance, cannot be told apart from the default.
+hub: {} # @schema deprecated
+
+# -- [Annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+# to add to the Distr Deployment, e.g. for controllers that restart it when a referenced Secret changes.
+deploymentAnnotations: {}
+# -- [Annotations](https://kubernetes.io/docs/concepts/overview/working-with-objects/annotations/)
+# to add to the Distr pods.
+podAnnotations: {}
+# -- [Labels](https://kubernetes.io/docs/concepts/overview/working-with-objects/labels/) to add to
+# the Distr pods.
+podLabels: {}
+
+# -- Pod-level security context of the Distr pods. The Distr image runs as UID/GID 65532.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  fsGroup: 65532
+
+# -- Container-level security context of the Distr container.
+securityContext: {}
+  # capabilities:
+  #   drop:
+  #   - ALL
+  # readOnlyRootFilesystem: true
+  # runAsNonRoot: true
+  # runAsUser: 1000
+
+service:
+  # -- [Type](https://kubernetes.io/docs/concepts/services-networking/service/#publishing-services-service-types)
+  # of the Distr Service.
+  type: ClusterIP
+  # -- Port of the app and API server.
+  port: 8080
+  # -- Port of the OCI registry server.
+  artifactsPort: 8585
+  # -- Port of the Prometheus metrics server.
+  metricsPort: 3000
+
+serviceMonitor:
+  # -- Create a Prometheus Operator
+  # [ServiceMonitor](https://prometheus-operator.dev/docs/api-reference/api/#monitoring.coreos.com/v1.ServiceMonitor)
+  # that scrapes the metrics port of the Distr Service. Requires the ServiceMonitor CRD and
+  # `METRICS_ENABLED` in `distr.env`, which the chart sets by default.
+  enabled: false
+  # -- Additional labels of the ServiceMonitor, e.g. the label your Prometheus selects
+  # ServiceMonitors by.
+  labels: {}
+  # -- Scrape interval. Empty means the interval configured in Prometheus.
+  interval: ''
+  # -- Scrape timeout. Empty means the timeout configured in Prometheus.
+  scrapeTimeout: ''
+  # -- Key of a Secret in the release namespace holding `METRICS_BEARER_TOKEN`, required when it is
+  # set, e.g. `{name: distr-metrics, key: token}`.
+  bearerTokenSecret: {}
+
+ingress:
+  # -- Create an [Ingress](https://kubernetes.io/docs/concepts/services-networking/ingress/) for the
+  # Distr Service.
+  enabled: false
+  # -- Ingress class name, e.g. `nginx`.
+  className: ''
+  # -- Annotations of the Ingress. Registry pushes have no size limit, so raise or disable the body
+  # size limit of your Ingress controller on the registry host. Traefik applies none, while
+  # ingress-nginx rejects anything above 1 MB unless `nginx.ingress.kubernetes.io/proxy-body-size`
+  # says otherwise.
+  annotations: {}
+    # kubernetes.io/ingress.class: nginx
+    # kubernetes.io/tls-acme: "true"
+    # nginx.ingress.kubernetes.io/proxy-body-size: "0"
+  # -- Hosts served by the Ingress. The app and the registry are served on separate hosts, routed to
+  # the `http` and `artifacts` ports of the Distr Service.
+  # @default -- see the values file
+  hosts:
+    - host: distr.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+          port:
+            name: http
+    - host: pkg.distr.local
+      paths:
+        - path: /
+          pathType: ImplementationSpecific
+          port:
+            name: artifacts
+  # -- TLS configuration of the Ingress.
+  tls: []
+  #  - secretName: chart-example-tls
+  #    hosts:
+  #      - chart-example.local
+
+# -- Resource requests and limits of the Distr container. Left empty deliberately so the chart also
+# runs on clusters with few resources, such as Minikube. Uncomment and adjust the lines below to
+# specify resources.
+resources: {}
+  # limits:
+  #   cpu: 1000m
+  #   memory: 2Gi
+  # requests:
+  #   cpu: 100m
+  #   memory: 256Mi
+
+# -- [Startup probe](https://kubernetes.io/docs/tasks/configure-pod-container/configure-liveness-readiness-startup-probes/)
+# of the Distr container. It allows up to 5 minutes (failureThreshold * periodSeconds) for Distr to
+# come up before the liveness and readiness probes take over.
+startupProbe:
+  httpGet:
+    path: /
+    port: http # @schema type: [string, integer]
+  periodSeconds: 10
+  failureThreshold: 30
+# -- Liveness probe of the Distr container.
+livenessProbe:
+  httpGet:
+    path: /
+    port: http # @schema type: [string, integer]
+# -- Readiness probe of the Distr container.
+readinessProbe:
+  httpGet:
+    path: /
+    port: http # @schema type: [string, integer]
+
+# -- Seconds the Distr pod is given to terminate gracefully after receiving a shutdown signal.
+terminationGracePeriodSeconds: 60
+
+autoscaling:
+  # -- Create a [HorizontalPodAutoscaler](https://kubernetes.io/docs/concepts/workloads/autoscaling/)
+  # for Distr, which takes precedence over `replicaCount`.
+  enabled: false
+  # -- Lower bound of the autoscaler.
+  minReplicas: 2
+  # -- Upper bound of the autoscaler.
+  maxReplicas: 10
+  # -- Target average CPU utilization the autoscaler scales for.
+  targetCPUUtilizationPercentage: 100
+  # targetMemoryUtilizationPercentage: 80
+
+podDisruptionBudget:
+  # -- Keep voluntary disruptions (node drains, cluster upgrades) from taking down all Distr replicas
+  # at once. Only the Distr pods are covered; the cronjob pods run to completion and are not part of
+  # the budget.
+  enabled: true
+  # -- Distr replicas that may be unavailable during a voluntary disruption. Mutually exclusive with
+  # `minAvailable`, which is why this one is set by default: a minAvailable budget would block node
+  # drains indefinitely when replicaCount is 1.
+  maxUnavailable: 1 # @schema type: [integer, string]
+  # -- Distr replicas that must stay available during a voluntary disruption. Mutually exclusive with
+  # `maxUnavailable`.
+  minAvailable: '' # @schema type: [string, integer]
+
+# -- Additional volumes of the Distr pods.
+volumes: []
+# - name: foo
+#   secret:
+#     secretName: mysecret
+#     optional: false
+
+# -- Additional volume mounts of the Distr container.
+volumeMounts: []
+# - name: foo
+#   mountPath: "/etc/foo"
+#   readOnly: true
+
+# -- Node selector of the Distr pods.
+nodeSelector: {}
+
+# -- Tolerations of the Distr pods.
+tolerations: []
+
+# -- Affinity of the Distr pods.
+affinity: {}
+
+# @default -- see the values file
+# -- Default resources for all cron job containers. Individual jobs can override this with `cronJobs[].resources`.
+cronJobResources: {}
+  # limits:
+  #   memory: 512Mi
+  # requests:
+  #   cpu: 100m
+  #   memory: 64Mi
+
+# -- Maintenance CronJobs run against the database, each executing the Distr image with `args`. Removing
+# an entry disables that job; the commented-out `organization-cleanup` job deletes organizations that
+# have been marked for deletion and `user-account-cleanup` deletes user accounts that belong to no
+# organization.
+cronJobs:
+  - name: deployment-target-metrics-cleanup
+    labels:
+      distr.sh/job: deployment-target-metrics-cleanup
+    args: [cleanup, DeploymentTargetMetrics, --timeout, 10m]
+  - name: oidcstate-cleanup
+    labels:
+      distr.sh/job: oidcstate-cleanup
+    args: [cleanup, OIDCState, --timeout, 10m]
+  - name: artifact-blob-cleanup
+    labels:
+      distr.sh/job: artifact-blob-cleanup
+    args: [cleanup, ArtifactBlob, --timeout, 10m]
+  - name: file-cleanup
+    labels:
+      distr.sh/job: file-cleanup
+    args: [cleanup, File, --timeout, 10m]
+  # - name: organization-cleanup
+  #   labels:
+  #     distr.sh/job: organization-cleanup
+  #   args: [cleanup, Organization, --timeout, 10m]
+  # - name: user-account-cleanup
+  #   labels:
+  #     distr.sh/job: user-account-cleanup
+  #   args: [cleanup, UserAccount, --timeout, 10m]
+  # Keeps the state that decides whether a custom domain is used for links, mails, controller manifests
+  # and registry URLs. It is a no-op while no CNAME target is configured, and runs more often than
+  # the hourly default so that a domain whose record was just fixed starts being used again quickly.
+  - name: custom-domain-verification
+    labels:
+      distr.sh/job: custom-domain-verification
+    schedule: '*/15 * * * *'
+    args: [maintenance, verify-custom-domains, --timeout, 10m]
+  - name: registry-upstream-sync
+    labels:
+      distr.sh/job: registry-upstream-sync
+    args: [maintenance, sync-artifacts-upstream, --timeout, 10m]
+
+# Plain Caddy deployment for automated custom domain configuration: vendors bring their
+# own domain via a CNAME record pointing at this Caddy's LoadBalancer. Caddy issues
+# certificates on demand (on the first TLS handshake), authorized per domain by Distr's
+# internal caddy-ask endpoint, and routes /v2/* to the registry and everything else to the
+# app. Disabled by default.
+caddy:
+  # -- Deploy the Caddy reverse proxy that terminates TLS for customer-configured custom domains.
+  # The CNAME target customers point their domains at is configured as CUSTOM_DOMAIN_TARGET in
+  # `distr.env`, which is also what makes the feature available in the UI.
+  enabled: false
+  # -- Number of Caddy replicas. Anything above 1 requires certificate storage that all replicas
+  # share, either a `ReadWriteMany` volume (see `caddy.persistence.accessModes`) or a `caddy.storage`
+  # module: Caddy instances coordinate certificate issuance and solve each other's ACME challenges
+  # only when they use the same storage, and the load balancer routes a challenge to an arbitrary
+  # replica. The chart refuses to render otherwise.
+  replicaCount: 1
+  image:
+    # -- Caddy image repository. Only change this for a custom build, e.g. one that includes a
+    # storage module for `caddy.storage`.
+    repository: caddy
+    # -- Caddy image tag.
+    tag: 2.11.7-alpine # @schema type: [string, number]
+    # -- Caddy image pull policy.
+    pullPolicy: IfNotPresent
+  # -- E-mail address used for the ACME account.
+  acmeEmail: ''
+  # -- ACME directory URL. Leave empty for Caddy's defaults (Let's Encrypt / ZeroSSL). Point it at
+  # `https://acme-staging-v02.api.letsencrypt.org/directory` while testing a new setup.
+  acmeCA: ''
+  # -- Certificate issuer for custom domains: `acme` (public certificates) or `internal` (Caddy's
+  # own CA, for local testing or environments with a private trust store).
+  issuer: acme
+  # -- Advanced: a Caddyfile global `storage` directive, as an alternative to the volume for
+  # clusters without a `ReadWriteMany` storage class. Requires a Caddy image built with the
+  # corresponding storage module, because Caddy has no runtime plugins. Set
+  # `caddy.persistence.enabled` to false when the module keeps the certificates.
+  storage: ''
+  # storage: |
+  #   storage redis {
+  #     host distr-redis-master
+  #   }
+  podDisruptionBudget:
+    # -- Keep voluntary disruptions (node drains, cluster upgrades) from taking down all replicas at
+    # once, which would make every custom domain unreachable.
+    enabled: true
+    # -- Replicas that may be unavailable during a voluntary disruption. Mutually exclusive with
+    # `minAvailable`, which is why this one is set by default: a minAvailable budget would block node
+    # drains indefinitely when replicaCount is 1.
+    maxUnavailable: 1 # @schema type: [integer, string]
+    # -- Replicas that must stay available during a voluntary disruption. Mutually exclusive with
+    # `maxUnavailable`.
+    minAvailable: '' # @schema type: [string, integer]
+  persistence:
+    # -- Keep the certificates on a volume. It is kept when the release is uninstalled, so that a
+    # reinstall does not reissue a certificate for every custom domain. Disable this only when
+    # `caddy.storage` stores the certificates elsewhere.
+    enabled: true
+    # -- Use an existing PersistentVolumeClaim instead of the one created by the chart, for example
+    # a preprovisioned NFS or EFS claim.
+    existingClaim: ''
+    # -- Size of the certificate storage volume.
+    size: 1Gi
+    # -- Storage class of the certificate storage volume. Empty means the cluster default.
+    storageClassName: ''
+    # -- Access modes of the certificate storage volume. All replicas mount the same volume, so
+    # `caddy.replicaCount` above 1 needs ReadWriteMany and a storage class that provides it.
+    accessModes:
+      - ReadWriteOnce
+  service:
+    # -- Type of the public Caddy Service. It must be reachable under the CNAME targets configured
+    # in `distr.env`.
+    type: LoadBalancer
+    # -- Annotations of the public Caddy Service. The chart stays generic: set cloud-specific
+    # annotations here. The commented-out ones provision an AWS Network Load Balancer. The Service
+    # serves HTTP/3 on UDP 443 next to TCP 443, which an AWS NLB only does as a `TCP_UDP` listener,
+    # enabled by the last annotation together with AWS Load Balancer Controller v2.13.0 or later and
+    # its `EnableTCPUDPListener` feature gate.
+    annotations: {}
+      # service.beta.kubernetes.io/aws-load-balancer-type: external
+      # service.beta.kubernetes.io/aws-load-balancer-nlb-target-type: ip
+      # service.beta.kubernetes.io/aws-load-balancer-scheme: internet-facing
+      # service.beta.kubernetes.io/aws-load-balancer-enable-tcp-udp-listener: 'true'
+  # -- Port Caddy reaches Distr's on-demand TLS ask endpoint on. It is passed to Distr as
+  # INTERNAL_SERVER_ADDR, the address of its internal server, and must never be exposed publicly.
+  askServerPort: 8085
+  # -- Resource requests and limits of the Caddy container. Left empty deliberately so the chart also
+  # runs on clusters with few resources, such as Minikube. Uncomment and adjust the lines below to
+  # specify resources. Keep in mind that Caddy terminates TLS for all custom domain traffic,
+  # including registry pushes, which it streams to Distr without buffering or a size limit.
+  resources: {}
+    # limits:
+    #   cpu: 1000m
+    #   memory: 256Mi
+    # requests:
+    #   cpu: 50m
+    #   memory: 64Mi
+
+postgresql:
+  # -- Deploy the bundled PostgreSQL subchart. When disabled, configure `externalDatabase` instead.
+  enabled: false
+  auth:
+    # -- Database user created by the bundled PostgreSQL.
+    username: distr
+    # -- Password of that user. Generated randomly when empty, which breaks on upgrades, so set it
+    # or use `postgresql.auth.existingSecret`.
+    password: ''
+    # -- Database created by the bundled PostgreSQL.
+    database: distr
+    # -- Existing secret holding the database password, instead of `postgresql.auth.password`.
+    existingSecret: ''
+  # -- PostgreSQL architecture, `standalone` or `replication`.
+  architecture: standalone
+  service:
+    ports:
+      # -- Port the bundled PostgreSQL listens on.
+      postgresql: 5432
+  image:
+    # -- PostgreSQL image repository.
+    repository: bitnamilegacy/postgresql
+    # -- PostgreSQL image tag.
+    tag: 17.6.0 # @schema type: [string, number]
+
+rustfs:
+  # -- Deploy the bundled RustFS object storage, used by the OCI registry and by Loki. When disabled,
+  # provide external object storage for both (see `loki.loki.storage.s3`), otherwise they cannot
+  # persist data.
+  enabled: false
+  # -- Name of the RustFS resources. The default is referenced by the registry and Loki endpoints.
+  fullnameOverride: distr-rustfs
+  secret:
+    rustfs:
+      # -- Object storage access key. This is the source of truth: changing it requires keeping
+      # `loki.loki.storage.s3` and the create-loki-bucket init container in sync, otherwise Loki
+      # cannot access its bucket.
+      access_key: 'distr'
+      # -- Object storage secret key. Change this for any real deployment, and keep it in sync as
+      # described above.
+      secret_key: 'distr123'
+  mode:
+    standalone:
+      # -- Run RustFS as a single instance.
+      enabled: true
+      strategy:
+        # -- Deployment strategy of the standalone instance. Recreate, because the data volume is
+        # ReadWriteOnce.
+        type: Recreate
+    distributed:
+      # -- Run RustFS as a distributed cluster instead.
+      enabled: false
+  storageclass:
+    # -- Storage class of the RustFS volumes. Empty means the cluster default.
+    name: ''
+    # -- Size of the RustFS data volume.
+    dataStorageSize: 20Gi
+    # -- Size of the RustFS log volume.
+    logStorageSize: 10Gi
+  ingress:
+    # -- Expose RustFS through an Ingress. Not needed by Distr, which reaches it in-cluster.
+    enabled: false
+
+# Loki stores deployment and deployment target log records (default retention: 30 days).
+# It runs in monolithic mode with a single replica and persists chunks + TSDB index in
+# an S3-compatible object storage bucket (by default the in-cluster rustfs, using a
+# dedicated "loki" bucket that is provisioned by an init container).
+# Set loki.enabled to false to use an externally managed Loki instance instead and point
+# LOKI_URL (and the optional LOKI_* auth variables) in distr.env at it.
+loki:
+  # -- Deploy the bundled Loki subchart. When disabled, point `LOKI_URL` in `distr.env` at an
+  # externally managed Loki instance.
+  enabled: true
+  # -- Name of the Loki resources. The default is referenced by `LOKI_URL` in `distr.env`.
+  fullnameOverride: distr-loki
+  # -- Loki deployment mode. Monolithic is sufficient for the log volume Distr produces.
+  deploymentMode: Monolithic
+  # -- Loki's own configuration: object storage, schema, retention (`limits_config.retention_period`,
+  # 30 days by default) and ingestion limits. See the values file for the individual settings and why
+  # they deviate from Loki's defaults.
+  # @default -- see the values file
+  loki:
+    auth_enabled: true
+    commonConfig:
+      replication_factor: 1
+    schemaConfig:
+      configs:
+        - from: '2024-01-01'
+          store: tsdb
+          object_store: s3
+          schema: v13
+          index:
+            prefix: index_
+            period: 24h
+    # Loki is enabled by default but rustfs.enabled is false by default, so the s3
+    # settings below point at the in-cluster RustFS endpoint without it being deployed.
+    # To persist logs you must either set rustfs.enabled=true or update these s3 settings
+    # (and the create-loki-bucket initContainer below) to point at external object storage.
+    storage:
+      type: s3
+      bucketNames:
+        chunks: loki
+        ruler: loki
+        admin: loki
+      s3:
+        # Setting the endpoint and the credentials to null is how Loki is pointed at a bucket it
+        # reaches through the credentials of its service account, see examples/enterprise-aws.
+        endpoint: http://distr-rustfs-svc:9000 # @schema nullable
+        region: local
+        # Must match rustfs.secret.rustfs and the create-loki-bucket init container below, and
+        # please change the secret key for any real deployment.
+        accessKeyId: distr # @schema nullable
+        secretAccessKey: distr123 # @schema nullable
+        s3ForcePathStyle: true
+    compactor:
+      retention_enabled: true
+      delete_request_store: s3
+    server:
+      # A single query result page (max_entries_limit_per_query entries) can exceed
+      # the 4 MB gRPC default, which makes the internal querier->frontend handoff
+      # fail and the query hang until it times out.
+      grpc_server_max_recv_msg_size: 67108864
+      grpc_server_max_send_msg_size: 67108864
+    limits_config:
+      retention_period: 720h # 30 days
+      increment_duplicate_timestamp: true
+      allow_structured_metadata: true
+      max_global_streams_per_user: 25000
+      # Truncate oversized log lines instead of rejecting the whole push.
+      max_line_size_truncate: true
+      # Accept backfilled logs up to the retention period so a controller that was
+      # offline can still push its backlog.
+      reject_old_samples_max_age: 720h
+      # Raised moderately from Loki's 4/6 MB defaults to give an organization with
+      # several chatty controllers more headroom before pushes are throttled.
+      ingestion_rate_mb: 16
+      ingestion_burst_size_mb: 32
+  # -- Loki's monolithic instance: replica count, volume size and the init container that provisions
+  # the `loki` bucket in the object storage. Keep its credentials in sync with
+  # `rustfs.secret.rustfs` when you change them.
+  # @default -- see the values file
+  singleBinary:
+    replicas: 1
+    persistence:
+      size: 5Gi
+    initContainers:
+      - name: create-loki-bucket
+        image: rclone/rclone:1.75.2
+        command: [rclone, mkdir, 'storage:loki']
+        env:
+          - name: RCLONE_CONFIG_STORAGE_TYPE
+            value: s3
+          - name: RCLONE_CONFIG_STORAGE_PROVIDER
+            value: Other
+          - name: RCLONE_CONFIG_STORAGE_ENDPOINT
+            value: http://distr-rustfs-svc:9000
+          # Must match rustfs.secret.rustfs and loki.loki.storage.s3 above.
+          - name: RCLONE_CONFIG_STORAGE_ACCESS_KEY_ID
+            value: distr
+          - name: RCLONE_CONFIG_STORAGE_SECRET_ACCESS_KEY
+            value: distr123
+  gateway:
+    # -- Deploy Loki's nginx gateway. Not needed: Distr talks to Loki directly.
+    enabled: false
+  lokiCanary:
+    # -- Deploy the Loki canary, which continuously probes log delivery.
+    enabled: false
+  test:
+    # -- Deploy the Loki chart's test resources.
+    enabled: false
+  chunksCache:
+    # -- Deploy the memcached chunks cache.
+    enabled: false
+  resultsCache:
+    # -- Deploy the memcached query results cache.
+    enabled: false
+  memcached:
+    # -- Deploy the shared memcached instance of the Loki chart.
+    enabled: false
+  backend:
+    # -- Backend replicas of Loki's scalable mode, unused in monolithic mode.
+    replicas: 0
+  read:
+    # -- Read replicas of Loki's scalable mode, unused in monolithic mode.
+    replicas: 0
+  write:
+    # -- Write replicas of Loki's scalable mode, unused in monolithic mode.
+    replicas: 0
+
+externalDatabase:
+  # -- Connection URI of an external PostgreSQL, used when `postgresql.enabled` is false.
+  uri: ''
+  # -- Existing secret holding the connection URI, instead of `externalDatabase.uri`.
+  existingSecret: ''
+  # -- Key of the connection URI inside `externalDatabase.existingSecret`.
+  existingSecretUriKey: 'uri'

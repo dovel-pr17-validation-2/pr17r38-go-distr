@@ -1,0 +1,641 @@
+import {inject} from '@angular/core';
+import {CanActivateFn, Router, Routes} from '@angular/router';
+import {CustomerOrganizationFeature, UserRole} from '@distr-sh/distr-sdk';
+import {firstValueFrom, switchMap} from 'rxjs';
+import {getRemoteEnvironment} from '../env/remote';
+import {AccessTokenDetailComponent} from './access-tokens/access-token-detail.component';
+import {AccessTokensComponent} from './access-tokens/access-tokens.component';
+import {AdvisoryDetailComponent} from './advisories/advisory-detail.component';
+import {AdvisoryListComponent} from './advisories/advisory-list.component';
+import {AlertConfigurationsPageComponent} from './alert-configurations/alert-configurations-page.component';
+import {CustomerAlertConfigurationsPageComponent} from './alert-configurations/customer-alert-configurations-page.component';
+import {ApplicationDetailComponent} from './applications/application-detail.component';
+import {ApplicationsPageComponent} from './applications/applications-page.component';
+import {ArtifactPullsComponent} from './artifacts/artifact-pulls/artifact-pulls.component';
+import {ArtifactVersionsComponent} from './artifacts/artifact-versions/artifact-versions.component';
+import {ArtifactsComponent} from './artifacts/artifacts/artifacts.component';
+import {BillingComponent} from './billing/billing.component';
+import {BillingSettingsComponent} from './billing/settings/billing-settings.component';
+import {CustomerOrganizationsComponent} from './components/customer-organizations/customer-organizations.component';
+import {DashboardComponent} from './components/dashboard/dashboard.component';
+import {PartnerOrganizationsComponent} from './components/partner-organizations/partner-organizations.component';
+import {CustomerUsersComponent} from './components/users/customers/customer-users.component';
+import {PartnerUsersComponent} from './components/users/partners/partner-users.component';
+import {VendorUsersComponent} from './components/users/vendors/vendor-users.component';
+import {CustomerSettingsComponent} from './customer-settings/customer-settings.component';
+import {DeploymentTargetDetailComponent} from './deployments/deployment-target-details/deployment-target-detail.component';
+import {DeploymentTargetsComponent} from './deployments/deployment-targets.component';
+import {CustomerHomePageComponent} from './home/customer/customer-home-page.component';
+import {CustomerLicenseDetailPageComponent} from './licenses/customer-license-detail-page.component';
+import {LicensesOverviewComponent} from './licenses/licenses-overview.component';
+import {VendorLicenseDetailPageComponent} from './licenses/vendor-license-detail-page.component';
+import {CustomerUpdateNotificationsPageComponent} from './notification-configurations/customer-update-notifications-page.component';
+import {UpdateNotificationsPageComponent} from './notification-configurations/update-notifications-page.component';
+import {CustomerNotificationRecordsPageComponent} from './notification-records/customer-notification-records-page.component';
+import {NotificationRecordsPageComponent} from './notification-records/notification-records-page.component';
+import {OrganizationBrandingComponent} from './organization-branding/organization-branding.component';
+import {CustomEmailComponent} from './organization-settings/custom-email.component';
+import {CustomOidcComponent} from './organization-settings/custom-oidc.component';
+import {GeneralSettingsComponent} from './organization-settings/general-settings.component';
+import {OrganizationSettingsComponent} from './organization-settings/organization-settings.component';
+import {CustomerSecretsPageComponent} from './secrets/customer-secrets-page.component';
+import {SecretsPage} from './secrets/secrets-page.component';
+import {AuthService} from './services/auth.service';
+import {ContextService} from './services/context.service';
+import {FeatureFlagService} from './services/feature-flag.service';
+import {OrganizationService} from './services/organization.service';
+import {ToastService} from './services/toast.service';
+import {SidebarLinksPageComponent} from './sidebar-links/sidebar-links-page.component';
+import {SubscriptionCallbackComponent} from './subscription/subscription-callback.component';
+import {SubscriptionComponent} from './subscription/subscription.component';
+import {SupportBundleDetailComponent} from './support-bundles/detail/support-bundle-detail.component';
+import {SupportBundleListComponent} from './support-bundles/list/support-bundle-list.component';
+import {SupportBundleSettingsComponent} from './support-bundles/vendor/support-bundle-settings.component';
+import {BrandingTutorialComponent} from './tutorials/branding/branding-tutorial.component';
+import {ControllersTutorialComponent} from './tutorials/controllers/controllers-tutorial.component';
+import {RegistryTutorialComponent} from './tutorials/registry/registry-tutorial.component';
+import {TutorialsComponent} from './tutorials/tutorials.component';
+import {UsersTutorialComponent} from './tutorials/users/users-tutorial.component';
+import {isSubscriptionExpired} from './types/organization';
+import {UserGeneralSettingsComponent} from './user-settings/user-general-settings.component';
+import {UserIdentitiesComponent} from './user-settings/user-identities.component';
+import {UserSecuritySettingsComponent} from './user-settings/user-security-settings.component';
+import {UserSettingsComponent} from './user-settings/user-settings.component';
+
+function requiredRoleGuard(...userRole: UserRole[]): CanActivateFn {
+  return () => {
+    const auth = inject(AuthService);
+    if (auth.isSuperAdmin() || auth.hasAnyRole(...userRole)) {
+      return true;
+    }
+    return inject(Router).createUrlTree(['/']);
+  };
+}
+
+const requireVendor: CanActivateFn = () => {
+  if (inject(AuthService).isVendor()) {
+    return true;
+  }
+  return inject(Router).createUrlTree(['/']);
+};
+
+const requireCustomer: CanActivateFn = () => {
+  if (inject(AuthService).isCustomer()) {
+    return true;
+  }
+  return inject(Router).createUrlTree(['/']);
+};
+
+const requireVendorOrPartner: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  if (auth.isVendor() || auth.isPartner()) {
+    return true;
+  }
+  return inject(Router).createUrlTree(['/']);
+};
+
+const requireVendorOrCustomer: CanActivateFn = () => {
+  const auth = inject(AuthService);
+  if (auth.isVendor() || auth.isCustomer()) {
+    return true;
+  }
+  return inject(Router).createUrlTree(['/']);
+};
+
+const requireNonLensContext: CanActivateFn = () => {
+  if (!inject(AuthService).isLens()) {
+    return true;
+  }
+  return inject(Router).createUrlTree(['/']);
+};
+
+function licensingEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isLicensingEnabled$);
+  };
+}
+
+function notificationsEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isNotificationsEnabled$);
+  };
+}
+
+/** Lets a customer through only when the vendor has granted any of the features. */
+function requireCustomerFeature(...features: CustomerOrganizationFeature[]): CanActivateFn {
+  return async () => {
+    const auth = inject(AuthService);
+    const context = inject(ContextService);
+    const router = inject(Router);
+    if (!auth.isCustomer()) {
+      return true;
+    }
+    const customerOrganization = await firstValueFrom(context.getCustomerOrganization());
+    return features.some((feature) => customerOrganization?.features.includes(feature)) || router.createUrlTree(['/']);
+  };
+}
+
+function supportBundlesEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isSupportBundlesEnabled$);
+  };
+}
+
+function vendorBillingEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isVendorBillingEnabled$);
+  };
+}
+
+// The tab holds the custom domains as well, so either feature makes it reachable.
+function customOidcProvidersEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    const router = inject(Router);
+    return (
+      (await firstValueFrom(featureFlags.isCustomOidcProvidersEnabled$)) ||
+      (await firstValueFrom(featureFlags.isCustomDomainsEnabled$)) ||
+      router.createUrlTree(['/settings/organization/general'])
+    );
+  };
+}
+
+function customerSettingsEnabledGuard(): CanActivateFn {
+  return async () => {
+    const contextService = inject(ContextService);
+    const featureFlags = inject(FeatureFlagService);
+    const router = inject(Router);
+    const customerOrganization = await firstValueFrom(contextService.getCustomerOrganization());
+    return (
+      ((await firstValueFrom(featureFlags.isCustomerSettingsEnabled$)) &&
+        customerOrganization?.features?.includes('settings')) ||
+      router.createUrlTree(['/'])
+    );
+  };
+}
+
+function customerSettingsFeatureGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    const router = inject(Router);
+    return (await firstValueFrom(featureFlags.isCustomerSettingsEnabled$)) || router.createUrlTree(['/customers']);
+  };
+}
+
+function customEmailsEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    const router = inject(Router);
+    return (
+      (await firstValueFrom(featureFlags.isCustomEmailsEnabled$)) ||
+      router.createUrlTree(['/settings/organization/general'])
+    );
+  };
+}
+
+function partnerManagementEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isPartnerManagementEnabled$);
+  };
+}
+
+function vulnerabilitiesEnabledGuard(): CanActivateFn {
+  return async () => {
+    const featureFlags = inject(FeatureFlagService);
+    return await firstValueFrom(featureFlags.isVulnerabilitiesEnabled$);
+  };
+}
+
+function registryHostSetOrRedirectGuard(redirectTo: string): CanActivateFn {
+  return async () => {
+    const router = inject(Router);
+    const toast = inject(ToastService);
+    const env = await getRemoteEnvironment();
+    if ((env.registryHost ?? '').length > 0) {
+      return true;
+    }
+    toast.error('Registry must be enabled first!');
+    return router.createUrlTree([redirectTo]);
+  };
+}
+
+function subscriptionGuard(): CanActivateFn {
+  return () => {
+    const auth = inject(AuthService);
+    const router = inject(Router);
+    const organizationService = inject(OrganizationService);
+    if (auth.isCustomer() && !auth.isLens()) {
+      return true;
+    }
+    return organizationService.get().pipe(
+      switchMap(async (org) => {
+        if (!isSubscriptionExpired(org)) {
+          return true;
+        } else if (auth.isLens()) {
+          // a lens cannot reach the subscription page, so the session has to return to the vendor portal first
+          await auth.switchContext(org.id!);
+          return false;
+        } else {
+          return router.createUrlTree(['/subscription']);
+        }
+      })
+    );
+  };
+}
+
+export const routes: Routes = [
+  {
+    path: '',
+    canActivate: [subscriptionGuard()],
+    children: [
+      {
+        path: 'dashboard',
+        component: DashboardComponent,
+        canActivate: [requireVendorOrPartner],
+      },
+      {
+        path: 'home',
+        title: 'Home',
+        component: CustomerHomePageComponent,
+        canActivate: [requireCustomer],
+      },
+      {path: 'overview', pathMatch: 'full', redirectTo: 'home'},
+      {
+        path: 'applications',
+        title: 'Applications',
+        canActivate: [requireVendor],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: ApplicationsPageComponent,
+          },
+          {
+            path: ':applicationId',
+            component: ApplicationDetailComponent,
+          },
+        ],
+      },
+      {
+        path: 'deployments',
+        title: 'Deployments',
+        children: [
+          {path: '', pathMatch: 'full', component: DeploymentTargetsComponent},
+          {path: ':deploymentTargetId', component: DeploymentTargetDetailComponent},
+        ],
+      },
+      {
+        path: 'artifacts',
+        title: 'Artifacts',
+        children: [
+          {path: '', pathMatch: 'full', component: ArtifactsComponent},
+          {path: ':id', component: ArtifactVersionsComponent},
+        ],
+      },
+      {
+        path: 'artifact-pulls',
+        title: 'Downloads',
+        component: ArtifactPullsComponent,
+        canActivate: [requireVendorOrPartner],
+      },
+      {
+        path: 'customers',
+        title: 'Customers',
+        component: CustomerOrganizationsComponent,
+        canActivate: [requireVendorOrPartner],
+      },
+      {
+        path: 'customers/:customerOrganizationId',
+        title: 'Customers',
+        canActivate: [requireVendorOrPartner],
+        children: [
+          {path: 'users', component: CustomerUsersComponent},
+          {path: 'secrets', component: CustomerSecretsPageComponent},
+          {path: 'links', component: SidebarLinksPageComponent},
+          {
+            path: 'alerts',
+            component: CustomerAlertConfigurationsPageComponent,
+            canActivate: [notificationsEnabledGuard()],
+          },
+          {
+            path: 'updates',
+            component: CustomerUpdateNotificationsPageComponent,
+            canActivate: [notificationsEnabledGuard()],
+          },
+          {
+            path: 'notification-history',
+            component: CustomerNotificationRecordsPageComponent,
+            canActivate: [notificationsEnabledGuard()],
+          },
+          {
+            path: 'settings',
+            component: CustomerSettingsComponent,
+            canActivate: [requiredRoleGuard('admin'), customerSettingsFeatureGuard()],
+          },
+          {path: '', pathMatch: 'full', redirectTo: 'users'},
+        ],
+      },
+      {
+        path: 'partners',
+        title: 'Partners',
+        component: PartnerOrganizationsComponent,
+        canActivate: [requireVendor, partnerManagementEnabledGuard()],
+      },
+      {
+        path: 'partners/:partnerOrganizationId',
+        title: 'Partners',
+        canActivate: [requireVendor, partnerManagementEnabledGuard()],
+        children: [
+          {path: 'users', component: PartnerUsersComponent},
+          {path: '', pathMatch: 'full', redirectTo: 'users'},
+        ],
+      },
+      {
+        path: 'users',
+        title: 'Users',
+        component: VendorUsersComponent,
+        canActivate: [requiredRoleGuard('admin')],
+      },
+      {
+        path: 'secrets',
+        title: 'Secrets',
+        component: SecretsPage,
+      },
+      {
+        path: 'license-keys',
+        title: 'Licenses',
+        component: CustomerLicenseDetailPageComponent,
+        canActivate: [requireCustomer, licensingEnabledGuard()],
+      },
+      {
+        path: 'branding',
+        title: 'Branding',
+        component: OrganizationBrandingComponent,
+        data: {userRole: 'vendor'},
+        canActivate: [requireVendor, requiredRoleGuard('read_write', 'admin')],
+      },
+      {
+        path: 'billing',
+        title: 'Billing',
+        canActivate: [requireVendor, vendorBillingEnabledGuard()],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: BillingComponent,
+          },
+          {
+            path: 'settings',
+            component: BillingSettingsComponent,
+            canActivate: [requiredRoleGuard('admin')],
+          },
+        ],
+      },
+      {
+        path: 'licenses',
+        title: 'Licenses',
+        canActivate: [requireVendorOrPartner, licensingEnabledGuard()],
+        data: {userRole: 'vendor'},
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: LicensesOverviewComponent,
+          },
+          {
+            path: ':customerOrganizationId',
+            component: VendorLicenseDetailPageComponent,
+          },
+        ],
+      },
+      {
+        path: 'settings',
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            redirectTo: 'organization',
+          },
+          {
+            path: 'customer',
+            title: 'Settings',
+            component: CustomerSettingsComponent,
+            canActivate: [requireCustomer, requiredRoleGuard('admin'), customerSettingsEnabledGuard()],
+          },
+          {
+            path: 'organization',
+            title: 'Organization Settings',
+            component: OrganizationSettingsComponent,
+            data: {userRole: 'vendor'},
+            canActivate: [requireVendor, requiredRoleGuard('admin')],
+            children: [
+              {
+                path: '',
+                pathMatch: 'full',
+                redirectTo: 'general',
+              },
+              {
+                path: 'general',
+                component: GeneralSettingsComponent,
+              },
+              {
+                path: 'identity-provider',
+                component: CustomOidcComponent,
+                canActivate: [customOidcProvidersEnabledGuard()],
+              },
+              {
+                path: 'email',
+                component: CustomEmailComponent,
+                canActivate: [customEmailsEnabledGuard()],
+              },
+            ],
+          },
+          {
+            path: 'profile',
+            title: 'User Settings',
+            component: UserSettingsComponent,
+            children: [
+              {
+                path: '',
+                pathMatch: 'full',
+                redirectTo: 'general',
+              },
+              {
+                path: 'general',
+                component: UserGeneralSettingsComponent,
+              },
+              {
+                path: 'security',
+                component: UserSecuritySettingsComponent,
+              },
+              {
+                path: 'identities',
+                component: UserIdentitiesComponent,
+              },
+            ],
+          },
+          {
+            path: 'access-tokens',
+            title: 'Access Tokens',
+            canActivate: [requireNonLensContext],
+            children: [
+              {
+                path: '',
+                pathMatch: 'full',
+                component: AccessTokensComponent,
+              },
+              {
+                path: ':accessTokenId',
+                component: AccessTokenDetailComponent,
+              },
+            ],
+          },
+        ],
+      },
+      {
+        path: 'tutorials',
+        title: 'Tutorials',
+        canActivate: [requireVendor, requiredRoleGuard('admin')],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: TutorialsComponent,
+          },
+          {
+            path: 'users',
+            component: UsersTutorialComponent,
+          },
+          {
+            path: 'controllers',
+            component: ControllersTutorialComponent,
+          },
+          {
+            path: 'branding',
+            component: BrandingTutorialComponent,
+          },
+          {
+            path: 'registry',
+            canActivate: [registryHostSetOrRedirectGuard('/tutorials')],
+            component: RegistryTutorialComponent,
+          },
+        ],
+      },
+      {
+        path: 'notifications',
+        canActivate: [requireVendorOrCustomer, notificationsEnabledGuard()],
+        children: [
+          {
+            path: 'alert-configurations',
+            title: 'Alerts',
+            canActivate: [requireCustomerFeature('alerts')],
+            component: AlertConfigurationsPageComponent,
+          },
+          {
+            path: 'updates',
+            title: 'Update Notifications',
+            canActivate: [requireCustomerFeature('update_notifications')],
+            component: UpdateNotificationsPageComponent,
+          },
+          {
+            path: 'history',
+            title: 'Notification History',
+            canActivate: [requireCustomerFeature('alerts', 'update_notifications')],
+            component: NotificationRecordsPageComponent,
+          },
+        ],
+      },
+      {
+        path: 'support-bundles',
+        title: 'Support Bundles',
+        canActivate: [requireVendorOrPartner, supportBundlesEnabledGuard()],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: SupportBundleListComponent,
+          },
+          {
+            path: 'settings',
+            title: 'Support Bundle Settings',
+            component: SupportBundleSettingsComponent,
+            canActivate: [requireVendor, requiredRoleGuard('read_write', 'admin')],
+          },
+          {
+            path: ':supportBundleId',
+            component: SupportBundleDetailComponent,
+          },
+        ],
+      },
+      {
+        path: 'support',
+        title: 'Support',
+        canActivate: [requireCustomer, supportBundlesEnabledGuard(), requireCustomerFeature('support_bundles')],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: SupportBundleListComponent,
+          },
+          {
+            path: ':supportBundleId',
+            component: SupportBundleDetailComponent,
+          },
+        ],
+      },
+      {
+        path: 'advisories',
+        title: 'Security Advisories',
+        canActivate: [requireVendorOrPartner, vulnerabilitiesEnabledGuard()],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: AdvisoryListComponent,
+          },
+          {
+            path: ':advisoryId',
+            component: AdvisoryDetailComponent,
+          },
+        ],
+      },
+      {
+        path: 'security',
+        title: 'Security',
+        canActivate: [requireCustomer, vulnerabilitiesEnabledGuard(), requireCustomerFeature('vulnerabilities')],
+        children: [
+          {
+            path: '',
+            pathMatch: 'full',
+            component: AdvisoryListComponent,
+          },
+          {
+            path: ':advisoryId',
+            component: AdvisoryDetailComponent,
+          },
+        ],
+      },
+    ],
+  },
+  {
+    path: 'subscription',
+    title: 'Subscription',
+    canActivate: [requireVendor],
+    children: [
+      {
+        path: '',
+        pathMatch: 'full',
+        component: SubscriptionComponent,
+      },
+      {
+        path: 'callback',
+        component: SubscriptionCallbackComponent,
+      },
+    ],
+  },
+];

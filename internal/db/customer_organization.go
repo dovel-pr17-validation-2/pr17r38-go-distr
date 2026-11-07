@@ -1,0 +1,343 @@
+package db
+
+import (
+	"context"
+	"errors"
+	"fmt"
+
+	internalctx "github.com/distr-sh/distr/internal/context"
+	"github.com/distr-sh/distr/internal/distrerr"
+	"github.com/distr-sh/distr/internal/types"
+	"github.com/google/uuid"
+	"github.com/jackc/pgerrcode"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
+)
+
+const (
+	customerOrganizationOutputExpr = `
+		co.id,
+		co.created_at,
+		co.organization_id,
+		co.image_id,
+		co.name,
+		co.features,
+		co.partner_organization_id,
+		co.controller_image_repository
+	`
+	customerOrganizationWithUsageOutputExpr = customerOrganizationOutputExpr + `,
+		count(distinct(oua.user_account_id)) as user_count,
+    	count(distinct(dt.id)) as deployment_target_count
+	`
+)
+
+var ErrCustomerOrgNotInOrg = errors.New("customer organization does not belong to organization")
+
+func ValidateCustomerOrgBelongsToOrg(ctx context.Context, customerOrgID uuid.UUID, orgID uuid.UUID) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"SELECT EXISTS(SELECT 1 FROM CustomerOrganization WHERE id = @customerOrgID AND organization_id = @orgID)",
+		pgx.NamedArgs{
+			"customerOrgID": customerOrgID,
+			"orgID":         orgID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not validate CustomerOrganization belongs to Organization: %w", err)
+	}
+	exists, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[bool])
+	if err != nil {
+		return fmt.Errorf("could not collect result: %w", err)
+	}
+	if !exists {
+		return ErrCustomerOrgNotInOrg
+	}
+	return nil
+}
+
+// AddCustomerOrganizationFeature adds the feature to every customer of the given organizations
+// that does not have it yet.
+func AddCustomerOrganizationFeature(
+	ctx context.Context,
+	organizationIDs []uuid.UUID,
+	feature types.CustomerOrganizationFeature,
+) error {
+	db := internalctx.GetDb(ctx)
+	_, err := db.Exec(ctx,
+		`UPDATE CustomerOrganization
+		SET features = array_append(features, @feature::CUSTOMER_ORGANIZATION_FEATURE)
+		WHERE organization_id = ANY(@organizationIds::UUID[])
+			AND NOT @feature::CUSTOMER_ORGANIZATION_FEATURE = ANY(features)`,
+		pgx.NamedArgs{"organizationIds": organizationIDs, "feature": feature},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update CustomerOrganization features: %w", err)
+	}
+	return nil
+}
+
+func CreateCustomerOrganization(ctx context.Context, customerOrg *types.CustomerOrganization) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"INSERT INTO CustomerOrganization AS co (organization_id, image_id, name, partner_organization_id, features) "+
+			"VALUES (@organizationId, @imageId, @name, @partnerOrganizationId, @features) "+
+			"RETURNING "+customerOrganizationOutputExpr,
+		pgx.NamedArgs{
+			"organizationId":        customerOrg.OrganizationID,
+			"imageId":               customerOrg.ImageID,
+			"name":                  customerOrg.Name,
+			"partnerOrganizationId": customerOrg.PartnerOrganizationID,
+			"features":              customerOrg.Features,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not insert CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.CustomerOrganization])
+	if err != nil {
+		if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok &&
+			pgErr.Code == pgerrcode.ForeignKeyViolation &&
+			pgErr.ConstraintName == "customerorganization_image_id_fkey" {
+			return distrerr.NewBadRequest("invalid image ID")
+		}
+
+		return fmt.Errorf("could not scan created CustomerOrganization: %w", err)
+	} else {
+		*customerOrg = result
+		return nil
+	}
+}
+
+func GetCustomerOrganizationByID(
+	ctx context.Context,
+	id uuid.UUID,
+) (*types.CustomerOrganizationWithUsage, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		fmt.Sprintf(
+			`SELECT %v
+			FROM CustomerOrganization co
+			LEFT JOIN Organization_UserAccount oua ON co.id = oua.customer_organization_id
+			LEFT JOIN DeploymentTarget dt ON co.id = dt.customer_organization_id
+			WHERE co.id = @id
+			GROUP BY %v
+			ORDER BY co.name`,
+			customerOrganizationWithUsageOutputExpr, customerOrganizationOutputExpr,
+		),
+		pgx.NamedArgs{"id": id},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.CustomerOrganizationWithUsage])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("could not collect CustomerOrganization: %w", err)
+	}
+	return &result, nil
+}
+
+func GetCustomerOrganization(ctx context.Context, id, orgID uuid.UUID) (*types.CustomerOrganization, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"SELECT "+customerOrganizationOutputExpr+`
+		FROM CustomerOrganization co
+		WHERE co.id = @id AND co.organization_id = @orgId`,
+		pgx.NamedArgs{"id": id, "orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.CustomerOrganization])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("could not collect CustomerOrganization: %w", err)
+	}
+	return &result, nil
+}
+
+func GetCustomerOrganizationsByOrganizationID(
+	ctx context.Context,
+	orgID uuid.UUID,
+) ([]types.CustomerOrganizationWithUsage, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		fmt.Sprintf(
+			`SELECT %v
+			FROM CustomerOrganization co
+			LEFT JOIN Organization_UserAccount oua ON co.id = oua.customer_organization_id
+			LEFT JOIN DeploymentTarget dt ON co.id = dt.customer_organization_id
+			WHERE co.organization_id = @orgId
+			GROUP BY %v
+			ORDER BY co.name`,
+			customerOrganizationWithUsageOutputExpr, customerOrganizationOutputExpr,
+		),
+		pgx.NamedArgs{"orgId": orgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.CustomerOrganizationWithUsage])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect CustomerOrganization: %w", err)
+	}
+	return result, nil
+}
+
+func CountCustomerOrganizationsByOrganizationID(ctx context.Context, organizationID uuid.UUID) (int64, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"SELECT count(*) FROM CustomerOrganization WHERE organization_id = @organizationId",
+		pgx.NamedArgs{"organizationId": organizationID},
+	)
+	if err != nil {
+		return 0, fmt.Errorf("could not query CustomerOrganization: %w", err)
+	}
+	if count, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64]); err != nil {
+		return 0, fmt.Errorf("could not count CustomerOrganizations: %w", err)
+	} else {
+		return count, nil
+	}
+}
+
+func UpdateCustomerOrganizationControllerImageRepository(
+	ctx context.Context,
+	id, orgID uuid.UUID,
+	repository *string,
+) (*types.CustomerOrganization, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"UPDATE CustomerOrganization AS co SET controller_image_repository = @repository "+
+			"WHERE co.id = @id AND co.organization_id = @orgId RETURNING "+customerOrganizationOutputExpr,
+		pgx.NamedArgs{"id": id, "orgId": orgID, "repository": repository},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not update CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToAddrOfStructByName[types.CustomerOrganization])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, distrerr.ErrNotFound
+	} else if err != nil {
+		return nil, fmt.Errorf("could not collect CustomerOrganization: %w", err)
+	} else {
+		return result, nil
+	}
+}
+
+func UpdateCustomerOrganization(ctx context.Context, customerOrg *types.CustomerOrganization) error {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		"UPDATE CustomerOrganization AS co SET name = @name, image_id = @imageId, features = @features "+
+			"WHERE co.id = @id AND co.organization_id = @organizationId RETURNING "+customerOrganizationOutputExpr,
+		pgx.NamedArgs{
+			"id":             customerOrg.ID,
+			"organizationId": customerOrg.OrganizationID,
+			"name":           customerOrg.Name,
+			"imageId":        customerOrg.ImageID,
+			"features":       customerOrg.Features,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByName[types.CustomerOrganization])
+	if errors.Is(err, pgx.ErrNoRows) {
+		return distrerr.ErrNotFound
+	} else if err != nil {
+		return err
+	} else {
+		*customerOrg = result
+		return nil
+	}
+}
+
+func GetCustomerOrganizationsByPartnerOrgID(
+	ctx context.Context,
+	partnerOrgID uuid.UUID,
+) ([]types.CustomerOrganizationWithUsage, error) {
+	db := internalctx.GetDb(ctx)
+	rows, err := db.Query(ctx,
+		fmt.Sprintf(
+			`SELECT %v
+			FROM CustomerOrganization co
+			LEFT JOIN Organization_UserAccount oua ON co.id = oua.customer_organization_id
+			LEFT JOIN DeploymentTarget dt ON co.id = dt.customer_organization_id
+			WHERE co.partner_organization_id = @partnerOrgId
+			GROUP BY %v
+			ORDER BY co.name`,
+			customerOrganizationWithUsageOutputExpr, customerOrganizationOutputExpr,
+		),
+		pgx.NamedArgs{"partnerOrgId": partnerOrgID},
+	)
+	if err != nil {
+		return nil, fmt.Errorf("could not query CustomerOrganization: %w", err)
+	}
+	result, err := pgx.CollectRows(rows, pgx.RowToStructByName[types.CustomerOrganizationWithUsage])
+	if err != nil {
+		return nil, fmt.Errorf("could not collect CustomerOrganization: %w", err)
+	}
+	return result, nil
+}
+
+func SetCustomerOrganizationPartner(
+	ctx context.Context,
+	customerOrgID uuid.UUID,
+	orgID uuid.UUID,
+	partnerOrgID *uuid.UUID,
+) error {
+	db := internalctx.GetDb(ctx)
+	cmd, err := db.Exec(ctx,
+		`UPDATE CustomerOrganization
+		SET partner_organization_id = @partnerOrgId
+		WHERE id = @customerOrgId AND organization_id = @orgId`,
+		pgx.NamedArgs{
+			"customerOrgId": customerOrgID,
+			"orgId":         orgID,
+			"partnerOrgId":  partnerOrgID,
+		},
+	)
+	if err != nil {
+		return fmt.Errorf("could not update CustomerOrganization partner: %w", err)
+	} else if cmd.RowsAffected() == 0 {
+		return distrerr.ErrNotFound
+	}
+	return nil
+}
+
+func DeleteCustomerOrganizationWithID(ctx context.Context, id uuid.UUID, organizationID uuid.UUID) error {
+	err := RunTx(ctx, func(ctx context.Context) error {
+		db := internalctx.GetDb(ctx)
+		if _, err := db.Exec(ctx, "SET CONSTRAINTS deployment_application_entitlement_id_fkey DEFERRED"); err != nil {
+			return err
+		}
+
+		// CustomOIDCConfiguration references CustomDomain with ON DELETE RESTRICT, blocking the cascade.
+		if _, err := db.Exec(ctx,
+			`DELETE FROM CustomOIDCConfiguration c
+			USING CustomDomain d
+			WHERE c.custom_domain_id = d.id AND d.customer_organization_id = @customerOrganizationId`,
+			pgx.NamedArgs{"customerOrganizationId": id},
+		); err != nil {
+			return fmt.Errorf("could not delete CustomOIDCConfiguration for customer: %w", err)
+		}
+
+		cmd, err := db.Exec(
+			ctx,
+			`DELETE FROM CustomerOrganization WHERE id = @id AND organization_id = @organizationId`,
+			pgx.NamedArgs{"id": id, "organizationId": organizationID},
+		)
+		if err != nil {
+			return fmt.Errorf("could not delete CustomerOrganization: %w", err)
+		}
+		if cmd.RowsAffected() == 0 {
+			return distrerr.ErrNotFound
+		}
+		return nil
+	})
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == pgerrcode.ForeignKeyViolation {
+		err = fmt.Errorf("%w: %w", distrerr.ErrConflict, err)
+	}
+	return err
+}

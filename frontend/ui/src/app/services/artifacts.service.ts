@@ -1,0 +1,174 @@
+import {HttpClient} from '@angular/common/http';
+import {inject, Injectable} from '@angular/core';
+import {concat, map, Observable, of, switchMap, tap} from 'rxjs';
+import {ReactiveList} from './cache';
+
+export interface HasDownloads {
+  downloadsTotal?: number;
+  downloadedByUsersCount?: number;
+  downloadedByUsers?: string[];
+  downloadedByCustomerOrganizationsCount?: number;
+  downloadedByCustomerOrganizations?: string[];
+}
+
+export interface ArtifactUser {
+  id: string;
+  avatarUrl: string;
+}
+
+export interface BaseArtifact {
+  id: string;
+  name: string;
+  imageUrl?: string;
+  titleImageUrl?: string;
+}
+
+export interface BaseArtifactVersion {
+  id: string;
+  name: string;
+}
+
+export type UpstreamAuthType = 'basic' | 'aws_ecr';
+
+export interface ArtifactUpstreamAuth {
+  type: UpstreamAuthType;
+  username?: string;
+  password?: string;
+}
+
+export interface Artifact extends BaseArtifact, HasDownloads {
+  public: boolean;
+  featured: boolean;
+  upstreamUrl?: string;
+  lastSyncedAt?: string;
+  lastSyncError?: string;
+  upstreamAuthType?: UpstreamAuthType;
+  /** Only set for a customer. */
+  lastPull?: ArtifactLastPull;
+}
+
+export interface ArtifactLastPull {
+  versionName: string;
+  createdAt: string;
+  pulledByName?: string;
+  pulledByImageUrl?: string;
+  deploymentTargetName?: string;
+}
+
+export interface TaggedArtifactVersion extends HasDownloads {
+  id: string;
+  digest: string;
+  createdAt: string;
+  size: number;
+  tags: {name: string; downloads: HasDownloads}[];
+  imageUrl?: string;
+  inferredType: 'generic' | 'container-image' | 'helm-chart' | 'signature';
+}
+
+export interface ArtifactWithTags extends Artifact {
+  versions?: TaggedArtifactVersion[];
+}
+
+export interface PatchArtifactRequest {
+  upstreamUrl?: string | null;
+  auth?: ArtifactUpstreamAuth | null;
+  public?: boolean;
+  featured?: boolean;
+}
+
+export type DeleteArtifactTagResponse = {artifactDeleted: true} | {artifactDeleted: false; artifact: ArtifactWithTags};
+
+class ArtifactsReactiveList extends ReactiveList<ArtifactWithTags> {
+  protected override identify = (a: ArtifactWithTags) => a.id;
+  protected override sortAttr = (a: ArtifactWithTags) => a.versions?.[0]?.createdAt ?? '';
+  protected override sortInverted = true;
+}
+
+@Injectable({providedIn: 'root'})
+export class ArtifactsService {
+  private readonly artifactsUrl = '/api/v1/artifacts';
+  private readonly http = inject(HttpClient);
+  private readonly cache = new ArtifactsReactiveList(() => this.http.get<ArtifactWithTags[]>(this.artifactsUrl));
+
+  public list(): Observable<ArtifactWithTags[]> {
+    return this.cache.get();
+  }
+
+  public refresh(): Promise<ArtifactWithTags[]> {
+    return this.cache.refresh();
+  }
+
+  public get(id: string): Observable<ArtifactWithTags> {
+    return this.http.get<ArtifactWithTags>(`${this.artifactsUrl}/${id}`).pipe(tap((a) => this.cache.save(a)));
+  }
+
+  /**
+   * Fetches the artifact and then follows its cache entry. The list endpoint returns artifacts without versions, so
+   * an entry that a list refresh has replaced is fetched again.
+   */
+  public watch(id: string): Observable<ArtifactWithTags | undefined> {
+    return concat(
+      this.get(id),
+      this.list().pipe(
+        map((ls) => ls.find((a) => a.id === id)),
+        switchMap((existing) => (existing && existing.versions === undefined ? this.get(id) : of(existing)))
+      )
+    );
+  }
+
+  public patchImage(artifactsId: string, imageId: string) {
+    return this.http
+      .patch<ArtifactWithTags>(`${this.artifactsUrl}/${artifactsId}/image`, {imageId})
+      .pipe(tap((it) => this.cache.save(it)));
+  }
+
+  public patchTitleImage(artifactId: string, imageId: string) {
+    return this.http
+      .patch<ArtifactWithTags>(`${this.artifactsUrl}/${artifactId}/title-image`, {imageId})
+      .pipe(tap((it) => this.cache.save(it)));
+  }
+
+  public deleteArtifact(artifactId: string): Observable<void> {
+    return this.http.delete<void>(`${this.artifactsUrl}/${artifactId}`).pipe(
+      tap(() => {
+        this.cache.remove({id: artifactId} as ArtifactWithTags);
+      })
+    );
+  }
+
+  public createArtifact(
+    name: string,
+    upstreamUrl?: string,
+    upstreamAuth?: ArtifactUpstreamAuth
+  ): Observable<ArtifactWithTags> {
+    return this.http
+      .post<ArtifactWithTags>(this.artifactsUrl, {name, upstreamUrl, upstreamAuth})
+      .pipe(tap((it) => this.cache.save(it)));
+  }
+
+  public patchArtifact(artifactId: string, patch: PatchArtifactRequest): Observable<ArtifactWithTags> {
+    return this.http
+      .patch<ArtifactWithTags>(`${this.artifactsUrl}/${artifactId}`, patch)
+      .pipe(tap((it) => this.cache.save(it)));
+  }
+
+  public syncArtifact(id: string): Observable<ArtifactWithTags> {
+    return this.http
+      .post<ArtifactWithTags>(`${this.artifactsUrl}/${id}/sync`, {})
+      .pipe(tap((it) => this.cache.save(it)));
+  }
+
+  public deleteArtifactTag(artifact: ArtifactWithTags, tagName: string): Observable<DeleteArtifactTagResponse> {
+    return this.http
+      .delete<DeleteArtifactTagResponse>(`${this.artifactsUrl}/${artifact.id}/tags/${encodeURIComponent(tagName)}`)
+      .pipe(
+        tap((res) => {
+          if (res.artifactDeleted) {
+            this.cache.remove(artifact);
+          } else {
+            this.cache.save(res.artifact);
+          }
+        })
+      );
+  }
+}
